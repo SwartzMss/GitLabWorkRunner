@@ -71,6 +71,9 @@ database_url = "sqlite://gitlab-work-runner.db"
 
 [rules]
 file = "rules.toml"
+
+[logging]
+file = "logs/gitlab-work-runner.log"
 ```
 
 Rules will use `rules.toml`:
@@ -104,3 +107,38 @@ Configure a GitLab project webhook:
 - URL: `http://<host>:8080/webhooks/gitlab`
 - Secret token: the value of `[server].webhook_secret`
 - Trigger: Merge request events
+
+## Logs
+
+The service writes logs to both stdout and the configured log file:
+
+```toml
+[logging]
+file = "logs/gitlab-work-runner.log"
+```
+
+Use `RUST_LOG` to control verbosity:
+
+```powershell
+$env:RUST_LOG = "info"
+cargo run
+```
+
+For each Merge Request webhook, the log flow includes:
+
+- webhook received and payload size
+- webhook token validation failure, if rejected
+- parsed `project_id`, `mr_iid`, `commit_sha`, action, source branch, target branch
+- review start with `ruleset_hash`
+- duplicate commit/ruleset skip decision
+- GitLab MR changes fetch start and completion
+- diff refs: `base_sha`, `start_sha`, `head_sha`
+- changed file count
+- per-file diff evaluation: path, hunk count, finding count, new/renamed/deleted flags
+- total findings and comment drafts
+- comment publish attempts with path and line number
+- GitLab discussion id and note id after publish
+- fallback from line-level discussion to MR-level discussion when GitLab rejects a position
+- final review summary: skipped, finding count, comment count
+
+Secrets are intentionally not logged.

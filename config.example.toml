@@ -11,3 +11,6 @@ database_url = "sqlite://gitlab-work-runner.db"
 
 [rules]
 file = "rules.toml"
+
+[logging]
+file = "logs/gitlab-work-runner.log"

@@ -1,6 +1,7 @@
 use crate::error::AppResult;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use tracing::{info, warn};
 
 #[derive(Clone)]
 pub struct GitLabClient {
@@ -77,6 +78,12 @@ impl GitLabClient {
         project_id: i64,
         mr_iid: i64,
     ) -> AppResult<MergeRequestChanges> {
+        info!(
+            project_id,
+            mr_iid,
+            gitlab_base_url = %self.base_url,
+            "fetching merge request changes from gitlab"
+        );
         let url = format!(
             "{}/api/v4/projects/{}/merge_requests/{}/changes",
             self.base_url, project_id, mr_iid
@@ -88,7 +95,12 @@ impl GitLabClient {
             .send()
             .await?
             .error_for_status()?;
-        Ok(response.json().await?)
+        let changes = response.json().await?;
+        info!(
+            project_id,
+            mr_iid, "merge request changes fetched from gitlab"
+        );
+        Ok(changes)
     }
 
     pub async fn create_discussion(
@@ -97,6 +109,12 @@ impl GitLabClient {
         mr_iid: i64,
         request: &CreateDiscussionRequest,
     ) -> AppResult<CreatedDiscussion> {
+        info!(
+            project_id,
+            mr_iid,
+            has_position = request.position.is_some(),
+            "creating gitlab merge request discussion"
+        );
         let url = format!(
             "{}/api/v4/projects/{}/merge_requests/{}/discussions",
             self.base_url, project_id, mr_iid
@@ -109,11 +127,16 @@ impl GitLabClient {
             .send()
             .await?;
         if response.status() == StatusCode::BAD_REQUEST && request.position.is_some() {
+            warn!(
+                project_id,
+                mr_iid,
+                "line-level discussion was rejected by gitlab; falling back to merge-request-level discussion"
+            );
             let fallback = CreateDiscussionRequest {
                 body: request.body.clone(),
                 position: None,
             };
-            return Ok(self
+            let created: CreatedDiscussion = self
                 .http
                 .post(url)
                 .header("PRIVATE-TOKEN", &self.token)
@@ -122,9 +145,23 @@ impl GitLabClient {
                 .await?
                 .error_for_status()?
                 .json()
-                .await?);
+                .await?;
+            info!(
+                project_id,
+                mr_iid,
+                discussion_id = %created.id,
+                "fallback merge-request-level discussion created"
+            );
+            return Ok(created);
         }
-        Ok(response.error_for_status()?.json().await?)
+        let created: CreatedDiscussion = response.error_for_status()?.json().await?;
+        info!(
+            project_id,
+            mr_iid,
+            discussion_id = %created.id,
+            "gitlab merge request discussion created"
+        );
+        Ok(created)
     }
 }
 

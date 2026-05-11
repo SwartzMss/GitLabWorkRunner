@@ -8,6 +8,8 @@ pub struct AppConfig {
     pub gitlab: GitLabConfig,
     pub storage: StorageConfig,
     pub rules: RulesConfig,
+    #[serde(default)]
+    pub logging: LoggingConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -30,6 +32,19 @@ pub struct StorageConfig {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct RulesConfig {
     pub file: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct LoggingConfig {
+    pub file: String,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            file: "logs/gitlab-work-runner.log".into(),
+        }
+    }
 }
 
 impl AppConfig {
@@ -83,6 +98,7 @@ file = "rules.toml"
         assert_eq!(config.gitlab.base_url, "https://gitlab.example.com");
         assert_eq!(config.storage.database_url, "sqlite::memory:");
         assert_eq!(config.rules.file, "rules.toml");
+        assert_eq!(config.logging.file, "logs/gitlab-work-runner.log");
     }
 
     #[test]
@@ -102,6 +118,7 @@ file = "rules.toml"
             rules: RulesConfig {
                 file: "rules.toml".into(),
             },
+            logging: LoggingConfig::default(),
         };
 
         let err = config.gitlab_token().unwrap_err().to_string();
