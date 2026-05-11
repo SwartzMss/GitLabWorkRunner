@@ -138,6 +138,10 @@ cargo run
 
 GitLab token 和 Webhook secret 不会被写入日志。
 
+### License
+
+本项目使用 MIT License，详情见 [LICENSE](LICENSE)。
+
 ---
 
 ## English
@@ -277,3 +281,7 @@ For each Merge Request webhook, the log flow includes:
 - Final review summary: skipped, finding count, comment count.
 
 GitLab tokens and webhook secrets are intentionally not logged.
+
+### License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
