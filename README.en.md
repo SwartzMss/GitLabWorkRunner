@@ -90,10 +90,21 @@ message = "Direct unwrap can panic at runtime. Prefer explicit error handling."
 
 ## Local Run
 
+Windows PowerShell:
+
 ```powershell
 Copy-Item config.example.toml config.toml
 Copy-Item rules.example.toml rules.toml
 $env:GITLAB_TOKEN = "<your-token>"
+cargo run
+```
+
+Linux / macOS:
+
+```bash
+cp config.example.toml config.toml
+cp rules.example.toml rules.toml
+export GITLAB_TOKEN="<your-token>"
 cargo run
 ```
 
@@ -139,6 +150,16 @@ For each Merge Request webhook, the log flow includes:
 - Final review summary: skipped, finding count, comment count.
 
 GitLab tokens and webhook secrets are intentionally not logged.
+
+### Log Rotation
+
+The service currently writes to the configured log file but does not rotate or clean up logs internally. For production deployments, use the platform's log rotation mechanism:
+
+- Linux: use `logrotate` for `logs/gitlab-work-runner.log`.
+- Windows: use Task Scheduler or a log collection system to archive, compress, and clean old log files.
+- Containers: prefer stdout and let the container runtime or logging platform handle rotation.
+
+Without rotation, the log file will keep growing during long-running deployments.
 
 ## License
 

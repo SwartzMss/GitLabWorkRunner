@@ -90,10 +90,21 @@ message = "Direct unwrap can panic at runtime. Prefer explicit error handling."
 
 ## 本地运行
 
+Windows PowerShell：
+
 ```powershell
 Copy-Item config.example.toml config.toml
 Copy-Item rules.example.toml rules.toml
 $env:GITLAB_TOKEN = "<your-token>"
+cargo run
+```
+
+Linux / macOS：
+
+```bash
+cp config.example.toml config.toml
+cp rules.example.toml rules.toml
+export GITLAB_TOKEN="<your-token>"
 cargo run
 ```
 
@@ -139,6 +150,16 @@ cargo run
 - 最终 Review 汇总：skipped、finding count、comment count。
 
 GitLab token 和 Webhook secret 不会被写入日志。
+
+### 日志轮转
+
+服务当前只负责写入日志文件，不内置日志切割和清理。生产部署时建议使用平台能力做日志轮转：
+
+- Linux：使用 `logrotate` 管理 `logs/gitlab-work-runner.log`。
+- Windows：使用任务计划程序或日志采集系统定期归档、压缩和清理日志文件。
+- 容器部署：优先输出到 stdout，由容器运行时或日志平台负责轮转。
+
+如果长期运行且不配置轮转，日志文件会持续增长。
 
 ## 许可证
 
