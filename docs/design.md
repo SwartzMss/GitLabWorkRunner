@@ -281,6 +281,11 @@ database_url = "sqlite://gitlab-work-runner.db"
 
 [rules]
 file = "rules.toml"
+
+[logging]
+file = "logs/gitlab-work-runner.log"
+max_bytes = 10485760
+max_files = 5
 ```
 
 规则配置使用 `rules.toml`，第一版只支持正则匹配新增行。后续可以扩展成多种 rule kind。
@@ -294,6 +299,7 @@ file = "rules.toml"
 - diff 解析失败：跳过单个文件，继续处理其他文件，并记录 warning。
 - 评论发布失败：保留 finding 和失败原因，避免整个任务静默成功。
 - 重复事件：返回 `202 Accepted`，不重复评论。
+- 日志文件超过大小限制：轮转当前日志文件，并最多保留配置数量的历史文件。
 
 ## 测试策略
 
@@ -324,6 +330,7 @@ Webhook payload -> diff fixture -> rule finding -> discussion API request -> sta
 5. 根据 `rules.toml` 对新增行执行规则。
 6. 在 MR 中发布行级评论。
 7. 对同一 commit 和同一规则集不重复评论。
+8. 将完整 Review 流程写入 stdout 和日志文件，并按大小轮转日志文件。
 
 ## 后续扩展
 
