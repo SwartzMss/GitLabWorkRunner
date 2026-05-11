@@ -103,6 +103,8 @@ cargo run
 - Secret token: `[server].webhook_secret` 的值
 - Trigger: Merge request events
 
+关于 `Merge request events` 的触发时机和 payload 字段，见 [GitLab Webhook 说明](docs/gitlab-webhook.md)。
+
 ## 日志
 
 服务会同时输出日志到 stdout 和配置的日志文件：

@@ -103,6 +103,8 @@ Configure a GitLab project webhook:
 - Secret token: the value of `[server].webhook_secret`
 - Trigger: Merge request events
 
+For details about when `Merge request events` are triggered and which payload fields matter, see [GitLab Webhook notes](docs/gitlab-webhook.md).
+
 ## Logs
 
 The service writes logs to both stdout and the configured log file:
