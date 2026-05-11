@@ -187,4 +187,39 @@ max_files = 3
         assert_eq!(config.logging.max_bytes, 1024);
         assert_eq!(config.logging.max_files, 3);
     }
+
+    #[test]
+    fn loads_custom_logging_rotation_config() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"
+[server]
+bind = "127.0.0.1:8080"
+webhook_secret = "secret"
+
+[gitlab]
+base_url = "https://gitlab.example.com"
+token_env = "GITLAB_TOKEN"
+
+[storage]
+database_url = "sqlite::memory:"
+
+[rules]
+file = "rules.toml"
+
+[logging]
+file = "runner.log"
+max_bytes = 1024
+max_files = 3
+"#
+        )
+        .unwrap();
+
+        let config = AppConfig::from_path(file.path()).unwrap();
+
+        assert_eq!(config.logging.file, "runner.log");
+        assert_eq!(config.logging.max_bytes, 1024);
+        assert_eq!(config.logging.max_files, 3);
+    }
 }
