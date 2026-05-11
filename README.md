@@ -87,5 +87,20 @@ message = "Direct unwrap can panic at runtime. Prefer explicit error handling."
 
 ## Development Status
 
-This repository is currently in design stage. Implementation should start from
-the first-version scope in [docs/design.md](docs/design.md).
+The first Rust implementation is in progress from the first-version scope in
+[docs/design.md](docs/design.md).
+
+## Local Run
+
+```powershell
+Copy-Item config.example.toml config.toml
+Copy-Item rules.example.toml rules.toml
+$env:GITLAB_TOKEN = "<your-token>"
+cargo run
+```
+
+Configure a GitLab project webhook:
+
+- URL: `http://<host>:8080/webhooks/gitlab`
+- Secret token: the value of `[server].webhook_secret`
+- Trigger: Merge request events

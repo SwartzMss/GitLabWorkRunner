@@ -1,0 +1,7 @@
+[[rules]]
+id = "forbid-unwrap"
+title = "Avoid unwrap"
+severity = "warning"
+path = "**/*.rs"
+pattern = "\\.unwrap\\(\\)"
+message = "Direct unwrap can panic at runtime. Prefer explicit error handling."

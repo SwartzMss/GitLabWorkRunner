@@ -1,12 +1,12 @@
 # GitLab MR Review Service Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Build the first Rust version of GitLabWorkRunner as a GitLab Merge Request automated review service.
 
 **Architecture:** The service receives GitLab MR webhooks, fetches MR diffs through GitLab API, parses added-line positions, applies `rules.toml`, publishes MR discussions, and records processed commits in SQLite. Pure review logic stays independent from HTTP, GitLab, and storage boundaries so it can be tested without external services.
 
-**Tech Stack:** Rust 2021, Tokio, Axum, Reqwest, Serde, SQLx SQLite, Regex, Globset, Thiserror, Tracing, Wiremock for API tests.
+**Tech Stack:** Rust 2021, Tokio, Axum, Reqwest, Serde, SQLx SQLite, Regex, Globset, Thiserror, Tracing, Axum-based local mock servers for API tests.
 
 ---
 
@@ -41,7 +41,7 @@
 - Create: `config.example.toml`
 - Create: `rules.example.toml`
 
-- [ ] **Step 1: Create crate metadata and dependencies**
+- [x] **Step 1: Create crate metadata and dependencies**
 
 Create `Cargo.toml`:
 
@@ -71,10 +71,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3"
-wiremock = "0.6"
+
 ```
 
-- [ ] **Step 2: Create module exports**
+- [x] **Step 2: Create module exports**
 
 Create `src/lib.rs`:
 
@@ -82,7 +82,7 @@ Create `src/lib.rs`:
 pub mod error;
 ```
 
-- [ ] **Step 3: Create shared error type**
+- [x] **Step 3: Create shared error type**
 
 Create `src/error.rs`:
 
@@ -116,7 +116,7 @@ pub enum AppError {
 pub type AppResult<T> = Result<T, AppError>;
 ```
 
-- [ ] **Step 4: Create binary entrypoint stub**
+- [x] **Step 4: Create binary entrypoint stub**
 
 Create `src/main.rs`:
 
@@ -126,7 +126,7 @@ fn main() {
 }
 ```
 
-- [ ] **Step 5: Add example configs**
+- [x] **Step 5: Add example configs**
 
 Create `config.example.toml`:
 
@@ -158,13 +158,13 @@ pattern = "\\.unwrap\\(\\)"
 message = "Direct unwrap can panic at runtime. Prefer explicit error handling."
 ```
 
-- [ ] **Step 6: Verify skeleton compiles**
+- [x] **Step 6: Verify skeleton compiles**
 
 Run: `cargo test`
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add Cargo.toml src/lib.rs src/main.rs src/error.rs config.example.toml rules.example.toml
@@ -178,7 +178,7 @@ git commit -m "chore: scaffold rust service"
 - Modify: `src/lib.rs`
 - Test: unit tests in `src/config.rs`
 
-- [ ] **Step 1: Write config loading tests**
+- [x] **Step 1: Write config loading tests**
 
 Add to `src/config.rs`:
 
@@ -302,13 +302,13 @@ Add this line to `src/lib.rs`:
 pub mod config;
 ```
 
-- [ ] **Step 2: Run config tests**
+- [x] **Step 2: Run config tests**
 
 Run: `cargo test config::tests -- --nocapture`
 
 Expected: PASS.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add src/config.rs
@@ -322,7 +322,7 @@ git commit -m "feat: load service configuration"
 - Modify: `src/lib.rs`
 - Test: unit tests in `src/diff.rs`
 
-- [ ] **Step 1: Implement diff parser with tests**
+- [x] **Step 1: Implement diff parser with tests**
 
 Create `src/diff.rs`:
 
@@ -509,13 +509,13 @@ Add this line to `src/lib.rs`:
 pub mod diff;
 ```
 
-- [ ] **Step 2: Run diff tests**
+- [x] **Step 2: Run diff tests**
 
 Run: `cargo test diff::tests -- --nocapture`
 
 Expected: PASS.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add src/diff.rs
@@ -529,7 +529,7 @@ git commit -m "feat: parse unified diffs"
 - Modify: `src/lib.rs`
 - Test: unit tests in `src/rules.rs`
 
-- [ ] **Step 1: Implement rules parsing and matching**
+- [x] **Step 1: Implement rules parsing and matching**
 
 Create `src/rules.rs`:
 
@@ -730,13 +730,13 @@ Add this line to `src/lib.rs`:
 pub mod rules;
 ```
 
-- [ ] **Step 2: Run rule tests**
+- [x] **Step 2: Run rule tests**
 
 Run: `cargo test rules::tests -- --nocapture`
 
 Expected: PASS.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add src/rules.rs
@@ -750,7 +750,7 @@ git commit -m "feat: evaluate configured review rules"
 - Modify: `src/lib.rs`
 - Test: unit tests in `src/comments.rs`
 
-- [ ] **Step 1: Implement markdown comment builder**
+- [x] **Step 1: Implement markdown comment builder**
 
 Create `src/comments.rs`:
 
@@ -856,13 +856,13 @@ Add this line to `src/lib.rs`:
 pub mod comments;
 ```
 
-- [ ] **Step 2: Run comment tests**
+- [x] **Step 2: Run comment tests**
 
 Run: `cargo test comments::tests -- --nocapture`
 
 Expected: PASS.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add src/comments.rs
@@ -876,7 +876,7 @@ git commit -m "feat: build review comments"
 - Modify: `src/lib.rs`
 - Test: unit tests in `src/storage.rs`
 
-- [ ] **Step 1: Implement state store**
+- [x] **Step 1: Implement state store**
 
 Create `src/storage.rs`:
 
@@ -1052,13 +1052,13 @@ Add this line to `src/lib.rs`:
 pub mod storage;
 ```
 
-- [ ] **Step 2: Run storage tests**
+- [x] **Step 2: Run storage tests**
 
 Run: `cargo test storage::tests -- --nocapture`
 
 Expected: PASS.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add src/storage.rs
@@ -1072,7 +1072,7 @@ git commit -m "feat: persist review state"
 - Modify: `src/lib.rs`
 - Test: unit tests in `src/gitlab.rs`
 
-- [ ] **Step 1: Implement GitLab client DTOs and methods**
+- [x] **Step 1: Implement GitLab client DTOs and methods**
 
 Create `src/gitlab.rs`:
 
@@ -1218,7 +1218,7 @@ Add this line to `src/lib.rs`:
 pub mod gitlab;
 ```
 
-- [ ] **Step 2: Add API client tests with wiremock**
+- [x] **Step 2: Add API client tests with wiremock**
 
 Add tests in `src/gitlab.rs` that verify:
 
@@ -1264,13 +1264,13 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Run GitLab tests**
+- [x] **Step 3: Run GitLab tests**
 
 Run: `cargo test gitlab::tests -- --nocapture`
 
 Expected: PASS.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add src/gitlab.rs
@@ -1285,7 +1285,7 @@ git commit -m "feat: add gitlab api client"
 - Modify: `src/lib.rs`
 - Test: unit tests in `src/webhook.rs`
 
-- [ ] **Step 1: Add webhook fixture**
+- [x] **Step 1: Add webhook fixture**
 
 Create `tests/fixtures/gitlab_mr_event.json`:
 
@@ -1307,7 +1307,7 @@ Create `tests/fixtures/gitlab_mr_event.json`:
 }
 ```
 
-- [ ] **Step 2: Implement webhook parser**
+- [x] **Step 2: Implement webhook parser**
 
 Create `src/webhook.rs`:
 
@@ -1404,13 +1404,13 @@ Add this line to `src/lib.rs`:
 pub mod webhook;
 ```
 
-- [ ] **Step 3: Run webhook tests**
+- [x] **Step 3: Run webhook tests**
 
 Run: `cargo test webhook::tests -- --nocapture`
 
 Expected: PASS.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add src/webhook.rs tests/fixtures/gitlab_mr_event.json
@@ -1425,7 +1425,7 @@ git commit -m "feat: parse gitlab webhooks"
 - Modify: `src/lib.rs`
 - Test: unit tests in `src/review.rs`
 
-- [ ] **Step 1: Implement review service**
+- [x] **Step 1: Implement review service**
 
 Create `src/review.rs`:
 
@@ -1545,13 +1545,13 @@ Add this line to `src/lib.rs`:
 pub mod review;
 ```
 
-- [ ] **Step 2: Run review compile check**
+- [x] **Step 2: Run review compile check**
 
 Run: `cargo test review -- --nocapture`
 
 Expected: PASS or no tests run after compiling `src/review.rs`.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add src/review.rs
@@ -1566,7 +1566,7 @@ git commit -m "feat: orchestrate merge request reviews"
 - Modify: `src/lib.rs`
 - Test: unit tests in `src/server.rs`
 
-- [ ] **Step 1: Implement Axum routes**
+- [x] **Step 1: Implement Axum routes**
 
 Create `src/server.rs`:
 
@@ -1695,13 +1695,13 @@ Add this line to `src/lib.rs`:
 pub mod server;
 ```
 
-- [ ] **Step 2: Run server compile check**
+- [x] **Step 2: Run server compile check**
 
 Run: `cargo test server -- --nocapture`
 
 Expected: PASS or no tests run after compiling `src/server.rs`.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add src/server.rs src/main.rs
@@ -1714,7 +1714,7 @@ git commit -m "feat: expose gitlab webhook server"
 - Create: `tests/fixtures/mr_changes.json`
 - Create: `tests/e2e_review.rs`
 
-- [ ] **Step 1: Add MR changes fixture**
+- [x] **Step 1: Add MR changes fixture**
 
 Create `tests/fixtures/mr_changes.json`:
 
@@ -1738,7 +1738,7 @@ Create `tests/fixtures/mr_changes.json`:
 }
 ```
 
-- [ ] **Step 2: Add e2e test**
+- [x] **Step 2: Add e2e test**
 
 Create `tests/e2e_review.rs`:
 
@@ -1811,13 +1811,13 @@ message = "Do not unwrap."
 }
 ```
 
-- [ ] **Step 3: Run e2e test**
+- [x] **Step 3: Run e2e test**
 
 Run: `cargo test --test e2e_review -- --nocapture`
 
 Expected: PASS.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add tests/fixtures/mr_changes.json tests/e2e_review.rs
@@ -1830,7 +1830,7 @@ git commit -m "test: cover mocked review flow"
 - Modify: `README.md`
 - Modify: `.gitignore`
 
-- [ ] **Step 1: Add runtime ignores**
+- [x] **Step 1: Add runtime ignores**
 
 Create `.gitignore`:
 
@@ -1841,7 +1841,7 @@ Create `.gitignore`:
 /rules.toml
 ```
 
-- [ ] **Step 2: Update README run instructions**
+- [x] **Step 2: Update README run instructions**
 
 Add this section to `README.md`:
 
@@ -1862,7 +1862,7 @@ Configure a GitLab project webhook:
 - Trigger: Merge request events
 ````
 
-- [ ] **Step 3: Run full verification**
+- [x] **Step 3: Run full verification**
 
 Run: `cargo fmt`
 
@@ -1872,7 +1872,7 @@ Run: `cargo test`
 
 Expected: all tests PASS.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add .gitignore README.md
