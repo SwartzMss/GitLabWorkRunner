@@ -1,0 +1,15 @@
+{
+  "object_kind": "merge_request",
+  "project": {
+    "id": 123
+  },
+  "object_attributes": {
+    "iid": 45,
+    "action": "update",
+    "last_commit": {
+      "id": "abc123"
+    },
+    "source_branch": "feature/review",
+    "target_branch": "main"
+  }
+}

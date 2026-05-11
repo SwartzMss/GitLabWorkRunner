@@ -1,0 +1,188 @@
+use crate::{
+    diff::{DiffFile, DiffLineKind},
+    error::{AppError, AppResult},
+};
+use globset::{Glob, GlobMatcher};
+use regex::Regex;
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use std::{fs, path::Path};
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct RulesFile {
+    pub rules: Vec<RuleConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct RuleConfig {
+    pub id: String,
+    pub title: String,
+    pub severity: Severity,
+    pub path: String,
+    pub pattern: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Finding {
+    pub rule_id: String,
+    pub severity: Severity,
+    pub path: String,
+    pub new_line: Option<u32>,
+    pub title: String,
+    pub message: String,
+}
+
+struct CompiledRule {
+    config: RuleConfig,
+    matcher: GlobMatcher,
+    regex: Regex,
+}
+
+pub struct Ruleset {
+    hash: String,
+    rules: Vec<CompiledRule>,
+}
+
+impl Ruleset {
+    pub fn from_path(path: impl AsRef<Path>) -> AppResult<Self> {
+        let text = fs::read_to_string(path)?;
+        Self::from_toml(&text)
+    }
+
+    pub fn from_toml(text: &str) -> AppResult<Self> {
+        let parsed: RulesFile = toml::from_str(text)?;
+        let mut rules = Vec::new();
+        for config in parsed.rules {
+            let matcher = Glob::new(&config.path)
+                .map_err(|err| AppError::Rule(format!("invalid glob {}: {err}", config.path)))?
+                .compile_matcher();
+            let regex = Regex::new(&config.pattern).map_err(|err| {
+                AppError::Rule(format!("invalid regex for rule {}: {err}", config.id))
+            })?;
+            rules.push(CompiledRule {
+                config,
+                matcher,
+                regex,
+            });
+        }
+        let hash = format!("{:x}", Sha256::digest(text.as_bytes()));
+        Ok(Self { hash, rules })
+    }
+
+    pub fn hash(&self) -> &str {
+        &self.hash
+    }
+
+    pub fn evaluate(&self, file: &DiffFile) -> Vec<Finding> {
+        let mut findings = Vec::new();
+        for rule in &self.rules {
+            if !rule.matcher.is_match(&file.new_path) {
+                continue;
+            }
+            for hunk in &file.hunks {
+                for line in &hunk.lines {
+                    if line.kind == DiffLineKind::Added && rule.regex.is_match(&line.content) {
+                        findings.push(Finding {
+                            rule_id: rule.config.id.clone(),
+                            severity: rule.config.severity.clone(),
+                            path: file.new_path.clone(),
+                            new_line: line.new_line,
+                            title: rule.config.title.clone(),
+                            message: rule.config.message.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        findings
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diff::parse_unified_diff;
+
+    #[test]
+    fn matches_added_lines_only() {
+        let rules = Ruleset::from_toml(
+            r#"
+[[rules]]
+id = "forbid-unwrap"
+title = "Avoid unwrap"
+severity = "warning"
+path = "**/*.rs"
+pattern = "\\.unwrap\\(\\)"
+message = "Do not unwrap."
+"#,
+        )
+        .unwrap();
+        let diff = "@@ -1,2 +1,2 @@\n-let a = old.unwrap();\n+let a = new.unwrap();\n";
+        let file = parse_unified_diff("src/lib.rs", "src/lib.rs", diff).unwrap();
+
+        let findings = rules.evaluate(&file);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, "forbid-unwrap");
+        assert_eq!(findings[0].new_line, Some(1));
+    }
+
+    #[test]
+    fn ignores_non_matching_paths() {
+        let rules = Ruleset::from_toml(
+            r#"
+[[rules]]
+id = "forbid-unwrap"
+title = "Avoid unwrap"
+severity = "warning"
+path = "**/*.rs"
+pattern = "\\.unwrap\\(\\)"
+message = "Do not unwrap."
+"#,
+        )
+        .unwrap();
+        let diff = "@@ -1 +1 @@\n+value.unwrap()\n";
+        let file = parse_unified_diff("README.md", "README.md", diff).unwrap();
+
+        assert!(rules.evaluate(&file).is_empty());
+    }
+
+    #[test]
+    fn hash_changes_when_rule_text_changes() {
+        let first = Ruleset::from_toml(
+            r#"
+[[rules]]
+id = "a"
+title = "A"
+severity = "info"
+path = "**/*"
+pattern = "a"
+message = "a"
+"#,
+        )
+        .unwrap();
+        let second = Ruleset::from_toml(
+            r#"
+[[rules]]
+id = "a"
+title = "A"
+severity = "info"
+path = "**/*"
+pattern = "b"
+message = "a"
+"#,
+        )
+        .unwrap();
+
+        assert_ne!(first.hash(), second.hash());
+    }
+}

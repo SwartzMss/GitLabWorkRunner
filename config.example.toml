@@ -1,0 +1,16 @@
+[server]
+bind = "0.0.0.0:8080"
+webhook_secret = "change-me"
+
+[gitlab]
+base_url = "https://gitlab.example.com"
+token_env = "GITLAB_TOKEN"
+
+[storage]
+database_url = "sqlite://gitlab-work-runner.db"
+
+[rules]
+file = "rules.toml"
+
+[logging]
+file = "logs/gitlab-work-runner.log"

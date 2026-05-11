@@ -1,0 +1,17 @@
+{
+  "changes": [
+    {
+      "old_path": "src/lib.rs",
+      "new_path": "src/lib.rs",
+      "new_file": false,
+      "renamed_file": false,
+      "deleted_file": false,
+      "diff": "@@ -1 +1 @@\n+let value = maybe.unwrap();\n"
+    }
+  ],
+  "diff_refs": {
+    "base_sha": "base",
+    "start_sha": "start",
+    "head_sha": "abc123"
+  }
+}

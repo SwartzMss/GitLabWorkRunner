@@ -1,0 +1,5 @@
+/target/
+/gitlab-work-runner.db
+/config.toml
+/rules.toml
+/logs/
