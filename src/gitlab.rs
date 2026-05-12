@@ -33,6 +33,12 @@ pub struct DiffRefs {
     pub head_sha: Option<String>,
 }
 
+impl DiffRefs {
+    pub fn is_complete(&self) -> bool {
+        self.base_sha.is_some() && self.start_sha.is_some() && self.head_sha.is_some()
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct CreateDiscussionRequest {
     pub body: String,
