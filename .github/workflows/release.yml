@@ -136,4 +136,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           version="${{ github.ref_name }}"
-          gh release create "$version" dist/* --title "$version" --notes "Windows and Ubuntu x86-64 release for $version." --verify-tag
+          gh release create "$version" dist/* --repo "$GITHUB_REPOSITORY" --title "$version" --notes "Windows and Ubuntu x86-64 release for $version." --verify-tag
