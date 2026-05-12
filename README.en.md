@@ -52,6 +52,7 @@ The first version currently supports:
 - Publishing line-level MR comments.
 - Avoiding reprocessing the same commit and ruleset.
 - Writing the full review flow to stdout and a log file.
+- Rotating log files by size so a single file does not grow forever.
 
 ## Configuration
 
@@ -74,6 +75,8 @@ file = "rules.toml"
 
 [logging]
 file = "logs/gitlab-work-runner.log"
+max_bytes = 10485760
+max_files = 5
 ```
 
 Rules use `rules.toml`:
@@ -123,6 +126,8 @@ The service writes logs to both stdout and the configured log file:
 ```toml
 [logging]
 file = "logs/gitlab-work-runner.log"
+max_bytes = 10485760
+max_files = 5
 ```
 
 Use `RUST_LOG` to control verbosity:
@@ -153,13 +158,23 @@ GitLab tokens and webhook secrets are intentionally not logged.
 
 ### Log Rotation
 
-The service currently writes to the configured log file but does not rotate or clean up logs internally. For production deployments, use the platform's log rotation mechanism:
+The service includes built-in size-based log rotation. The default configuration is:
 
-- Linux: use `logrotate` for `logs/gitlab-work-runner.log`.
-- Windows: use Task Scheduler or a log collection system to archive, compress, and clean old log files.
-- Containers: prefer stdout and let the container runtime or logging platform handle rotation.
+```toml
+[logging]
+file = "logs/gitlab-work-runner.log"
+max_bytes = 10485760
+max_files = 5
+```
 
-Without rotation, the log file will keep growing during long-running deployments.
+When the next write would exceed `max_bytes`, the service rotates before writing:
+
+- The active file is renamed to `gitlab-work-runner.log.1`.
+- Existing `.1` files are shifted to `.2`, up to `max_files`.
+- At most `max_files` history files are retained.
+- With `max_files = 0`, no history files are retained and the active log file is recreated.
+
+This is size-based rotation only. It does not provide time-based rotation, compression, upload, or centralized collection. In production, container runtimes, logging platforms, `logrotate`, or Windows log collection systems can still manage logs externally.
 
 ## License
 

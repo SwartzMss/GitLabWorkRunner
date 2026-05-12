@@ -52,6 +52,7 @@ GitLab Merge Request Event
 - 发布行级 MR 评论。
 - 对相同 commit 和规则集做去重。
 - 将完整 Review 流程日志写入 stdout 和日志文件。
+- 按大小轮转日志文件，避免单个日志文件无限增长。
 
 ## 配置
 
@@ -74,6 +75,8 @@ file = "rules.toml"
 
 [logging]
 file = "logs/gitlab-work-runner.log"
+max_bytes = 10485760
+max_files = 5
 ```
 
 规则配置使用 `rules.toml`：
@@ -123,6 +126,8 @@ cargo run
 ```toml
 [logging]
 file = "logs/gitlab-work-runner.log"
+max_bytes = 10485760
+max_files = 5
 ```
 
 可以通过 `RUST_LOG` 控制日志级别：
@@ -153,13 +158,23 @@ GitLab token 和 Webhook secret 不会被写入日志。
 
 ### 日志轮转
 
-服务当前只负责写入日志文件，不内置日志切割和清理。生产部署时建议使用平台能力做日志轮转：
+服务内置按大小轮转日志文件。默认配置为：
 
-- Linux：使用 `logrotate` 管理 `logs/gitlab-work-runner.log`。
-- Windows：使用任务计划程序或日志采集系统定期归档、压缩和清理日志文件。
-- 容器部署：优先输出到 stdout，由容器运行时或日志平台负责轮转。
+```toml
+[logging]
+file = "logs/gitlab-work-runner.log"
+max_bytes = 10485760
+max_files = 5
+```
 
-如果长期运行且不配置轮转，日志文件会持续增长。
+当当前日志文件在下一次写入时会超过 `max_bytes`，服务会先执行轮转：
+
+- 当前文件重命名为 `gitlab-work-runner.log.1`。
+- 旧的 `.1` 依次移动为 `.2`，直到 `max_files`。
+- 最多保留 `max_files` 个历史文件。
+- `max_files = 0` 时不保留历史文件，只重新创建当前日志文件。
+
+这是内置的大小轮转，不包含按时间轮转、压缩、上传或集中采集。生产环境如果已经接入容器运行时、日志平台、`logrotate` 或 Windows 日志采集系统，也可以继续由外部系统统一管理。
 
 ## 许可证
 

@@ -2,6 +2,10 @@ use crate::error::{AppError, AppResult};
 use serde::Deserialize;
 use std::{fs, path::Path};
 
+const DEFAULT_LOG_FILE: &str = "logs/gitlab-work-runner.log";
+const DEFAULT_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
+const DEFAULT_LOG_MAX_FILES: usize = 5;
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct AppConfig {
     pub server: ServerConfig,
@@ -36,15 +40,34 @@ pub struct RulesConfig {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct LoggingConfig {
+    #[serde(default = "default_log_file")]
     pub file: String,
+    #[serde(default = "default_log_max_bytes")]
+    pub max_bytes: u64,
+    #[serde(default = "default_log_max_files")]
+    pub max_files: usize,
 }
 
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
-            file: "logs/gitlab-work-runner.log".into(),
+            file: default_log_file(),
+            max_bytes: default_log_max_bytes(),
+            max_files: default_log_max_files(),
         }
     }
+}
+
+fn default_log_file() -> String {
+    DEFAULT_LOG_FILE.into()
+}
+
+fn default_log_max_bytes() -> u64 {
+    DEFAULT_LOG_MAX_BYTES
+}
+
+fn default_log_max_files() -> usize {
+    DEFAULT_LOG_MAX_FILES
 }
 
 impl AppConfig {
@@ -99,6 +122,8 @@ file = "rules.toml"
         assert_eq!(config.storage.database_url, "sqlite::memory:");
         assert_eq!(config.rules.file, "rules.toml");
         assert_eq!(config.logging.file, "logs/gitlab-work-runner.log");
+        assert_eq!(config.logging.max_bytes, 10 * 1024 * 1024);
+        assert_eq!(config.logging.max_files, 5);
     }
 
     #[test]
@@ -123,5 +148,40 @@ file = "rules.toml"
 
         let err = config.gitlab_token().unwrap_err().to_string();
         assert!(err.contains("GITLAB_WORK_RUNNER_MISSING_TOKEN"));
+    }
+
+    #[test]
+    fn loads_custom_logging_rotation_config() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"
+[server]
+bind = "127.0.0.1:8080"
+webhook_secret = "secret"
+
+[gitlab]
+base_url = "https://gitlab.example.com"
+token_env = "GITLAB_TOKEN"
+
+[storage]
+database_url = "sqlite::memory:"
+
+[rules]
+file = "rules.toml"
+
+[logging]
+file = "runner.log"
+max_bytes = 1024
+max_files = 3
+"#
+        )
+        .unwrap();
+
+        let config = AppConfig::from_path(file.path()).unwrap();
+
+        assert_eq!(config.logging.file, "runner.log");
+        assert_eq!(config.logging.max_bytes, 1024);
+        assert_eq!(config.logging.max_files, 3);
     }
 }
