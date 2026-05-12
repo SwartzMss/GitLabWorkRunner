@@ -249,7 +249,7 @@ impl ReviewService {
 }
 
 fn incomplete_diff_refs_body() -> String {
-    "**[warning] Review skipped**\n\nGitLab did not return complete diff refs for this merge request, so GitLabWorkRunner cannot create reliable line-level comments. This usually happens when the merge request has conflicts or GitLab cannot prepare the merge diff yet.\n\nPlease resolve the merge conflicts or refresh the merge request, then trigger the webhook again.\n\n<!-- gitlab-work-runner:rule=incomplete-diff-refs -->".into()
+    "**[warning] Review 已跳过**\n\n当前 MR 的 diff 信息不完整，无法可靠发布行级评论。请先解决冲突或刷新 MR 后重新触发检查。\n\n<!-- gitlab-work-runner:rule=incomplete-diff-refs -->".into()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -1,4 +1,9 @@
-use axum::{http::StatusCode, routing::get, routing::post, Json, Router};
+use axum::{
+    body::Bytes,
+    http::StatusCode,
+    routing::{get, post},
+    Json, Router,
+};
 use gitlab_work_runner::{
     gitlab::GitLabClient, review::ReviewService, rules::Ruleset, storage::StateStore,
     webhook::MergeRequestEvent,
@@ -116,9 +121,13 @@ async fn skips_rule_comments_when_diff_refs_are_incomplete() {
         )
         .route(
             "/api/v4/projects/123/merge_requests/45/discussions",
-            post(move || {
+            post(move |body: Bytes| {
                 let discussion_count = Arc::clone(&discussion_count_for_handler);
                 async move {
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    assert!(body["body"].as_str().unwrap().contains("Review 已跳过"));
+                    assert!(body["body"].as_str().unwrap().contains("请先解决冲突"));
+                    assert!(body.get("position").is_none());
                     discussion_count.fetch_add(1, Ordering::SeqCst);
                     (
                         StatusCode::CREATED,
