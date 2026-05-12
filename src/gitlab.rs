@@ -28,9 +28,9 @@ pub struct GitLabChange {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct DiffRefs {
-    pub base_sha: String,
-    pub start_sha: String,
-    pub head_sha: String,
+    pub base_sha: Option<String>,
+    pub start_sha: Option<String>,
+    pub head_sha: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -209,6 +209,31 @@ mod tests {
         let changes = client.merge_request_changes(1, 2).await.unwrap();
 
         assert_eq!(changes.changes.len(), 1);
-        assert_eq!(changes.diff_refs.head_sha, "head");
+        assert_eq!(changes.diff_refs.head_sha.as_deref(), Some("head"));
+    }
+
+    #[tokio::test]
+    async fn fetches_merge_request_changes_with_null_diff_refs() {
+        let app = Router::new().route(
+            "/api/v4/projects/1/merge_requests/2/changes",
+            get(|| async {
+                Json(json!({
+                    "changes": [],
+                    "diff_refs": {
+                        "base_sha": null,
+                        "start_sha": "start",
+                        "head_sha": "head"
+                    }
+                }))
+            }),
+        );
+        let base_url = spawn_server(app).await;
+
+        let client = GitLabClient::new(base_url, "token".into());
+        let changes = client.merge_request_changes(1, 2).await.unwrap();
+
+        assert_eq!(changes.diff_refs.base_sha, None);
+        assert_eq!(changes.diff_refs.start_sha.as_deref(), Some("start"));
+        assert_eq!(changes.diff_refs.head_sha.as_deref(), Some("head"));
     }
 }

@@ -69,9 +69,9 @@ impl ReviewService {
             mr_iid = event.mr_iid,
             commit_sha = %event.commit_sha,
             changed_files = changes.changes.len(),
-            base_sha = %changes.diff_refs.base_sha,
-            start_sha = %changes.diff_refs.start_sha,
-            head_sha = %changes.diff_refs.head_sha,
+            base_sha = ?changes.diff_refs.base_sha,
+            start_sha = ?changes.diff_refs.start_sha,
+            head_sha = ?changes.diff_refs.head_sha,
             "merge request diff fetched"
         );
 
@@ -123,15 +123,38 @@ impl ReviewService {
                 new_line = ?draft.new_line,
                 "publishing review comment"
             );
-            let position = draft.new_line.map(|new_line| DiscussionPosition {
-                base_sha: changes.diff_refs.base_sha.clone(),
-                start_sha: changes.diff_refs.start_sha.clone(),
-                head_sha: changes.diff_refs.head_sha.clone(),
-                position_type: "text".into(),
-                old_path: draft.path.clone(),
-                new_path: draft.path.clone(),
-                new_line: Some(new_line),
-            });
+            let position = match (
+                draft.new_line,
+                &changes.diff_refs.base_sha,
+                &changes.diff_refs.start_sha,
+                &changes.diff_refs.head_sha,
+            ) {
+                (Some(new_line), Some(base_sha), Some(start_sha), Some(head_sha)) => {
+                    Some(DiscussionPosition {
+                        base_sha: base_sha.clone(),
+                        start_sha: start_sha.clone(),
+                        head_sha: head_sha.clone(),
+                        position_type: "text".into(),
+                        old_path: draft.path.clone(),
+                        new_path: draft.path.clone(),
+                        new_line: Some(new_line),
+                    })
+                }
+                (Some(new_line), _, _, _) => {
+                    warn!(
+                        project_id = event.project_id,
+                        mr_iid = event.mr_iid,
+                        path = %draft.path,
+                        new_line,
+                        base_sha = ?changes.diff_refs.base_sha,
+                        start_sha = ?changes.diff_refs.start_sha,
+                        head_sha = ?changes.diff_refs.head_sha,
+                        "line-level discussion skipped because gitlab diff refs are incomplete"
+                    );
+                    None
+                }
+                (None, _, _, _) => None,
+            };
             let created = self
                 .gitlab
                 .create_discussion(
