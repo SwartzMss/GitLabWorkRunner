@@ -75,6 +75,48 @@ impl ReviewService {
             "merge request diff fetched"
         );
 
+        if !changes.diff_refs.is_complete() {
+            warn!(
+                project_id = event.project_id,
+                mr_iid = event.mr_iid,
+                commit_sha = %event.commit_sha,
+                base_sha = ?changes.diff_refs.base_sha,
+                start_sha = ?changes.diff_refs.start_sha,
+                head_sha = ?changes.diff_refs.head_sha,
+                "review skipped because gitlab diff refs are incomplete"
+            );
+            let created = self
+                .gitlab
+                .create_discussion(
+                    event.project_id,
+                    event.mr_iid,
+                    &CreateDiscussionRequest {
+                        body: incomplete_diff_refs_body(),
+                        position: None,
+                    },
+                )
+                .await?;
+            self.store
+                .record_comment(&StoredComment {
+                    project_id: event.project_id,
+                    mr_iid: event.mr_iid,
+                    commit_sha: &event.commit_sha,
+                    ruleset_hash: self.ruleset.hash(),
+                    rule_id: "incomplete-diff-refs",
+                    path: "",
+                    new_line: None,
+                    discussion_id: Some(&created.id),
+                    note_id: created.notes.first().map(|note| note.id),
+                })
+                .await?;
+            self.store.mark_processed(&key, "skipped").await?;
+            return Ok(ReviewSummary {
+                skipped: true,
+                findings: 0,
+                comments: 1,
+            });
+        }
+
         let mut findings = Vec::new();
         for change in &changes.changes {
             if change.deleted_file || change.diff.trim().is_empty() {
@@ -123,38 +165,27 @@ impl ReviewService {
                 new_line = ?draft.new_line,
                 "publishing review comment"
             );
-            let position = match (
-                draft.new_line,
-                &changes.diff_refs.base_sha,
-                &changes.diff_refs.start_sha,
-                &changes.diff_refs.head_sha,
-            ) {
-                (Some(new_line), Some(base_sha), Some(start_sha), Some(head_sha)) => {
-                    Some(DiscussionPosition {
-                        base_sha: base_sha.clone(),
-                        start_sha: start_sha.clone(),
-                        head_sha: head_sha.clone(),
-                        position_type: "text".into(),
-                        old_path: draft.path.clone(),
-                        new_path: draft.path.clone(),
-                        new_line: Some(new_line),
-                    })
-                }
-                (Some(new_line), _, _, _) => {
-                    warn!(
-                        project_id = event.project_id,
-                        mr_iid = event.mr_iid,
-                        path = %draft.path,
-                        new_line,
-                        base_sha = ?changes.diff_refs.base_sha,
-                        start_sha = ?changes.diff_refs.start_sha,
-                        head_sha = ?changes.diff_refs.head_sha,
-                        "line-level discussion skipped because gitlab diff refs are incomplete"
-                    );
-                    None
-                }
-                (None, _, _, _) => None,
-            };
+            let position = draft.new_line.map(|new_line| DiscussionPosition {
+                base_sha: changes
+                    .diff_refs
+                    .base_sha
+                    .clone()
+                    .expect("complete diff refs"),
+                start_sha: changes
+                    .diff_refs
+                    .start_sha
+                    .clone()
+                    .expect("complete diff refs"),
+                head_sha: changes
+                    .diff_refs
+                    .head_sha
+                    .clone()
+                    .expect("complete diff refs"),
+                position_type: "text".into(),
+                old_path: draft.path.clone(),
+                new_path: draft.path.clone(),
+                new_line: Some(new_line),
+            });
             let created = self
                 .gitlab
                 .create_discussion(
@@ -215,6 +246,10 @@ impl ReviewService {
             comments: published,
         })
     }
+}
+
+fn incomplete_diff_refs_body() -> String {
+    "**[warning] Review skipped**\n\nGitLab did not return complete diff refs for this merge request, so GitLabWorkRunner cannot create reliable line-level comments. This usually happens when the merge request has conflicts or GitLab cannot prepare the merge diff yet.\n\nPlease resolve the merge conflicts or refresh the merge request, then trigger the webhook again.\n\n<!-- gitlab-work-runner:rule=incomplete-diff-refs -->".into()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
