@@ -16,6 +16,7 @@ use tracing_subscriber::{fmt::MakeWriter, layer::SubscriberExt, util::Subscriber
 async fn main() -> gitlab_work_runner::error::AppResult<()> {
     let config = AppConfig::from_path("config.toml")?;
     init_tracing(&config.logging)?;
+    config.gitlab_token()?;
 
     tracing::info!(
         log_file = %config.logging.file,

@@ -79,8 +79,8 @@ impl AppConfig {
     pub fn gitlab_token(&self) -> AppResult<String> {
         std::env::var(&self.gitlab.token_env).map_err(|_| {
             AppError::Config(format!(
-                "environment variable {} is not set",
-                self.gitlab.token_env
+                "environment variable {name} is not set. Create a GitLab access token with the api scope, then set it before starting the service. Windows cmd: set {name}=<your-gitlab-token>. PowerShell: $env:{name} = \"<your-gitlab-token>\". Linux/macOS: export {name}=<your-gitlab-token>.",
+                name = self.gitlab.token_env
             ))
         })
     }
@@ -148,6 +148,9 @@ file = "rules.toml"
 
         let err = config.gitlab_token().unwrap_err().to_string();
         assert!(err.contains("GITLAB_WORK_RUNNER_MISSING_TOKEN"));
+        assert!(err.contains("set GITLAB_WORK_RUNNER_MISSING_TOKEN=<your-gitlab-token>"));
+        assert!(err.contains("$env:GITLAB_WORK_RUNNER_MISSING_TOKEN"));
+        assert!(err.contains("export GITLAB_WORK_RUNNER_MISSING_TOKEN=<your-gitlab-token>"));
     }
 
     #[test]
