@@ -4,7 +4,7 @@ Language: [简体中文](README.md) | **English**
 
 GitLabWorkRunner is a Rust service for automated GitLab Merge Request review.
 
-It is not a full GitLab Runner replacement, and it does not execute CI scripts from the target repository. The first version focuses on a small review loop:
+It is not a full GitLab Runner replacement, and it does not automatically execute CI scripts from the target repository. The service only runs review rules and script tasks explicitly configured in `rules.toml`.
 
 1. Receive GitLab Merge Request webhooks.
 2. Fetch MR diffs through the GitLab API.
@@ -49,6 +49,7 @@ The first version currently supports:
 - Validating the webhook secret token.
 - Fetching MR changes from GitLab.
 - Applying regex-based rules to added lines.
+- Downloading the MR head snapshot and running configured script tasks.
 - Publishing line-level MR comments.
 - Avoiding reprocessing the same commit and ruleset.
 - Writing the full review flow to stdout and a log file.
@@ -89,7 +90,39 @@ severity = "warning"
 path = "**/*.rs"
 pattern = "\\.unwrap\\(\\)"
 message = "Direct unwrap can panic at runtime. Prefer explicit error handling."
+
+[[script_tasks]]
+enabled = false
+id = "check-project"
+title = "Project script check"
+command = "python3 tools/check_project.py"
+timeout_seconds = 30
+when_changed = ["src/**", "tools/**"]
 ```
+
+### Script Tasks
+
+`[[script_tasks]]` are independent tasks and do not change existing `[[rules]]` line checks. Each task has its own `enabled` flag; there is no global switch.
+
+Behavior:
+
+- `enabled` defaults to `true` when omitted.
+- If `when_changed` is omitted or empty, the task runs for every MR.
+- The service always downloads the current MR head commit archive.
+- The command runs from the extracted repository root.
+- stdout and stderr are merged into one `output.log`.
+- `exit 0` means pass and does not create a comment.
+- `exit != 0` or timeout creates one MR-level comment.
+- Timeout is enforced by the Rust process; `timeout_seconds` defaults to `60`.
+
+Work directory:
+
+```text
+work/script_tasks/<project_id>/<mr_iid>/<commit_sha>/<task_id>/
+  output.log
+```
+
+After execution, the extracted `source/` directory is removed and only `output.log` is kept for debugging. Script tasks remove the configured GitLab token environment variable before running the command.
 
 ## Local Run
 
@@ -145,6 +178,7 @@ For each Merge Request webhook, the log flow includes:
 - Review start with `ruleset_hash`.
 - Duplicate commit/ruleset skip decision.
 - GitLab MR changes fetch start and completion.
+- Script task archive download, execution, timeout, and output file path.
 - diff refs: `base_sha`, `start_sha`, `head_sha`.
 - Changed file count.
 - Per-file diff evaluation: path, hunk count, finding count, new/renamed/deleted flags.

@@ -8,6 +8,8 @@ pub enum AppError {
     Diff(String),
     #[error("rule error: {0}")]
     Rule(String),
+    #[error("script task error: {0}")]
+    ScriptTask(String),
     #[error("gitlab api error: {0}")]
     GitLab(String),
     #[error("storage error: {0}")]

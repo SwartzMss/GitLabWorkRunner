@@ -110,7 +110,12 @@ async fn gitlab_webhook(
         }
     };
     let gitlab = GitLabClient::new(state.config.gitlab.base_url.clone(), gitlab_token);
-    let service = ReviewService::new(gitlab, state.store.clone(), ruleset);
+    let service = ReviewService::new(
+        gitlab,
+        state.store.clone(),
+        ruleset,
+        state.config.gitlab.token_env.clone(),
+    );
 
     match service.review_merge_request(&event).await {
         Ok(summary) => {

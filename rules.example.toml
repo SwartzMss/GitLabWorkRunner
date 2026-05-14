@@ -5,3 +5,11 @@ severity = "warning"
 path = "**/*.rs"
 pattern = "\\.unwrap\\(\\)"
 message = "Direct unwrap can panic at runtime. Prefer explicit error handling."
+
+[[script_tasks]]
+enabled = false
+id = "check-project"
+title = "Project script check"
+command = "python3 tools/check_project.py"
+timeout_seconds = 30
+when_changed = ["src/**", "tools/**"]
