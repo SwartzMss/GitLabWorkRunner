@@ -93,11 +93,11 @@ message = "Direct unwrap can panic at runtime. Prefer explicit error handling."
 
 [[script_tasks]]
 enabled = false
-id = "check-project"
-title = "Project script check"
-command = "python3 tools/check_project.py"
+id = "check-todo-tbd"
+title = "TODO/TBD marker check"
+command = "python3 examples/scripts/check_todo_tbd.py"
 timeout_seconds = 30
-when_changed = ["src/**", "tools/**"]
+when_changed = ["**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.rs"]
 ```
 
 ### Script Tasks
@@ -123,6 +123,8 @@ work/script_tasks/<project_id>/<mr_iid>/<commit_sha>/<task_id>/
 ```
 
 After execution, the extracted `source/` directory is removed and only `output.log` is kept for debugging. Script tasks remove the configured GitLab token environment variable before running the command.
+
+The repository includes a minimal script example: [examples/scripts/check_todo_tbd.py](examples/scripts/check_todo_tbd.py). It scans text files in the checkout and fails when it finds `//TODO` or `//TBD`, printing file locations.
 
 ## Local Run
 

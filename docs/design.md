@@ -205,11 +205,11 @@ struct Finding {
 ```toml
 [[script_tasks]]
 enabled = true
-id = "check-project"
-title = "Project script check"
-command = "python3 tools/check_project.py"
+id = "check-todo-tbd"
+title = "TODO/TBD marker check"
+command = "python3 examples/scripts/check_todo_tbd.py"
 timeout_seconds = 30
-when_changed = ["src/**", "tools/**"]
+when_changed = ["**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.rs"]
 ```
 
 字段说明：

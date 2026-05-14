@@ -93,11 +93,11 @@ message = "Direct unwrap can panic at runtime. Prefer explicit error handling."
 
 [[script_tasks]]
 enabled = false
-id = "check-project"
-title = "Project script check"
-command = "python3 tools/check_project.py"
+id = "check-todo-tbd"
+title = "TODO/TBD marker check"
+command = "python3 examples/scripts/check_todo_tbd.py"
 timeout_seconds = 30
-when_changed = ["src/**", "tools/**"]
+when_changed = ["**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.rs"]
 ```
 
 ### 脚本任务
@@ -123,6 +123,8 @@ work/script_tasks/<project_id>/<mr_iid>/<commit_sha>/<task_id>/
 ```
 
 执行完成后会删除解压出的 `source/` 目录，只保留 `output.log` 便于排查。脚本任务会移除配置中的 GitLab token 环境变量，避免脚本直接继承服务 token。
+
+仓库提供了一个最小脚本示例：[examples/scripts/check_todo_tbd.py](examples/scripts/check_todo_tbd.py)。它会扫描 checkout 中的文本文件，发现 `//TODO` 或 `//TBD` 时返回失败并输出文件位置。
 
 ## 本地运行
 
