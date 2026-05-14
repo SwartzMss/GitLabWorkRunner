@@ -109,6 +109,37 @@ impl GitLabClient {
         Ok(changes)
     }
 
+    pub async fn repository_archive(&self, project_id: i64, sha: &str) -> AppResult<Vec<u8>> {
+        info!(
+            project_id,
+            sha,
+            gitlab_base_url = %self.base_url,
+            "downloading repository archive from gitlab"
+        );
+        let url = format!(
+            "{}/api/v4/projects/{}/repository/archive.zip",
+            self.base_url, project_id
+        );
+        let archive = self
+            .http
+            .get(url)
+            .query(&[("sha", sha)])
+            .header("PRIVATE-TOKEN", &self.token)
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?
+            .to_vec();
+        info!(
+            project_id,
+            sha,
+            bytes = archive.len(),
+            "repository archive downloaded from gitlab"
+        );
+        Ok(archive)
+    }
+
     pub async fn create_discussion(
         &self,
         project_id: i64,

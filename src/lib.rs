@@ -5,6 +5,7 @@ pub mod error;
 pub mod gitlab;
 pub mod review;
 pub mod rules;
+pub mod script_tasks;
 pub mod server;
 pub mod storage;
 pub mod webhook;

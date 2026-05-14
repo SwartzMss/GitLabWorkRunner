@@ -2,7 +2,7 @@ use crate::{
     diff::{DiffFile, DiffLineKind},
     error::{AppError, AppResult},
 };
-use globset::{Glob, GlobMatcher};
+use globset::{Glob, GlobMatcher, GlobSet, GlobSetBuilder};
 use regex::Regex;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -10,17 +10,35 @@ use std::{fs, path::Path};
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct RulesFile {
+    #[serde(default)]
     pub rules: Vec<RuleConfig>,
+    #[serde(default)]
+    pub script_tasks: Vec<ScriptTaskConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct RuleConfig {
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
     pub id: String,
     pub title: String,
     pub severity: Severity,
     pub path: String,
     pub pattern: String,
     pub message: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ScriptTaskConfig {
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    pub id: String,
+    pub title: String,
+    pub command: String,
+    #[serde(default = "default_script_timeout_seconds")]
+    pub timeout_seconds: u64,
+    #[serde(default)]
+    pub when_changed: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -47,9 +65,16 @@ struct CompiledRule {
     regex: Regex,
 }
 
+#[derive(Clone)]
+pub struct CompiledScriptTask {
+    pub config: ScriptTaskConfig,
+    changed_matcher: Option<GlobSet>,
+}
+
 pub struct Ruleset {
     hash: String,
     rules: Vec<CompiledRule>,
+    script_tasks: Vec<CompiledScriptTask>,
 }
 
 impl Ruleset {
@@ -61,7 +86,7 @@ impl Ruleset {
     pub fn from_toml(text: &str) -> AppResult<Self> {
         let parsed: RulesFile = toml::from_str(text)?;
         let mut rules = Vec::new();
-        for config in parsed.rules {
+        for config in parsed.rules.into_iter().filter(|config| config.enabled) {
             let matcher = Glob::new(&config.path)
                 .map_err(|err| AppError::Rule(format!("invalid glob {}: {err}", config.path)))?
                 .compile_matcher();
@@ -74,12 +99,62 @@ impl Ruleset {
                 regex,
             });
         }
+        let mut script_tasks = Vec::new();
+        for config in parsed
+            .script_tasks
+            .into_iter()
+            .filter(|config| config.enabled)
+        {
+            let changed_matcher = if config.when_changed.is_empty() {
+                None
+            } else {
+                let mut builder = GlobSetBuilder::new();
+                for pattern in &config.when_changed {
+                    builder.add(Glob::new(pattern).map_err(|err| {
+                        AppError::Rule(format!(
+                            "invalid when_changed glob for script task {}: {err}",
+                            config.id
+                        ))
+                    })?);
+                }
+                Some(builder.build().map_err(|err| {
+                    AppError::Rule(format!(
+                        "invalid when_changed glob set for script task {}: {err}",
+                        config.id
+                    ))
+                })?)
+            };
+            script_tasks.push(CompiledScriptTask {
+                config,
+                changed_matcher,
+            });
+        }
         let hash = format!("{:x}", Sha256::digest(text.as_bytes()));
-        Ok(Self { hash, rules })
+        Ok(Self {
+            hash,
+            rules,
+            script_tasks,
+        })
     }
 
     pub fn hash(&self) -> &str {
         &self.hash
+    }
+
+    pub fn has_line_rules(&self) -> bool {
+        !self.rules.is_empty()
+    }
+
+    pub fn script_tasks_for_changes(&self, changed_paths: &[String]) -> Vec<ScriptTaskConfig> {
+        self.script_tasks
+            .iter()
+            .filter(|task| {
+                task.changed_matcher
+                    .as_ref()
+                    .is_none_or(|matcher| changed_paths.iter().any(|path| matcher.is_match(path)))
+            })
+            .map(|task| task.config.clone())
+            .collect()
     }
 
     pub fn evaluate(&self, file: &DiffFile) -> Vec<Finding> {
@@ -105,6 +180,14 @@ impl Ruleset {
         }
         findings
     }
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+fn default_script_timeout_seconds() -> u64 {
+    60
 }
 
 #[cfg(test)]

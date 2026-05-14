@@ -2,8 +2,9 @@ use crate::{
     comments::build_comment_drafts,
     diff::parse_unified_diff,
     error::AppResult,
-    gitlab::{CreateDiscussionRequest, DiscussionPosition, GitLabClient},
+    gitlab::{CreateDiscussionRequest, DiscussionPosition, GitLabChange, GitLabClient},
     rules::Ruleset,
+    script_tasks::{build_script_task_comment, ScriptTaskContext, ScriptTaskRunner},
     storage::{ReviewKey, StateStore, StoredComment},
     webhook::MergeRequestEvent,
 };
@@ -13,14 +14,21 @@ pub struct ReviewService {
     gitlab: GitLabClient,
     store: StateStore,
     ruleset: Ruleset,
+    gitlab_token_env: String,
 }
 
 impl ReviewService {
-    pub fn new(gitlab: GitLabClient, store: StateStore, ruleset: Ruleset) -> Self {
+    pub fn new(
+        gitlab: GitLabClient,
+        store: StateStore,
+        ruleset: Ruleset,
+        gitlab_token_env: String,
+    ) -> Self {
         Self {
             gitlab,
             store,
             ruleset,
+            gitlab_token_env,
         }
     }
 
@@ -75,7 +83,11 @@ impl ReviewService {
             "merge request diff fetched"
         );
 
-        if !changes.diff_refs.is_complete() {
+        let mut findings = Vec::new();
+        let mut published = 0_usize;
+        let mut line_review_skipped = false;
+
+        if self.ruleset.has_line_rules() && !changes.diff_refs.is_complete() {
             warn!(
                 project_id = event.project_id,
                 mr_iid = event.mr_iid,
@@ -83,7 +95,7 @@ impl ReviewService {
                 base_sha = ?changes.diff_refs.base_sha,
                 start_sha = ?changes.diff_refs.start_sha,
                 head_sha = ?changes.diff_refs.head_sha,
-                "review skipped because gitlab diff refs are incomplete"
+                "line review skipped because gitlab diff refs are incomplete"
             );
             let created = self
                 .gitlab
@@ -109,16 +121,41 @@ impl ReviewService {
                     note_id: created.notes.first().map(|note| note.id),
                 })
                 .await?;
-            self.store.mark_processed(&key, "skipped").await?;
-            return Ok(ReviewSummary {
-                skipped: true,
-                findings: 0,
-                comments: 1,
-            });
+            published += 1;
+            line_review_skipped = true;
+        } else if changes.diff_refs.is_complete() {
+            findings = self.evaluate_line_rules(event, &changes.changes)?;
+            published += self
+                .publish_line_findings(event, &changes, &findings)
+                .await?;
         }
 
+        published += self.run_script_tasks(event, &changes).await?;
+
+        self.store.mark_processed(&key, "success").await?;
+        info!(
+            project_id = event.project_id,
+            mr_iid = event.mr_iid,
+            commit_sha = %event.commit_sha,
+            ruleset_hash = %self.ruleset.hash(),
+            findings = findings.len(),
+            comments = published,
+            "review completed"
+        );
+        Ok(ReviewSummary {
+            skipped: line_review_skipped && published == 1,
+            findings: findings.len(),
+            comments: published,
+        })
+    }
+
+    fn evaluate_line_rules(
+        &self,
+        event: &MergeRequestEvent,
+        changes: &[GitLabChange],
+    ) -> AppResult<Vec<crate::rules::Finding>> {
         let mut findings = Vec::new();
-        for change in &changes.changes {
+        for change in changes {
             if change.deleted_file || change.diff.trim().is_empty() {
                 info!(
                     project_id = event.project_id,
@@ -145,8 +182,16 @@ impl ReviewService {
             );
             findings.extend(file_findings);
         }
+        Ok(findings)
+    }
 
-        let drafts = build_comment_drafts(&findings);
+    async fn publish_line_findings(
+        &self,
+        event: &MergeRequestEvent,
+        changes: &crate::gitlab::MergeRequestChanges,
+        findings: &[crate::rules::Finding],
+    ) -> AppResult<usize> {
+        let drafts = build_comment_drafts(findings);
         info!(
             project_id = event.project_id,
             mr_iid = event.mr_iid,
@@ -229,27 +274,95 @@ impl ReviewService {
             }
             published += 1;
         }
+        Ok(published)
+    }
 
-        self.store.mark_processed(&key, "success").await?;
-        info!(
-            project_id = event.project_id,
-            mr_iid = event.mr_iid,
-            commit_sha = %event.commit_sha,
-            ruleset_hash = %self.ruleset.hash(),
-            findings = findings.len(),
-            comments = published,
-            "review completed"
-        );
-        Ok(ReviewSummary {
-            skipped: false,
-            findings: findings.len(),
-            comments: published,
-        })
+    async fn run_script_tasks(
+        &self,
+        event: &MergeRequestEvent,
+        changes: &crate::gitlab::MergeRequestChanges,
+    ) -> AppResult<usize> {
+        let changed_paths = changed_paths(&changes.changes);
+        let tasks = self.ruleset.script_tasks_for_changes(&changed_paths);
+        if tasks.is_empty() {
+            return Ok(0);
+        }
+
+        let archive_sha = changes
+            .diff_refs
+            .head_sha
+            .as_deref()
+            .unwrap_or(&event.commit_sha);
+        if changes.diff_refs.head_sha.is_none() {
+            warn!(
+                project_id = event.project_id,
+                mr_iid = event.mr_iid,
+                event_commit_sha = %event.commit_sha,
+                "script task archive fallback to webhook commit sha because gitlab head_sha is missing"
+            );
+        }
+        let archive = self
+            .gitlab
+            .repository_archive(event.project_id, archive_sha)
+            .await?;
+        let runner = ScriptTaskRunner::new();
+        let context = ScriptTaskContext {
+            project_id: event.project_id,
+            mr_iid: event.mr_iid,
+            commit_sha: archive_sha,
+            token_env: &self.gitlab_token_env,
+        };
+        let mut published = 0_usize;
+        for task in tasks {
+            let result = runner.run(&task, &context, &archive).await?;
+            if !result.should_comment() {
+                continue;
+            }
+            let created = self
+                .gitlab
+                .create_discussion(
+                    event.project_id,
+                    event.mr_iid,
+                    &CreateDiscussionRequest {
+                        body: build_script_task_comment(&result),
+                        position: None,
+                    },
+                )
+                .await?;
+            self.store
+                .record_comment(&StoredComment {
+                    project_id: event.project_id,
+                    mr_iid: event.mr_iid,
+                    commit_sha: &event.commit_sha,
+                    ruleset_hash: self.ruleset.hash(),
+                    rule_id: &format!("script:{}", result.id),
+                    path: "",
+                    new_line: None,
+                    discussion_id: Some(&created.id),
+                    note_id: created.notes.first().map(|note| note.id),
+                })
+                .await?;
+            published += 1;
+        }
+        Ok(published)
     }
 }
 
 fn incomplete_diff_refs_body() -> String {
     "**[warning] Review 已跳过**\n\n当前 MR 的 diff 信息不完整，无法可靠发布行级评论。请先解决冲突或刷新 MR 后重新触发检查。\n\n<!-- gitlab-work-runner:rule=incomplete-diff-refs -->".into()
+}
+
+fn changed_paths(changes: &[GitLabChange]) -> Vec<String> {
+    let mut paths = Vec::new();
+    for change in changes {
+        paths.push(change.new_path.clone());
+        if change.old_path != change.new_path {
+            paths.push(change.old_path.clone());
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

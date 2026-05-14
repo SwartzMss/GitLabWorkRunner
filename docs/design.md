@@ -8,7 +8,7 @@
 2. 服务校验事件并做去重。
 3. 通过 GitLab API 获取 MR diff。
 4. 解析 diff，建立文件、hunk、行号映射。
-5. 执行配置文件定义的规则。
+5. 执行配置文件定义的行级规则和可选脚本任务。
 6. 在 GitLab MR Discussion 中发布行级或 MR 级评论。
 7. 记录已处理 commit、评论 note id 和 MR 状态，避免重复评论。
 
@@ -17,7 +17,7 @@
 第一版不实现以下能力：
 
 - 不实现完整 GitLab Runner 协议。
-- 不执行用户仓库中的 CI 脚本。
+- 不自动执行用户仓库中的 CI 脚本；只执行 `rules.toml` 显式配置的脚本任务。
 - 不支持 GitHub、Bitbucket、Gitea 等其他平台。
 - 不兼容 reviewdog 的所有输入格式、reporter 和 linter adapter。
 - 不做容器沙箱、任务隔离、分布式调度。
@@ -27,7 +27,7 @@
 
 采用“Webhook 实时触发 + GitLab API 获取 Diff + SQLite 状态存储 + 配置化规则引擎 + GitLab MR Discussion 输出”的服务化架构。
 
-这个方案比内置写死规则更灵活，也比第一版直接做插件系统更可控。规则先放在 `rules.toml` 中，通过路径匹配、正则匹配和提示模板完成基础 review。
+这个方案比内置写死规则更灵活，也比第一版直接做插件系统更可控。行级规则先放在 `rules.toml` 中，通过路径匹配、正则匹配和提示模板完成基础 review；复杂检查通过独立的 `script_tasks` 下载 MR head 快照后执行。
 
 ## 系统架构
 
@@ -186,6 +186,49 @@ struct Finding {
 }
 ```
 
+### Script Task Runner
+
+职责：
+
+- 读取 `rules.toml` 中的 `[[script_tasks]]`。
+- 根据 `when_changed` 判断任务是否需要运行。
+- 通过 GitLab archive API 下载 MR 当前 head commit。
+- 解压到 `work/script_tasks/<project_id>/<mr_iid>/<commit_sha>/<task_id>/source`。
+- 在解压后的仓库根目录执行 `command`。
+- 将 stdout 和 stderr 合并写入同一个 `output.log`。
+- 由 Rust 进程控制 timeout，超时后 kill 子进程。
+- 任务完成后删除 `source/`，保留 `output.log` 便于排查。
+- `exit 0` 表示通过；`exit != 0` 或 timeout 时发布 MR 级评论。
+
+第一版脚本任务格式：
+
+```toml
+[[script_tasks]]
+enabled = true
+id = "check-todo-tbd"
+title = "TODO/TBD marker check"
+command = "python3 examples/scripts/check_todo_tbd.py"
+timeout_seconds = 30
+when_changed = ["**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.rs"]
+```
+
+字段说明：
+
+- `enabled`: 单条任务开关，默认 `true`。
+- `id`: 任务唯一标识。
+- `title`: MR 评论标题。
+- `command`: 在 checkout 根目录执行的命令。
+- `timeout_seconds`: 超时时间，默认 60 秒。
+- `when_changed`: 可选 glob 列表；为空时每个 MR 都执行。
+
+脚本输出协议：
+
+- `exit 0`: 通过，不发评论。
+- `exit != 0`: 失败，读取 `output.log` 后发一条 MR 级评论。
+- timeout: 失败，kill 子进程，读取 `output.log` 后发一条 MR 级评论。
+
+第一版不提供 Python helper，不要求 JSON 输出，也不尝试将脚本结果映射成行级评论。
+
 ### Comment Builder
 
 职责：
@@ -289,6 +332,7 @@ max_files = 5
 ```
 
 规则配置使用 `rules.toml`，第一版只支持正则匹配新增行。后续可以扩展成多种 rule kind。
+脚本任务使用同一个 `rules.toml`，但作为独立任务执行，不与行级规则共享 Finding 模型。
 
 ## 错误处理
 
@@ -300,6 +344,7 @@ max_files = 5
 - 评论发布失败：保留 finding 和失败原因，避免整个任务静默成功。
 - 重复事件：返回 `202 Accepted`，不重复评论。
 - 日志文件超过大小限制：轮转当前日志文件，并最多保留配置数量的历史文件。
+- 脚本任务超时：kill 子进程，保留 `output.log`，发布 MR 级失败评论。
 
 ## 测试策略
 
@@ -311,6 +356,7 @@ max_files = 5
 - unified diff parser 的新增行、删除行、上下文行号映射。
 - rules.toml 解析和正则匹配。
 - finding 到 GitLab discussion payload 的转换。
+- script task 的 archive 下载、解压、输出文件、timeout 和失败评论。
 - SQLite 状态写入和重复处理。
 
 集成测试可以使用 mock GitLab API server，验证完整流程：
@@ -331,6 +377,7 @@ Webhook payload -> diff fixture -> rule finding -> discussion API request -> sta
 6. 在 MR 中发布行级评论。
 7. 对同一 commit 和同一规则集不重复评论。
 8. 将完整 Review 流程写入 stdout 和日志文件，并按大小轮转日志文件。
+9. 可选执行 `script_tasks`，失败时发布 MR 级评论。
 
 ## 后续扩展
 
@@ -342,3 +389,4 @@ Webhook payload -> diff fixture -> rule finding -> discussion API request -> sta
 - 支持定时轮询补偿。
 - 支持删除或 resolve 旧评论。
 - 支持更完整的 reviewdog diff 兼容层。
+- 支持脚本任务 JSON 输出协议和更精细的结果定位。

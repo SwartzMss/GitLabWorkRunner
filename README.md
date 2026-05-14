@@ -4,7 +4,7 @@
 
 GitLabWorkRunner 是一个使用 Rust 编写的 GitLab Merge Request 自动 Review 服务。
 
-它不是完整的 GitLab Runner 替代品，也不会执行仓库里的 CI 脚本。第一版聚焦在一个小而完整的 Review 闭环：
+它不是完整的 GitLab Runner 替代品，也不会自动执行仓库里的 CI 脚本。服务只执行 `rules.toml` 中显式配置的 Review 规则和脚本任务。
 
 1. 接收 GitLab Merge Request Webhook。
 2. 通过 GitLab API 拉取 MR diff。
@@ -49,6 +49,7 @@ GitLab Merge Request Event
 - 校验 Webhook secret token。
 - 从 GitLab 拉取 MR changes。
 - 对新增行执行正则规则。
+- 可按配置下载 MR head 快照并执行独立脚本任务。
 - 发布行级 MR 评论。
 - 对相同 commit 和规则集做去重。
 - 将完整 Review 流程日志写入 stdout 和日志文件。
@@ -89,7 +90,41 @@ severity = "warning"
 path = "**/*.rs"
 pattern = "\\.unwrap\\(\\)"
 message = "Direct unwrap can panic at runtime. Prefer explicit error handling."
+
+[[script_tasks]]
+enabled = false
+id = "check-todo-tbd"
+title = "TODO/TBD marker check"
+command = "python3 examples/scripts/check_todo_tbd.py"
+timeout_seconds = 30
+when_changed = ["**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.rs"]
 ```
+
+### 脚本任务
+
+`[[script_tasks]]` 是独立任务，不影响现有 `[[rules]]` 行级检查。每条任务单独配置 `enabled`，不提供总开关。
+
+执行规则：
+
+- `enabled` 不写时默认为 `true`。
+- `when_changed` 不写或为空时，每个 MR 都执行。
+- 服务固定下载 MR 当前 head commit 的 archive。
+- 命令在解压后的仓库根目录执行。
+- stdout 和 stderr 合并写入一个 `output.log`。
+- `exit 0` 表示通过，不发评论。
+- `exit != 0` 或超时表示失败，发一条 MR 级评论。
+- 超时由 Rust 进程控制，默认 `timeout_seconds = 60`。
+
+工作目录：
+
+```text
+work/script_tasks/<project_id>/<mr_iid>/<commit_sha>/<task_id>/
+  output.log
+```
+
+执行完成后会删除解压出的 `source/` 目录，只保留 `output.log` 便于排查。脚本任务会移除配置中的 GitLab token 环境变量，避免脚本直接继承服务 token。
+
+仓库提供了一个最小脚本示例：[examples/scripts/check_todo_tbd.py](examples/scripts/check_todo_tbd.py)。它会扫描 checkout 中的文本文件，发现 `//TODO` 或 `//TBD` 时返回失败并输出文件位置。
 
 ## 本地运行
 
@@ -145,6 +180,7 @@ cargo run
 - Review 开始和 `ruleset_hash`。
 - 相同 commit / ruleset 的跳过决策。
 - GitLab MR changes 拉取开始和完成。
+- script task archive 下载、执行、超时和输出文件路径。
 - diff refs：`base_sha`、`start_sha`、`head_sha`。
 - changed file 数量。
 - 每个文件的 path、hunk 数、finding 数、new/renamed/deleted 状态。
