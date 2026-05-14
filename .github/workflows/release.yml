@@ -125,6 +125,9 @@ jobs:
       - linux
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -136,4 +139,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           version="${{ github.ref_name }}"
-          gh release create "$version" dist/* --repo "$GITHUB_REPOSITORY" --title "$version" --notes "Windows and Ubuntu x86-64 release for $version." --verify-tag
+          notes_file=".github/release-notes/${version}.md"
+          if [ -f "$notes_file" ]; then
+            notes_arg=(--notes-file "$notes_file")
+          else
+            notes_arg=(--notes "Windows and Ubuntu x86-64 release for $version.")
+          fi
+          gh release create "$version" dist/* --repo "$GITHUB_REPOSITORY" --title "$version" "${notes_arg[@]}" --verify-tag
