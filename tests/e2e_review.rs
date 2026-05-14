@@ -1,5 +1,6 @@
 use axum::{
     body::Bytes,
+    extract::Query,
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -11,6 +12,7 @@ use gitlab_work_runner::{
 };
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -222,16 +224,19 @@ async fn runs_script_task_and_posts_output_when_it_fails() {
                     "diff_refs": {
                         "base_sha": "base",
                         "start_sha": "start",
-                        "head_sha": "abc123"
+                        "head_sha": "head123"
                     }
                 }))
             }),
         )
         .route(
             "/api/v4/projects/123/repository/archive.zip",
-            get(move || {
+            get(move |Query(query): Query<HashMap<String, String>>| {
                 let archive = Arc::clone(&archive_for_handler);
-                async move { archive.as_ref().clone().into_response() }
+                async move {
+                    assert_eq!(query.get("sha").map(String::as_str), Some("head123"));
+                    archive.as_ref().clone().into_response()
+                }
             }),
         )
         .route(
@@ -286,7 +291,7 @@ when_changed = ["src/**"]
     let event = MergeRequestEvent {
         project_id: 123,
         mr_iid: 45,
-        commit_sha: "abc123".into(),
+        commit_sha: "event123".into(),
         action: "update".into(),
         source_branch: "feature/review".into(),
         target_branch: "main".into(),

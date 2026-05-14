@@ -88,6 +88,7 @@ impl ScriptTaskRunner {
             .truncate(true)
             .open(&output_path)?;
         let mut command = shell_command(&task.command);
+        configure_process_group(&mut command);
         command
             .current_dir(&source_dir)
             .env_remove(context.token_env)
@@ -115,7 +116,7 @@ impl ScriptTaskRunner {
                     timeout_seconds = task.timeout_seconds,
                     "script task timed out"
                 );
-                let _ = child.kill().await;
+                kill_process_tree(&mut child).await;
                 let _ = child.wait().await;
                 append_timeout_note(&output_path, timeout)?;
                 ScriptTaskStatus::TimedOut
@@ -199,6 +200,102 @@ fn shell_command(command: &str) -> Command {
         process.arg("-c").arg(command);
         process
     }
+}
+
+#[cfg(unix)]
+fn configure_process_group(command: &mut Command) {
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_process_group(_command: &mut Command) {}
+
+async fn kill_process_tree(child: &mut tokio::process::Child) {
+    let Some(pid) = child.id() else {
+        let _ = child.kill().await;
+        return;
+    };
+    if !kill_process_tree_by_pid(pid).await {
+        let _ = child.kill().await;
+    }
+}
+
+#[cfg(windows)]
+async fn kill_process_tree_by_pid(pid: u32) -> bool {
+    let status = Command::new("taskkill")
+        .arg("/PID")
+        .arg(pid.to_string())
+        .arg("/T")
+        .arg("/F")
+        .status()
+        .await;
+    match status {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            warn!(
+                pid,
+                status = ?status.code(),
+                "taskkill failed; falling back to direct process kill"
+            );
+            false
+        }
+        Err(err) => {
+            warn!(
+                pid,
+                error = %err,
+                "taskkill failed; falling back to direct process kill"
+            );
+            false
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn kill_process_tree_by_pid(pid: u32) -> bool {
+    let process_group = format!("-{pid}");
+    let _ = Command::new("kill")
+        .arg("-TERM")
+        .arg(&process_group)
+        .status()
+        .await;
+    let _ = time::timeout(Duration::from_secs(2), async {
+        loop {
+            let status = Command::new("kill")
+                .arg("-0")
+                .arg(&process_group)
+                .status()
+                .await;
+            match status {
+                Ok(status) if status.success() => {}
+                _ => {
+                    break;
+                }
+            }
+            time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    let status = Command::new("kill")
+        .arg("-0")
+        .arg(&process_group)
+        .status()
+        .await;
+    match status {
+        Ok(status) if status.success() => {
+            let _ = Command::new("kill")
+                .arg("-KILL")
+                .arg(&process_group)
+                .status()
+                .await;
+            true
+        }
+        _ => true,
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn kill_process_tree_by_pid(_pid: u32) -> bool {
+    false
 }
 
 fn reset_task_dir(path: &Path) -> io::Result<()> {

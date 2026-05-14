@@ -130,7 +130,7 @@ impl ReviewService {
                 .await?;
         }
 
-        published += self.run_script_tasks(event, &changes.changes).await?;
+        published += self.run_script_tasks(event, &changes).await?;
 
         self.store.mark_processed(&key, "success").await?;
         info!(
@@ -280,23 +280,36 @@ impl ReviewService {
     async fn run_script_tasks(
         &self,
         event: &MergeRequestEvent,
-        changes: &[GitLabChange],
+        changes: &crate::gitlab::MergeRequestChanges,
     ) -> AppResult<usize> {
-        let changed_paths = changed_paths(changes);
+        let changed_paths = changed_paths(&changes.changes);
         let tasks = self.ruleset.script_tasks_for_changes(&changed_paths);
         if tasks.is_empty() {
             return Ok(0);
         }
 
+        let archive_sha = changes
+            .diff_refs
+            .head_sha
+            .as_deref()
+            .unwrap_or(&event.commit_sha);
+        if changes.diff_refs.head_sha.is_none() {
+            warn!(
+                project_id = event.project_id,
+                mr_iid = event.mr_iid,
+                event_commit_sha = %event.commit_sha,
+                "script task archive fallback to webhook commit sha because gitlab head_sha is missing"
+            );
+        }
         let archive = self
             .gitlab
-            .repository_archive(event.project_id, &event.commit_sha)
+            .repository_archive(event.project_id, archive_sha)
             .await?;
         let runner = ScriptTaskRunner::new();
         let context = ScriptTaskContext {
             project_id: event.project_id,
             mr_iid: event.mr_iid,
-            commit_sha: &event.commit_sha,
+            commit_sha: archive_sha,
             token_env: &self.gitlab_token_env,
         };
         let mut published = 0_usize;
