@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.4.1
+
+- 修复脚本任务执行目录：`command` 现在从 runner 可执行文件所在目录执行，相对路径可直接引用 release 包内的 `examples/scripts/...`。
+- 被检查的 MR head 代码快照仍作为第 1 个参数传给脚本，`result.txt` 路径仍作为第 2 个参数传给脚本。
+- 日志新增 `script_cwd` 字段，便于确认脚本命令实际从哪个目录执行。
+
 ## v1.4.0
 
 - 发布包新增 `examples/` 目录，示例脚本会随 Windows/Linux release artifact 一起打包。
