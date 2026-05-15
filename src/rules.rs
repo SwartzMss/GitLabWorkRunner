@@ -35,8 +35,6 @@ pub struct ScriptTaskConfig {
     pub id: String,
     pub title: String,
     pub command: String,
-    #[serde(default)]
-    pub allow_failure: bool,
     #[serde(default = "default_script_timeout_seconds")]
     pub timeout_seconds: u64,
     #[serde(default)]

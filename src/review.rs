@@ -4,7 +4,7 @@ use crate::{
     error::AppResult,
     gitlab::{CreateDiscussionRequest, DiscussionPosition, GitLabChange, GitLabClient},
     rules::Ruleset,
-    script_tasks::{build_script_task_comment, ScriptTaskContext, ScriptTaskRunner},
+    script_tasks::{ScriptTaskContext, ScriptTaskRunner},
     storage::{ReviewKey, StateStore, StoredComment},
     webhook::MergeRequestEvent,
 };
@@ -312,39 +312,10 @@ impl ReviewService {
             commit_sha: archive_sha,
             token_env: &self.gitlab_token_env,
         };
-        let mut published = 0_usize;
         for task in tasks {
-            let result = runner.run(&task, &context, &archive).await?;
-            if !result.should_comment() {
-                continue;
-            }
-            let created = self
-                .gitlab
-                .create_discussion(
-                    event.project_id,
-                    event.mr_iid,
-                    &CreateDiscussionRequest {
-                        body: build_script_task_comment(&result),
-                        position: None,
-                    },
-                )
-                .await?;
-            self.store
-                .record_comment(&StoredComment {
-                    project_id: event.project_id,
-                    mr_iid: event.mr_iid,
-                    commit_sha: &event.commit_sha,
-                    ruleset_hash: self.ruleset.hash(),
-                    rule_id: &format!("script:{}", result.id),
-                    path: "",
-                    new_line: None,
-                    discussion_id: Some(&created.id),
-                    note_id: created.notes.first().map(|note| note.id),
-                })
-                .await?;
-            published += 1;
+            runner.run(&task, &context, &archive).await?;
         }
-        Ok(published)
+        Ok(0)
     }
 }
 

@@ -198,7 +198,7 @@ struct Finding {
 - 将 stdout 和 stderr 合并写入同一个 `output.log`。
 - 由 Rust 进程控制 timeout，超时后 kill 子进程。
 - 任务完成后删除 `source/`，保留 `output.log` 便于排查。
-- `exit 0` 表示通过；`exit != 0` 或 timeout 时发布 MR 级评论。
+- `exit 0` 表示通过；`exit != 0` 或 timeout 时只记录日志并保留 `output.log`，不发布 MR 评论。
 
 第一版脚本任务格式：
 
@@ -207,7 +207,6 @@ struct Finding {
 enabled = true
 id = "check-todo-tbd"
 title = "TODO/TBD marker check"
-allow_failure = true
 command = "python examples/scripts/check_todo_tbd.py"
 timeout_seconds = 30
 when_changed = ["**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.rs"]
@@ -225,8 +224,8 @@ when_changed = ["**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.rs"
 脚本输出协议：
 
 - `exit 0`: 通过，不发评论。
-- `exit != 0`: 失败，读取 `output.log` 后发一条 MR 级评论。
-- timeout: 失败，kill 子进程，读取 `output.log` 后发一条 MR 级评论。
+- `exit != 0`: 失败，保留 `output.log`，不发 MR 评论。
+- timeout: 失败，kill 子进程，保留 `output.log`，不发 MR 评论。
 
 第一版不提供 Python helper，不要求 JSON 输出，也不尝试将脚本结果映射成行级评论。
 
@@ -345,7 +344,7 @@ max_files = 5
 - 评论发布失败：保留 finding 和失败原因，避免整个任务静默成功。
 - 重复事件：返回 `202 Accepted`，不重复评论。
 - 日志文件超过大小限制：轮转当前日志文件，并最多保留配置数量的历史文件。
-- 脚本任务超时：kill 子进程，保留 `output.log`，发布 MR 级失败评论。
+- 脚本任务超时：kill 子进程，保留 `output.log`，不发布 MR 评论。
 
 ## 测试策略
 
@@ -357,7 +356,7 @@ max_files = 5
 - unified diff parser 的新增行、删除行、上下文行号映射。
 - rules.toml 解析和正则匹配。
 - finding 到 GitLab discussion payload 的转换。
-- script task 的 archive 下载、解压、输出文件、timeout 和失败评论。
+- script task 的 archive 下载、解压、输出文件和 timeout 处理。
 - SQLite 状态写入和重复处理。
 
 集成测试可以使用 mock GitLab API server，验证完整流程：
@@ -378,7 +377,7 @@ Webhook payload -> diff fixture -> rule finding -> discussion API request -> sta
 6. 在 MR 中发布行级评论。
 7. 对同一 commit 和同一规则集不重复评论。
 8. 将完整 Review 流程写入 stdout 和日志文件，并按大小轮转日志文件。
-9. 可选执行 `script_tasks`；失败时默认发布 MR 级评论，`allow_failure = true` 时只记录日志和 `output.log`。
+9. 可选执行 `script_tasks`；失败或超时时只记录日志和 `output.log`。
 
 ## 后续扩展
 

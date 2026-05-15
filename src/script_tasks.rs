@@ -4,7 +4,7 @@ use crate::{
 };
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, Cursor, Read, Write},
+    io::{self, Cursor, Write},
     path::{Component, Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -14,11 +14,9 @@ use tracing::{info, warn};
 use zip::ZipArchive;
 
 const DEFAULT_WORK_ROOT: &str = "work/script_tasks";
-const MAX_OUTPUT_BYTES: u64 = 16 * 1024;
 
 pub struct ScriptTaskRunner {
     work_root: PathBuf,
-    max_output_bytes: u64,
 }
 
 pub struct ScriptTaskContext<'a> {
@@ -33,11 +31,9 @@ pub struct ScriptTaskResult {
     pub id: String,
     pub title: String,
     pub status: ScriptTaskStatus,
-    pub allow_failure: bool,
     pub command: String,
     pub source_dir: PathBuf,
     pub output_path: PathBuf,
-    pub output_excerpt: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,17 +43,10 @@ pub enum ScriptTaskStatus {
     TimedOut,
 }
 
-impl ScriptTaskResult {
-    pub fn should_comment(&self) -> bool {
-        !self.allow_failure && !matches!(self.status, ScriptTaskStatus::Passed)
-    }
-}
-
 impl ScriptTaskRunner {
     pub fn new() -> Self {
         Self {
             work_root: PathBuf::from(DEFAULT_WORK_ROOT),
-            max_output_bytes: MAX_OUTPUT_BYTES,
         }
     }
 
@@ -81,7 +70,6 @@ impl ScriptTaskRunner {
             commit_sha = %context.commit_sha,
             script_task_id = %task.id,
             command = %command_with_check_root,
-            allow_failure = task.allow_failure,
             timeout_seconds = task.timeout_seconds,
             work_dir = %task_dir.display(),
             source_dir = %source_dir.display(),
@@ -134,14 +122,12 @@ impl ScriptTaskRunner {
             fs::remove_dir_all(&source_dir)?;
         }
 
-        let output_excerpt = read_output_excerpt(&output_path, self.max_output_bytes)?;
         info!(
             project_id = context.project_id,
             mr_iid = context.mr_iid,
             commit_sha = %context.commit_sha,
             script_task_id = %task.id,
             status = ?status,
-            allow_failure = task.allow_failure,
             source_dir = %source_dir.display(),
             output_path = %output_path.display(),
             "script task completed"
@@ -150,11 +136,9 @@ impl ScriptTaskRunner {
             id: task.id.clone(),
             title: task.title.clone(),
             status,
-            allow_failure: task.allow_failure,
             command: command_with_check_root,
             source_dir,
             output_path,
-            output_excerpt,
         })
     }
 
@@ -170,49 +154,6 @@ impl ScriptTaskRunner {
 impl Default for ScriptTaskRunner {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-pub fn build_script_task_comment(result: &ScriptTaskResult) -> String {
-    let execution_note = format!(
-        "执行命令：`{}`\n\n检查目录：`{}`\n\n> 检查目录是 MR head 的临时代码快照，任务结束后会被清理；排查时看下面的输出文件。",
-        result.command,
-        result.source_dir.display()
-    );
-    let status = match result.status {
-        ScriptTaskStatus::Passed => "passed",
-        ScriptTaskStatus::Failed(Some(code)) => {
-            let hint = exit_code_hint(code);
-            return format!(
-                "**[error] {}**\n\n脚本任务执行失败，退出码：`{}`。{}\n\n{}\n\n```text\n{}\n```\n\n输出文件：`{}`\n\n<!-- gitlab-work-runner:script={} -->",
-                result.title,
-                code,
-                hint,
-                execution_note,
-                result.output_excerpt,
-                result.output_path.display(),
-                result.id
-            );
-        }
-        ScriptTaskStatus::Failed(None) => "failed",
-        ScriptTaskStatus::TimedOut => "timed out",
-    };
-    format!(
-        "**[error] {}**\n\n脚本任务执行失败：`{}`。\n\n{}\n\n```text\n{}\n```\n\n输出文件：`{}`\n\n<!-- gitlab-work-runner:script={} -->",
-        result.title,
-        status,
-        execution_note,
-        result.output_excerpt,
-        result.output_path.display(),
-        result.id
-    )
-}
-
-fn exit_code_hint(code: i32) -> &'static str {
-    match code {
-        9009 => " Windows 上 `9009` 通常表示命令未找到，请确认脚本解释器或命令已安装并在 PATH 中。",
-        127 => " Unix 上 `127` 通常表示命令未找到，请确认脚本解释器或命令已安装并在 PATH 中。",
-        _ => "",
     }
 }
 
@@ -361,25 +302,6 @@ fn append_timeout_note(path: &Path, timeout: Duration) -> io::Result<()> {
     )
 }
 
-fn read_output_excerpt(path: &Path, max_bytes: u64) -> io::Result<String> {
-    let mut file = File::open(path)?;
-    let mut buffer = Vec::new();
-    let mut limited = std::io::Read::by_ref(&mut file).take(max_bytes + 1);
-    limited.read_to_end(&mut buffer)?;
-    let truncated = buffer.len() as u64 > max_bytes;
-    if truncated {
-        buffer.truncate(max_bytes as usize);
-    }
-    let mut text = String::from_utf8_lossy(&buffer).to_string();
-    if truncated {
-        text.push_str("\n[gitlab-work-runner] output truncated");
-    }
-    if text.trim().is_empty() {
-        text.push_str("[gitlab-work-runner] no output captured");
-    }
-    Ok(text)
-}
-
 fn extract_zip_archive(bytes: &[u8], destination: &Path) -> AppResult<()> {
     let reader = Cursor::new(bytes);
     let mut archive =
@@ -491,51 +413,11 @@ mod tests {
         assert_eq!(sanitize_path_segment(""), "_");
     }
 
-    #[test]
-    fn script_task_comment_includes_execution_context_and_command_hint() {
-        let result = ScriptTaskResult {
-            id: "check-todo-tbd".into(),
-            title: "TODO/TBD marker check".into(),
-            status: ScriptTaskStatus::Failed(Some(9009)),
-            allow_failure: false,
-            command: "python examples/scripts/check_todo_tbd.py".into(),
-            source_dir: PathBuf::from("work/script_tasks/1/1/abc/check-todo-tbd/source"),
-            output_path: PathBuf::from("work/script_tasks/1/1/abc/check-todo-tbd/output.log"),
-            output_excerpt: "[gitlab-work-runner] no output captured".into(),
-        };
-
-        let comment = build_script_task_comment(&result);
-
-        assert!(comment.contains("执行命令"));
-        assert!(comment.contains("检查目录"));
-        assert!(comment.contains("MR head"));
-        assert!(comment.contains("9009"));
-        assert!(comment.contains("命令未找到"));
-        assert!(comment.contains("output.log"));
-    }
-
-    #[test]
-    fn script_task_should_not_comment_when_failure_is_allowed() {
-        let result = ScriptTaskResult {
-            id: "optional-script".into(),
-            title: "Optional script".into(),
-            status: ScriptTaskStatus::Failed(Some(1)),
-            allow_failure: true,
-            command: "optional-check".into(),
-            source_dir: PathBuf::from("work/script_tasks/1/1/abc/optional-script/source"),
-            output_path: PathBuf::from("work/script_tasks/1/1/abc/optional-script/output.log"),
-            output_excerpt: "failed".into(),
-        };
-
-        assert!(!result.should_comment());
-    }
-
     #[tokio::test]
     async fn script_task_passes_check_root_as_argument() {
         let temp = tempfile::tempdir().unwrap();
         let runner = ScriptTaskRunner {
             work_root: temp.path().join("work"),
-            max_output_bytes: MAX_OUTPUT_BYTES,
         };
         let command = if cfg!(windows) {
             "check-root.cmd"
@@ -546,7 +428,6 @@ mod tests {
             id: "check-root".into(),
             title: "Check root".into(),
             command: command.into(),
-            allow_failure: false,
             timeout_seconds: 5,
             enabled: true,
             when_changed: Vec::new(),
@@ -560,11 +441,6 @@ mod tests {
 
         let result = runner.run(&task, &context, &test_archive()).await.unwrap();
 
-        assert_eq!(
-            result.status,
-            ScriptTaskStatus::Passed,
-            "{}",
-            result.output_excerpt
-        );
+        assert_eq!(result.status, ScriptTaskStatus::Passed);
     }
 }

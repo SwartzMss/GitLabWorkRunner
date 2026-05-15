@@ -95,7 +95,6 @@ message = "Direct unwrap can panic at runtime. Prefer explicit error handling."
 enabled = false
 id = "check-todo-tbd"
 title = "TODO/TBD marker check"
-allow_failure = true
 command = "python examples/scripts/check_todo_tbd.py"
 timeout_seconds = 30
 when_changed = ["**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.rs"]
@@ -108,13 +107,12 @@ when_changed = ["**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.rs"
 Behavior:
 
 - `enabled` defaults to `true` when omitted.
-- `allow_failure` defaults to `false`; when set to `true`, failures and timeouts are logged and keep `output.log`, but do not create MR comments.
 - If `when_changed` is omitted or empty, the task runs for every MR.
 - The service always downloads the current MR head commit archive.
 - The command runs from the extracted MR head repository root, which is the code snapshot being checked.
 - stdout and stderr are merged into one `output.log`.
-- `exit 0` means pass and does not create a comment.
-- `exit != 0` or timeout is treated as failure; by default it creates one MR-level comment, but `allow_failure = true` suppresses that comment.
+- `exit 0` means pass.
+- `exit != 0` or timeout is treated as failure, but does not create an MR comment; the service only logs it and keeps `output.log`.
 - Timeout is enforced by the Rust process; `timeout_seconds` defaults to `60`.
 - The service appends the MR head source snapshot root to the command, so scripts can read it as their first business argument.
 
