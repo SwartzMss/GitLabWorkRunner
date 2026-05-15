@@ -194,7 +194,7 @@ struct Finding {
 - 根据 `when_changed` 判断任务是否需要运行。
 - 通过 GitLab archive API 下载 MR 当前 head commit。
 - 解压到 `work/script_tasks/<project_id>/<mr_iid>/<commit_sha>/<task_id>/source`。
-- 在解压后的仓库根目录执行 `command`。
+- 在 runner 可执行文件所在目录执行 `command`，相对脚本路径不绑定目标 GitLab 仓库。
 - 将 stdout 和 stderr 合并写入 `run.log`，用于查看脚本运行过程。
 - 将 `result.txt` 路径作为第二个参数传给脚本，脚本将检测结果写入该文件。
 - 由 Rust 进程控制 timeout，超时后 kill 子进程。
@@ -218,7 +218,7 @@ when_changed = ["**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.rs"
 - `enabled`: 单条任务开关，默认 `true`。
 - `id`: 任务唯一标识。
 - `title`: MR 评论标题。
-- `command`: 在 checkout 根目录执行的命令。
+- `command`: 在 runner 可执行文件所在目录执行的命令；相对路径基于该目录解析。
 - `timeout_seconds`: 超时时间，默认 60 秒。
 - `when_changed`: 可选 glob 列表；为空时每个 MR 都执行。
 

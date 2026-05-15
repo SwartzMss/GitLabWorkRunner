@@ -109,7 +109,7 @@ when_changed = ["**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.rs"
 - `enabled` 不写时默认为 `true`。
 - `when_changed` 不写或为空时，每个 MR 都执行。
 - 服务固定下载 MR 当前 head commit 的 archive。
-- 命令在解压后的 MR head 仓库根目录执行，也就是脚本检查的代码快照。
+- 命令在 runner 可执行文件所在目录执行；`command` 中的相对路径也基于这个目录解析。
 - stdout 和 stderr 合并写入 `run.log`，用于查看脚本运行过程。
 - 服务会把 `result.txt` 路径作为第二个参数传给脚本，脚本应把检测结果写入这个文件。
 - `exit 0` 表示检测通过。
@@ -131,7 +131,7 @@ work/script_tasks/<project_id>/<mr_iid>/<commit_sha>/<task_id>/
 
 仓库提供了一个最小脚本示例：[examples/scripts/check_todo_tbd.py](examples/scripts/check_todo_tbd.py)。它读取第一个参数作为检查目录，第二个参数作为结果文件路径；过程日志写 stdout，检测结果写 `result.txt`。
 
-注意：`command = "python examples/scripts/check_todo_tbd.py"` 中的相对路径是相对于 MR 代码快照根目录的。如果目标 GitLab 项目里没有这个脚本，请把示例脚本复制到目标仓库，或者把 `command` 改成 runner 机器上的绝对路径。Windows 上如果返回退出码 `9009`，通常表示命令不存在，需要把 Python 加入 `PATH`。
+注意：`command = "python examples/scripts/check_todo_tbd.py"` 中的相对路径是相对于 runner 可执行文件所在目录的。如果使用 release 包里的示例脚本，保持这个路径即可；如果脚本放在其他目录，可以改成绝对路径。Windows 上如果返回退出码 `9009`，通常表示命令不存在，需要把 Python 加入 `PATH`。
 
 ## 本地运行
 

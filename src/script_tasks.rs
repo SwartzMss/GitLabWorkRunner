@@ -65,6 +65,7 @@ impl ScriptTaskRunner {
         reset_task_dir(&task_dir)?;
         fs::create_dir_all(&source_dir)?;
         extract_zip_archive(archive, &source_dir)?;
+        let script_cwd = script_working_dir()?;
 
         let command_with_args = command_with_script_args(&task.command, &source_dir, &result_path);
         info!(
@@ -75,6 +76,7 @@ impl ScriptTaskRunner {
             command = %command_with_args,
             timeout_seconds = task.timeout_seconds,
             work_dir = %task_dir.display(),
+            script_cwd = %script_cwd.display(),
             source_dir = %source_dir.display(),
             run_log_path = %run_log_path.display(),
             result_path = %result_path.display(),
@@ -89,7 +91,7 @@ impl ScriptTaskRunner {
         let mut command = shell_command(&task.command, &source_dir, &result_path);
         configure_process_group(&mut command);
         command
-            .current_dir(&source_dir)
+            .current_dir(&script_cwd)
             .env_remove(context.token_env)
             .env_remove("GITLAB_TOKEN")
             .stdout(Stdio::from(run_log.try_clone()?))
@@ -165,6 +167,13 @@ fn script_task_status(code: Option<i32>) -> ScriptTaskStatus {
         Some(1) => ScriptTaskStatus::IssueFound,
         other => ScriptTaskStatus::ExecutionFailed(other),
     }
+}
+
+fn script_working_dir() -> io::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    exe.parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| io::Error::other("current executable has no parent directory"))
 }
 
 fn command_with_script_args(command: &str, check_root: &Path, result_path: &Path) -> String {
@@ -414,7 +423,7 @@ mod tests {
             )
             .unwrap();
             zip.write_all(
-                br#"@if /I NOT "%~f1"=="%CD%" exit /B 2
+                br#"@if NOT EXIST "%~f1\README.md" exit /B 2
 @echo ok>"%~2"
 @exit /B 0"#,
             )
@@ -424,7 +433,7 @@ mod tests {
                 zip::write::SimpleFileOptions::default(),
             )
             .unwrap();
-            zip.write_all(br#"[ "$1" = "$PWD" ] && echo ok > "$2""#)
+            zip.write_all(br#"[ -f "$1/README.md" ] && echo ok > "$2""#)
                 .unwrap();
             zip.finish().unwrap();
         }
@@ -458,14 +467,24 @@ mod tests {
             work_root: temp.path().join("work"),
         };
         let command = if cfg!(windows) {
-            "check-root.cmd"
+            temp.path()
+                .join("work/1/2/abc/check-root/source/check-root.cmd")
+                .display()
+                .to_string()
         } else {
-            "sh check-root.sh"
+            format!(
+                "sh {}",
+                shell_quote_arg(
+                    &temp
+                        .path()
+                        .join("work/1/2/abc/check-root/source/check-root.sh")
+                )
+            )
         };
         let task = ScriptTaskConfig {
             id: "check-root".into(),
             title: "Check root".into(),
-            command: command.into(),
+            command,
             timeout_seconds: 5,
             enabled: true,
             when_changed: Vec::new(),
@@ -479,7 +498,12 @@ mod tests {
 
         let result = runner.run(&task, &context, &test_archive()).await.unwrap();
 
-        assert_eq!(result.status, ScriptTaskStatus::Passed);
+        assert_eq!(
+            result.status,
+            ScriptTaskStatus::Passed,
+            "{}",
+            fs::read_to_string(&result.run_log_path).unwrap_or_default()
+        );
         assert!(result.run_log_path.exists());
         assert_eq!(fs::read_to_string(result.result_path).unwrap().trim(), "ok");
     }

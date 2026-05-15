@@ -4,6 +4,7 @@
 
 - 发布包新增 `examples/` 目录，示例脚本会随 Windows/Linux release artifact 一起打包。
 - 脚本任务命令统一使用 `python` 示例，不再使用 `python3`。
+- 脚本任务命令在 runner 可执行文件所在目录执行，相对路径不再绑定目标 GitLab 仓库。
 - 脚本任务执行时会追加两个参数：MR head 代码快照根目录和结果文件路径。
 - 脚本任务输出拆分为 `run.log` 和 `result.txt`：stdout/stderr 写入 `run.log`，检测结果写入 `result.txt`。
 - 定义脚本任务退出码协议：`0` 表示检测通过，`1` 表示检测发现问题，其他退出码或超时表示脚本执行异常。

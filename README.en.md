@@ -109,7 +109,7 @@ Behavior:
 - `enabled` defaults to `true` when omitted.
 - If `when_changed` is omitted or empty, the task runs for every MR.
 - The service always downloads the current MR head commit archive.
-- The command runs from the extracted MR head repository root, which is the code snapshot being checked.
+- The command runs from the runner executable directory; relative paths in `command` are resolved from that directory.
 - stdout and stderr are merged into `run.log` for script execution logs.
 - The service passes the `result.txt` path as the second argument; scripts should write check results to that file.
 - `exit 0` means the check passed.
@@ -131,7 +131,7 @@ After execution, the extracted `source/` directory is removed and only `run.log`
 
 The repository includes a minimal script example: [examples/scripts/check_todo_tbd.py](examples/scripts/check_todo_tbd.py). It reads the first argument as the directory to check and the second argument as the result file path; process logs go to stdout and check results go to `result.txt`.
 
-Note: the relative path in `command = "python examples/scripts/check_todo_tbd.py"` is resolved from the MR source snapshot root. If the target GitLab repository does not contain that script, either copy the example script into the target repository or change `command` to an absolute path on the runner machine. On Windows, exit code `9009` usually means the command is not found; add Python to `PATH`.
+Note: the relative path in `command = "python examples/scripts/check_todo_tbd.py"` is resolved from the runner executable directory. If you use the example script from the release package, keep this path. If the script lives elsewhere, use an absolute path. On Windows, exit code `9009` usually means the command is not found; add Python to `PATH`.
 
 ## Local Run
 
