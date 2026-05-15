@@ -95,7 +95,8 @@ message = "Direct unwrap can panic at runtime. Prefer explicit error handling."
 enabled = false
 id = "check-todo-tbd"
 title = "TODO/TBD marker check"
-command = "python3 examples/scripts/check_todo_tbd.py"
+allow_failure = true
+command = "python examples/scripts/check_todo_tbd.py"
 timeout_seconds = 30
 when_changed = ["**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.rs"]
 ```
@@ -107,12 +108,13 @@ when_changed = ["**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.rs"
 Behavior:
 
 - `enabled` defaults to `true` when omitted.
+- `allow_failure` defaults to `false`; when set to `true`, failures and timeouts are logged and keep `output.log`, but do not create MR comments.
 - If `when_changed` is omitted or empty, the task runs for every MR.
 - The service always downloads the current MR head commit archive.
 - The command runs from the extracted MR head repository root, which is the code snapshot being checked.
 - stdout and stderr are merged into one `output.log`.
 - `exit 0` means pass and does not create a comment.
-- `exit != 0` or timeout creates one MR-level comment.
+- `exit != 0` or timeout is treated as failure; by default it creates one MR-level comment, but `allow_failure = true` suppresses that comment.
 - Timeout is enforced by the Rust process; `timeout_seconds` defaults to `60`.
 - The service appends the MR head source snapshot root to the command, so scripts can read it as their first business argument.
 
@@ -127,7 +129,7 @@ After execution, the extracted `source/` directory is removed and only `output.l
 
 The repository includes a minimal script example: [examples/scripts/check_todo_tbd.py](examples/scripts/check_todo_tbd.py). It reads the first argument as the directory to check and fails when it finds `//TODO` or `//TBD`, printing file locations.
 
-Note: the relative path in `command = "python3 examples/scripts/check_todo_tbd.py"` is resolved from the MR source snapshot root. If the target GitLab repository does not contain that script, either copy the example script into the target repository or change `command` to an absolute path on the runner machine. On Windows, exit code `9009` usually means the command is not found; use `python` instead of `python3` or add Python to `PATH`.
+Note: the relative path in `command = "python examples/scripts/check_todo_tbd.py"` is resolved from the MR source snapshot root. If the target GitLab repository does not contain that script, either copy the example script into the target repository or change `command` to an absolute path on the runner machine. On Windows, exit code `9009` usually means the command is not found; add Python to `PATH`.
 
 ## Local Run
 

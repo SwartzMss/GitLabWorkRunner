@@ -95,7 +95,8 @@ message = "Direct unwrap can panic at runtime. Prefer explicit error handling."
 enabled = false
 id = "check-todo-tbd"
 title = "TODO/TBD marker check"
-command = "python3 examples/scripts/check_todo_tbd.py"
+allow_failure = true
+command = "python examples/scripts/check_todo_tbd.py"
 timeout_seconds = 30
 when_changed = ["**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.rs"]
 ```
@@ -107,12 +108,13 @@ when_changed = ["**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.rs"
 执行规则：
 
 - `enabled` 不写时默认为 `true`。
+- `allow_failure` 不写时默认为 `false`；设为 `true` 后，脚本失败或超时只记录日志和 `output.log`，不发 MR 评论。
 - `when_changed` 不写或为空时，每个 MR 都执行。
 - 服务固定下载 MR 当前 head commit 的 archive。
 - 命令在解压后的 MR head 仓库根目录执行，也就是脚本检查的代码快照。
 - stdout 和 stderr 合并写入一个 `output.log`。
 - `exit 0` 表示通过，不发评论。
-- `exit != 0` 或超时表示失败，发一条 MR 级评论。
+- `exit != 0` 或超时表示失败；默认会发一条 MR 级评论，`allow_failure = true` 时不发评论。
 - 超时由 Rust 进程控制，默认 `timeout_seconds = 60`。
 - 服务会把本次要检查的 MR head 代码快照根目录追加到命令末尾，脚本可以把它当作第一个业务参数读取。
 
@@ -127,7 +129,7 @@ work/script_tasks/<project_id>/<mr_iid>/<commit_sha>/<task_id>/
 
 仓库提供了一个最小脚本示例：[examples/scripts/check_todo_tbd.py](examples/scripts/check_todo_tbd.py)。它读取第一个参数作为检查目录，发现 `//TODO` 或 `//TBD` 时返回失败并输出文件位置。
 
-注意：`command = "python3 examples/scripts/check_todo_tbd.py"` 中的相对路径是相对于 MR 代码快照根目录的。如果目标 GitLab 项目里没有这个脚本，请把示例脚本复制到目标仓库，或者把 `command` 改成 runner 机器上的绝对路径。Windows 上如果 `python3` 返回退出码 `9009`，通常表示命令不存在，可以改用 `python` 或把 Python 加入 `PATH`。
+注意：`command = "python examples/scripts/check_todo_tbd.py"` 中的相对路径是相对于 MR 代码快照根目录的。如果目标 GitLab 项目里没有这个脚本，请把示例脚本复制到目标仓库，或者把 `command` 改成 runner 机器上的绝对路径。Windows 上如果返回退出码 `9009`，通常表示命令不存在，需要把 Python 加入 `PATH`。
 
 ## 本地运行
 

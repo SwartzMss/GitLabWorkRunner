@@ -207,7 +207,8 @@ struct Finding {
 enabled = true
 id = "check-todo-tbd"
 title = "TODO/TBD marker check"
-command = "python3 examples/scripts/check_todo_tbd.py"
+allow_failure = true
+command = "python examples/scripts/check_todo_tbd.py"
 timeout_seconds = 30
 when_changed = ["**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.rs"]
 ```
@@ -377,7 +378,7 @@ Webhook payload -> diff fixture -> rule finding -> discussion API request -> sta
 6. 在 MR 中发布行级评论。
 7. 对同一 commit 和同一规则集不重复评论。
 8. 将完整 Review 流程写入 stdout 和日志文件，并按大小轮转日志文件。
-9. 可选执行 `script_tasks`，失败时发布 MR 级评论。
+9. 可选执行 `script_tasks`；失败时默认发布 MR 级评论，`allow_failure = true` 时只记录日志和 `output.log`。
 
 ## 后续扩展
 

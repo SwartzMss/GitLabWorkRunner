@@ -33,6 +33,7 @@ pub struct ScriptTaskResult {
     pub id: String,
     pub title: String,
     pub status: ScriptTaskStatus,
+    pub allow_failure: bool,
     pub command: String,
     pub source_dir: PathBuf,
     pub output_path: PathBuf,
@@ -48,7 +49,7 @@ pub enum ScriptTaskStatus {
 
 impl ScriptTaskResult {
     pub fn should_comment(&self) -> bool {
-        !matches!(self.status, ScriptTaskStatus::Passed)
+        !self.allow_failure && !matches!(self.status, ScriptTaskStatus::Passed)
     }
 }
 
@@ -80,6 +81,7 @@ impl ScriptTaskRunner {
             commit_sha = %context.commit_sha,
             script_task_id = %task.id,
             command = %command_with_check_root,
+            allow_failure = task.allow_failure,
             timeout_seconds = task.timeout_seconds,
             work_dir = %task_dir.display(),
             source_dir = %source_dir.display(),
@@ -139,6 +141,7 @@ impl ScriptTaskRunner {
             commit_sha = %context.commit_sha,
             script_task_id = %task.id,
             status = ?status,
+            allow_failure = task.allow_failure,
             source_dir = %source_dir.display(),
             output_path = %output_path.display(),
             "script task completed"
@@ -147,6 +150,7 @@ impl ScriptTaskRunner {
             id: task.id.clone(),
             title: task.title.clone(),
             status,
+            allow_failure: task.allow_failure,
             command: command_with_check_root,
             source_dir,
             output_path,
@@ -493,7 +497,8 @@ mod tests {
             id: "check-todo-tbd".into(),
             title: "TODO/TBD marker check".into(),
             status: ScriptTaskStatus::Failed(Some(9009)),
-            command: "python3 examples/scripts/check_todo_tbd.py".into(),
+            allow_failure: false,
+            command: "python examples/scripts/check_todo_tbd.py".into(),
             source_dir: PathBuf::from("work/script_tasks/1/1/abc/check-todo-tbd/source"),
             output_path: PathBuf::from("work/script_tasks/1/1/abc/check-todo-tbd/output.log"),
             output_excerpt: "[gitlab-work-runner] no output captured".into(),
@@ -507,6 +512,22 @@ mod tests {
         assert!(comment.contains("9009"));
         assert!(comment.contains("命令未找到"));
         assert!(comment.contains("output.log"));
+    }
+
+    #[test]
+    fn script_task_should_not_comment_when_failure_is_allowed() {
+        let result = ScriptTaskResult {
+            id: "optional-script".into(),
+            title: "Optional script".into(),
+            status: ScriptTaskStatus::Failed(Some(1)),
+            allow_failure: true,
+            command: "optional-check".into(),
+            source_dir: PathBuf::from("work/script_tasks/1/1/abc/optional-script/source"),
+            output_path: PathBuf::from("work/script_tasks/1/1/abc/optional-script/output.log"),
+            output_excerpt: "failed".into(),
+        };
+
+        assert!(!result.should_comment());
     }
 
     #[tokio::test]
@@ -525,6 +546,7 @@ mod tests {
             id: "check-root".into(),
             title: "Check root".into(),
             command: command.into(),
+            allow_failure: false,
             timeout_seconds: 5,
             enabled: true,
             when_changed: Vec::new(),
