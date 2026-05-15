@@ -26,12 +26,15 @@ def read_text(path: Path):
 
 
 def main() -> int:
-    if len(sys.argv) != 2:
-        print("usage: check_todo_tbd.py <check_root>")
+    if len(sys.argv) != 3:
+        print("usage: check_todo_tbd.py <check_root> <result_path>")
         return 2
     root = Path(sys.argv[1]).resolve()
+    result_path = Path(sys.argv[2]).resolve()
+    print(f"checking root: {root}")
     findings = []
     for path in iter_files(root):
+        print(f"scan {path.relative_to(root)}")
         text = read_text(path)
         if text is None:
             continue
@@ -40,9 +43,14 @@ def main() -> int:
                 findings.append(f"{path.relative_to(root)}:{line_no}: {line.strip()}")
 
     if not findings:
+        result_path.write_text("No //TODO or //TBD markers found.\n", encoding="utf-8")
         print("No //TODO or //TBD markers found.")
         return 0
 
+    result_path.write_text(
+        "Found //TODO or //TBD markers:\n" + "\n".join(findings) + "\n",
+        encoding="utf-8",
+    )
     print("Found //TODO or //TBD markers:")
     for finding in findings:
         print(finding)

@@ -33,7 +33,8 @@ pub struct ScriptTaskResult {
     pub status: ScriptTaskStatus,
     pub command: String,
     pub source_dir: PathBuf,
-    pub output_path: PathBuf,
+    pub run_log_path: PathBuf,
+    pub result_path: PathBuf,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,38 +60,40 @@ impl ScriptTaskRunner {
     ) -> AppResult<ScriptTaskResult> {
         let task_dir = self.task_dir(context, &task.id);
         let source_dir = task_dir.join("source");
-        let output_path = task_dir.join("output.log");
+        let run_log_path = task_dir.join("run.log");
+        let result_path = task_dir.join("result.txt");
         reset_task_dir(&task_dir)?;
         fs::create_dir_all(&source_dir)?;
         extract_zip_archive(archive, &source_dir)?;
 
-        let command_with_check_root = command_with_check_root(&task.command, &source_dir);
+        let command_with_args = command_with_script_args(&task.command, &source_dir, &result_path);
         info!(
             project_id = context.project_id,
             mr_iid = context.mr_iid,
             commit_sha = %context.commit_sha,
             script_task_id = %task.id,
-            command = %command_with_check_root,
+            command = %command_with_args,
             timeout_seconds = task.timeout_seconds,
             work_dir = %task_dir.display(),
             source_dir = %source_dir.display(),
-            output_path = %output_path.display(),
+            run_log_path = %run_log_path.display(),
+            result_path = %result_path.display(),
             "running script task"
         );
 
-        let output = OpenOptions::new()
+        let run_log = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .open(&output_path)?;
-        let mut command = shell_command(&task.command, &source_dir);
+            .open(&run_log_path)?;
+        let mut command = shell_command(&task.command, &source_dir, &result_path);
         configure_process_group(&mut command);
         command
             .current_dir(&source_dir)
             .env_remove(context.token_env)
             .env_remove("GITLAB_TOKEN")
-            .stdout(Stdio::from(output.try_clone()?))
-            .stderr(Stdio::from(output));
+            .stdout(Stdio::from(run_log.try_clone()?))
+            .stderr(Stdio::from(run_log));
 
         let mut child = command.spawn()?;
         let timeout = Duration::from_secs(task.timeout_seconds.max(1));
@@ -110,7 +113,7 @@ impl ScriptTaskRunner {
                 );
                 kill_process_tree(&mut child).await;
                 let _ = child.wait().await;
-                append_timeout_note(&output_path, timeout)?;
+                append_timeout_note(&run_log_path, timeout)?;
                 ScriptTaskStatus::TimedOut
             }
         };
@@ -126,16 +129,18 @@ impl ScriptTaskRunner {
             script_task_id = %task.id,
             status = ?status,
             source_dir = %source_dir.display(),
-            output_path = %output_path.display(),
+            run_log_path = %run_log_path.display(),
+            result_path = %result_path.display(),
             "script task completed"
         );
         Ok(ScriptTaskResult {
             id: task.id.clone(),
             title: task.title.clone(),
             status,
-            command: command_with_check_root,
+            command: command_with_args,
             source_dir,
-            output_path,
+            run_log_path,
+            result_path,
         })
     }
 
@@ -162,8 +167,13 @@ fn script_task_status(code: Option<i32>) -> ScriptTaskStatus {
     }
 }
 
-fn command_with_check_root(command: &str, check_root: &Path) -> String {
-    format!("{} {}", command, shell_quote_arg(check_root))
+fn command_with_script_args(command: &str, check_root: &Path, result_path: &Path) -> String {
+    format!(
+        "{} {} {}",
+        command,
+        shell_quote_arg(check_root),
+        shell_quote_arg(result_path)
+    )
 }
 
 fn shell_quote_arg(path: &Path) -> String {
@@ -178,11 +188,15 @@ fn shell_quote_arg(path: &Path) -> String {
     }
 }
 
-fn shell_command(command: &str, check_root: &Path) -> Command {
+fn shell_command(command: &str, check_root: &Path, result_path: &Path) -> Command {
     #[cfg(windows)]
     {
         let mut process = Command::new("cmd");
-        process.arg("/C").arg(command).arg(check_root);
+        process
+            .arg("/C")
+            .arg(command)
+            .arg(check_root)
+            .arg(result_path);
         process
     }
     #[cfg(not(windows))]
@@ -190,7 +204,7 @@ fn shell_command(command: &str, check_root: &Path) -> Command {
         let mut process = Command::new("sh");
         process
             .arg("-c")
-            .arg(command_with_check_root(command, check_root));
+            .arg(command_with_script_args(command, check_root, result_path));
         process
     }
 }
@@ -399,14 +413,19 @@ mod tests {
                 zip::write::SimpleFileOptions::default(),
             )
             .unwrap();
-            zip.write_all(br#"@if /I "%~f1"=="%CD%" (exit /B 0) else (exit /B 1)"#)
-                .unwrap();
+            zip.write_all(
+                br#"@if /I NOT "%~f1"=="%CD%" exit /B 2
+@echo ok>"%~2"
+@exit /B 0"#,
+            )
+            .unwrap();
             zip.start_file(
                 "repo-head/check-root.sh",
                 zip::write::SimpleFileOptions::default(),
             )
             .unwrap();
-            zip.write_all(br#"[ "$1" = "$PWD" ]"#).unwrap();
+            zip.write_all(br#"[ "$1" = "$PWD" ] && echo ok > "$2""#)
+                .unwrap();
             zip.finish().unwrap();
         }
         bytes.into_inner()
@@ -461,5 +480,7 @@ mod tests {
         let result = runner.run(&task, &context, &test_archive()).await.unwrap();
 
         assert_eq!(result.status, ScriptTaskStatus::Passed);
+        assert!(result.run_log_path.exists());
+        assert_eq!(fs::read_to_string(result.result_path).unwrap().trim(), "ok");
     }
 }
