@@ -114,7 +114,7 @@ Behavior:
 - `exit 0` means pass and does not create a comment.
 - `exit != 0` or timeout creates one MR-level comment.
 - Timeout is enforced by the Rust process; `timeout_seconds` defaults to `60`.
-- Runtime environment variables include `GITLAB_WORK_RUNNER_CHECK_ROOT`, which points to the MR head source snapshot root to check.
+- The service appends the MR head source snapshot root to the command, so scripts can read it as their first business argument.
 
 Work directory:
 
@@ -125,7 +125,7 @@ work/script_tasks/<project_id>/<mr_iid>/<commit_sha>/<task_id>/
 
 After execution, the extracted `source/` directory is removed and only `output.log` is kept for debugging. Script tasks remove the configured GitLab token environment variable before running the command.
 
-The repository includes a minimal script example: [examples/scripts/check_todo_tbd.py](examples/scripts/check_todo_tbd.py). It scans `GITLAB_WORK_RUNNER_CHECK_ROOT` when present, otherwise the current working directory, and fails when it finds `//TODO` or `//TBD`, printing file locations.
+The repository includes a minimal script example: [examples/scripts/check_todo_tbd.py](examples/scripts/check_todo_tbd.py). It reads the first argument as the directory to check and fails when it finds `//TODO` or `//TBD`, printing file locations.
 
 Note: the relative path in `command = "python3 examples/scripts/check_todo_tbd.py"` is resolved from the MR source snapshot root. If the target GitLab repository does not contain that script, either copy the example script into the target repository or change `command` to an absolute path on the runner machine. On Windows, exit code `9009` usually means the command is not found; use `python` instead of `python3` or add Python to `PATH`.
 

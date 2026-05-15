@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-import os
+import sys
 from pathlib import Path
 
-ROOT = Path(os.environ.get("GITLAB_WORK_RUNNER_CHECK_ROOT", Path.cwd())).resolve()
 SKIP_DIRS = {".git", ".idea", ".vscode", "target", "node_modules", "vendor"}
 PATTERNS = ("//TODO", "//TBD")
 
@@ -27,14 +26,18 @@ def read_text(path: Path):
 
 
 def main() -> int:
+    if len(sys.argv) != 2:
+        print("usage: check_todo_tbd.py <check_root>")
+        return 2
+    root = Path(sys.argv[1]).resolve()
     findings = []
-    for path in iter_files(ROOT):
+    for path in iter_files(root):
         text = read_text(path)
         if text is None:
             continue
         for line_no, line in enumerate(text.splitlines(), start=1):
             if any(pattern in line for pattern in PATTERNS):
-                findings.append(f"{path.relative_to(ROOT)}:{line_no}: {line.strip()}")
+                findings.append(f"{path.relative_to(root)}:{line_no}: {line.strip()}")
 
     if not findings:
         print("No //TODO or //TBD markers found.")

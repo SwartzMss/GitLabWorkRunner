@@ -73,12 +73,13 @@ impl ScriptTaskRunner {
         fs::create_dir_all(&source_dir)?;
         extract_zip_archive(archive, &source_dir)?;
 
+        let command_with_check_root = command_with_check_root(&task.command, &source_dir);
         info!(
             project_id = context.project_id,
             mr_iid = context.mr_iid,
             commit_sha = %context.commit_sha,
             script_task_id = %task.id,
-            command = %task.command,
+            command = %command_with_check_root,
             timeout_seconds = task.timeout_seconds,
             work_dir = %task_dir.display(),
             source_dir = %source_dir.display(),
@@ -91,11 +92,10 @@ impl ScriptTaskRunner {
             .write(true)
             .truncate(true)
             .open(&output_path)?;
-        let mut command = shell_command(&task.command);
+        let mut command = shell_command(&task.command, &source_dir);
         configure_process_group(&mut command);
         command
             .current_dir(&source_dir)
-            .env("GITLAB_WORK_RUNNER_CHECK_ROOT", &source_dir)
             .env_remove(context.token_env)
             .env_remove("GITLAB_TOKEN")
             .stdout(Stdio::from(output.try_clone()?))
@@ -147,7 +147,7 @@ impl ScriptTaskRunner {
             id: task.id.clone(),
             title: task.title.clone(),
             status,
-            command: task.command.clone(),
+            command: command_with_check_root,
             source_dir,
             output_path,
             output_excerpt,
@@ -212,17 +212,35 @@ fn exit_code_hint(code: i32) -> &'static str {
     }
 }
 
-fn shell_command(command: &str) -> Command {
+fn command_with_check_root(command: &str, check_root: &Path) -> String {
+    format!("{} {}", command, shell_quote_arg(check_root))
+}
+
+fn shell_quote_arg(path: &Path) -> String {
+    let value = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    }
+    #[cfg(not(windows))]
+    {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn shell_command(command: &str, check_root: &Path) -> Command {
     #[cfg(windows)]
     {
         let mut process = Command::new("cmd");
-        process.arg("/C").arg(command);
+        process.arg("/C").arg(command).arg(check_root);
         process
     }
     #[cfg(not(windows))]
     {
         let mut process = Command::new("sh");
-        process.arg("-c").arg(command);
+        process
+            .arg("-c")
+            .arg(command_with_check_root(command, check_root));
         process
     }
 }
@@ -445,6 +463,19 @@ mod tests {
             )
             .unwrap();
             zip.write_all(b"test\n").unwrap();
+            zip.start_file(
+                "repo-head/check-root.cmd",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+            zip.write_all(br#"@if /I "%~f1"=="%CD%" (exit /B 0) else (exit /B 1)"#)
+                .unwrap();
+            zip.start_file(
+                "repo-head/check-root.sh",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+            zip.write_all(br#"[ "$1" = "$PWD" ]"#).unwrap();
             zip.finish().unwrap();
         }
         bytes.into_inner()
@@ -479,16 +510,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn script_task_sets_check_root_to_source_dir() {
+    async fn script_task_passes_check_root_as_argument() {
         let temp = tempfile::tempdir().unwrap();
         let runner = ScriptTaskRunner {
             work_root: temp.path().join("work"),
             max_output_bytes: MAX_OUTPUT_BYTES,
         };
         let command = if cfg!(windows) {
-            r#"if "%GITLAB_WORK_RUNNER_CHECK_ROOT%"=="%CD%" (exit /B 0) else (exit /B 1)"#
+            "check-root.cmd"
         } else {
-            r#"[ "$GITLAB_WORK_RUNNER_CHECK_ROOT" = "$PWD" ]"#
+            "sh check-root.sh"
         };
         let task = ScriptTaskConfig {
             id: "check-root".into(),
@@ -507,6 +538,11 @@ mod tests {
 
         let result = runner.run(&task, &context, &test_archive()).await.unwrap();
 
-        assert_eq!(result.status, ScriptTaskStatus::Passed);
+        assert_eq!(
+            result.status,
+            ScriptTaskStatus::Passed,
+            "{}",
+            result.output_excerpt
+        );
     }
 }
