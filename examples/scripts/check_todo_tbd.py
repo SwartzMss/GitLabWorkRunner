@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
+import os
 from pathlib import Path
 
-ROOT = Path.cwd()
+ROOT = Path(os.environ.get("GITLAB_WORK_RUNNER_CHECK_ROOT", Path.cwd())).resolve()
 SKIP_DIRS = {".git", ".idea", ".vscode", "target", "node_modules", "vendor"}
 PATTERNS = ("//TODO", "//TBD")
 

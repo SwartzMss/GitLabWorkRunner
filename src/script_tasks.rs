@@ -95,10 +95,7 @@ impl ScriptTaskRunner {
         configure_process_group(&mut command);
         command
             .current_dir(&source_dir)
-            .env("GITLAB_WORK_RUNNER_SOURCE_DIR", &source_dir)
-            .env("GITLAB_WORK_RUNNER_TASK_DIR", &task_dir)
-            .env("GITLAB_WORK_RUNNER_OUTPUT_PATH", &output_path)
-            .env("GITLAB_WORK_RUNNER_COMMIT_SHA", context.commit_sha)
+            .env("GITLAB_WORK_RUNNER_CHECK_ROOT", &source_dir)
             .env_remove(context.token_env)
             .env_remove("GITLAB_TOKEN")
             .stdout(Stdio::from(output.try_clone()?))
@@ -438,6 +435,21 @@ fn sanitize_path_segment(value: &str) -> String {
 mod tests {
     use super::*;
 
+    fn test_archive() -> Vec<u8> {
+        let mut bytes = Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut bytes);
+            zip.start_file(
+                "repo-head/README.md",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+            zip.write_all(b"test\n").unwrap();
+            zip.finish().unwrap();
+        }
+        bytes.into_inner()
+    }
+
     #[test]
     fn sanitizes_path_segments() {
         assert_eq!(sanitize_path_segment("check/a:b"), "check_a_b");
@@ -464,5 +476,37 @@ mod tests {
         assert!(comment.contains("9009"));
         assert!(comment.contains("命令未找到"));
         assert!(comment.contains("output.log"));
+    }
+
+    #[tokio::test]
+    async fn script_task_sets_check_root_to_source_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = ScriptTaskRunner {
+            work_root: temp.path().join("work"),
+            max_output_bytes: MAX_OUTPUT_BYTES,
+        };
+        let command = if cfg!(windows) {
+            r#"if "%GITLAB_WORK_RUNNER_CHECK_ROOT%"=="%CD%" (exit /B 0) else (exit /B 1)"#
+        } else {
+            r#"[ "$GITLAB_WORK_RUNNER_CHECK_ROOT" = "$PWD" ]"#
+        };
+        let task = ScriptTaskConfig {
+            id: "check-root".into(),
+            title: "Check root".into(),
+            command: command.into(),
+            timeout_seconds: 5,
+            enabled: true,
+            when_changed: Vec::new(),
+        };
+        let context = ScriptTaskContext {
+            project_id: 1,
+            mr_iid: 2,
+            commit_sha: "abc",
+            token_env: "GITLAB_TOKEN",
+        };
+
+        let result = runner.run(&task, &context, &test_archive()).await.unwrap();
+
+        assert_eq!(result.status, ScriptTaskStatus::Passed);
     }
 }
