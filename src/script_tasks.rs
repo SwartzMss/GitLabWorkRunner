@@ -33,6 +33,8 @@ pub struct ScriptTaskResult {
     pub id: String,
     pub title: String,
     pub status: ScriptTaskStatus,
+    pub command: String,
+    pub source_dir: PathBuf,
     pub output_path: PathBuf,
     pub output_excerpt: String,
 }
@@ -79,6 +81,8 @@ impl ScriptTaskRunner {
             command = %task.command,
             timeout_seconds = task.timeout_seconds,
             work_dir = %task_dir.display(),
+            source_dir = %source_dir.display(),
+            output_path = %output_path.display(),
             "running script task"
         );
 
@@ -91,6 +95,10 @@ impl ScriptTaskRunner {
         configure_process_group(&mut command);
         command
             .current_dir(&source_dir)
+            .env("GITLAB_WORK_RUNNER_SOURCE_DIR", &source_dir)
+            .env("GITLAB_WORK_RUNNER_TASK_DIR", &task_dir)
+            .env("GITLAB_WORK_RUNNER_OUTPUT_PATH", &output_path)
+            .env("GITLAB_WORK_RUNNER_COMMIT_SHA", context.commit_sha)
             .env_remove(context.token_env)
             .env_remove("GITLAB_TOKEN")
             .stdout(Stdio::from(output.try_clone()?))
@@ -134,6 +142,7 @@ impl ScriptTaskRunner {
             commit_sha = %context.commit_sha,
             script_task_id = %task.id,
             status = ?status,
+            source_dir = %source_dir.display(),
             output_path = %output_path.display(),
             "script task completed"
         );
@@ -141,6 +150,8 @@ impl ScriptTaskRunner {
             id: task.id.clone(),
             title: task.title.clone(),
             status,
+            command: task.command.clone(),
+            source_dir,
             output_path,
             output_excerpt,
         })
@@ -162,13 +173,21 @@ impl Default for ScriptTaskRunner {
 }
 
 pub fn build_script_task_comment(result: &ScriptTaskResult) -> String {
+    let execution_note = format!(
+        "执行命令：`{}`\n\n检查目录：`{}`\n\n> 检查目录是 MR head 的临时代码快照，任务结束后会被清理；排查时看下面的输出文件。",
+        result.command,
+        result.source_dir.display()
+    );
     let status = match result.status {
         ScriptTaskStatus::Passed => "passed",
         ScriptTaskStatus::Failed(Some(code)) => {
+            let hint = exit_code_hint(code);
             return format!(
-                "**[error] {}**\n\n脚本任务执行失败，退出码：`{}`。\n\n```text\n{}\n```\n\n输出文件：`{}`\n\n<!-- gitlab-work-runner:script={} -->",
+                "**[error] {}**\n\n脚本任务执行失败，退出码：`{}`。{}\n\n{}\n\n```text\n{}\n```\n\n输出文件：`{}`\n\n<!-- gitlab-work-runner:script={} -->",
                 result.title,
                 code,
+                hint,
+                execution_note,
                 result.output_excerpt,
                 result.output_path.display(),
                 result.id
@@ -178,13 +197,22 @@ pub fn build_script_task_comment(result: &ScriptTaskResult) -> String {
         ScriptTaskStatus::TimedOut => "timed out",
     };
     format!(
-        "**[error] {}**\n\n脚本任务执行失败：`{}`。\n\n```text\n{}\n```\n\n输出文件：`{}`\n\n<!-- gitlab-work-runner:script={} -->",
+        "**[error] {}**\n\n脚本任务执行失败：`{}`。\n\n{}\n\n```text\n{}\n```\n\n输出文件：`{}`\n\n<!-- gitlab-work-runner:script={} -->",
         result.title,
         status,
+        execution_note,
         result.output_excerpt,
         result.output_path.display(),
         result.id
     )
+}
+
+fn exit_code_hint(code: i32) -> &'static str {
+    match code {
+        9009 => " Windows 上 `9009` 通常表示命令未找到，请确认脚本解释器或命令已安装并在 PATH 中。",
+        127 => " Unix 上 `127` 通常表示命令未找到，请确认脚本解释器或命令已安装并在 PATH 中。",
+        _ => "",
+    }
 }
 
 fn shell_command(command: &str) -> Command {
@@ -414,5 +442,27 @@ mod tests {
     fn sanitizes_path_segments() {
         assert_eq!(sanitize_path_segment("check/a:b"), "check_a_b");
         assert_eq!(sanitize_path_segment(""), "_");
+    }
+
+    #[test]
+    fn script_task_comment_includes_execution_context_and_command_hint() {
+        let result = ScriptTaskResult {
+            id: "check-todo-tbd".into(),
+            title: "TODO/TBD marker check".into(),
+            status: ScriptTaskStatus::Failed(Some(9009)),
+            command: "python3 examples/scripts/check_todo_tbd.py".into(),
+            source_dir: PathBuf::from("work/script_tasks/1/1/abc/check-todo-tbd/source"),
+            output_path: PathBuf::from("work/script_tasks/1/1/abc/check-todo-tbd/output.log"),
+            output_excerpt: "[gitlab-work-runner] no output captured".into(),
+        };
+
+        let comment = build_script_task_comment(&result);
+
+        assert!(comment.contains("执行命令"));
+        assert!(comment.contains("检查目录"));
+        assert!(comment.contains("MR head"));
+        assert!(comment.contains("9009"));
+        assert!(comment.contains("命令未找到"));
+        assert!(comment.contains("output.log"));
     }
 }

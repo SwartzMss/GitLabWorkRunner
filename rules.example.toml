@@ -10,6 +10,9 @@ message = "Direct unwrap can panic at runtime. Prefer explicit error handling."
 enabled = false
 id = "check-todo-tbd"
 title = "TODO/TBD marker check"
+# Commands run from the MR head snapshot root.
+# Keep this relative path only if the target GitLab repository contains this script.
+# Otherwise use an absolute path to a script installed with the runner package.
 command = "python3 examples/scripts/check_todo_tbd.py"
 timeout_seconds = 30
 when_changed = ["**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.rs"]

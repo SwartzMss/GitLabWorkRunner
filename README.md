@@ -109,11 +109,12 @@ when_changed = ["**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.rs"
 - `enabled` 不写时默认为 `true`。
 - `when_changed` 不写或为空时，每个 MR 都执行。
 - 服务固定下载 MR 当前 head commit 的 archive。
-- 命令在解压后的仓库根目录执行。
+- 命令在解压后的 MR head 仓库根目录执行，也就是脚本检查的代码快照。
 - stdout 和 stderr 合并写入一个 `output.log`。
 - `exit 0` 表示通过，不发评论。
 - `exit != 0` 或超时表示失败，发一条 MR 级评论。
 - 超时由 Rust 进程控制，默认 `timeout_seconds = 60`。
+- 运行时会注入 `GITLAB_WORK_RUNNER_SOURCE_DIR`、`GITLAB_WORK_RUNNER_TASK_DIR`、`GITLAB_WORK_RUNNER_OUTPUT_PATH` 和 `GITLAB_WORK_RUNNER_COMMIT_SHA`，供脚本定位检查目录和输出文件。
 
 工作目录：
 
@@ -124,7 +125,9 @@ work/script_tasks/<project_id>/<mr_iid>/<commit_sha>/<task_id>/
 
 执行完成后会删除解压出的 `source/` 目录，只保留 `output.log` 便于排查。脚本任务会移除配置中的 GitLab token 环境变量，避免脚本直接继承服务 token。
 
-仓库提供了一个最小脚本示例：[examples/scripts/check_todo_tbd.py](examples/scripts/check_todo_tbd.py)。它会扫描 checkout 中的文本文件，发现 `//TODO` 或 `//TBD` 时返回失败并输出文件位置。
+仓库提供了一个最小脚本示例：[examples/scripts/check_todo_tbd.py](examples/scripts/check_todo_tbd.py)。它会扫描当前工作目录中的文本文件，发现 `//TODO` 或 `//TBD` 时返回失败并输出文件位置。
+
+注意：`command = "python3 examples/scripts/check_todo_tbd.py"` 中的相对路径是相对于 MR 代码快照根目录的。如果目标 GitLab 项目里没有这个脚本，请把示例脚本复制到目标仓库，或者把 `command` 改成 runner 机器上的绝对路径。Windows 上如果 `python3` 返回退出码 `9009`，通常表示命令不存在，可以改用 `python` 或把 Python 加入 `PATH`。
 
 ## 本地运行
 
