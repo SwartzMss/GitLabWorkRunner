@@ -202,7 +202,7 @@ message = "Do not unwrap."
 }
 
 #[tokio::test]
-async fn runs_script_task_and_posts_output_when_it_fails() {
+async fn runs_script_task_without_posting_comment_when_it_fails() {
     let discussion_count = Arc::new(AtomicUsize::new(0));
     let discussion_count_for_handler = Arc::clone(&discussion_count);
     let archive = Arc::new(test_archive());
@@ -241,22 +241,11 @@ async fn runs_script_task_and_posts_output_when_it_fails() {
         )
         .route(
             "/api/v4/projects/123/merge_requests/45/discussions",
-            post(move |body: Bytes| {
+            post(move || {
                 let discussion_count = Arc::clone(&discussion_count_for_handler);
                 async move {
-                    let body: Value = serde_json::from_slice(&body).unwrap();
-                    let body = body["body"].as_str().unwrap();
-                    assert!(body.contains("Script failure"));
-                    assert!(body.contains("script task failed"));
-                    assert!(body.contains("gitlab-work-runner:script=check-script"));
                     discussion_count.fetch_add(1, Ordering::SeqCst);
-                    (
-                        StatusCode::CREATED,
-                        Json(json!({
-                            "id": "discussion-1",
-                            "notes": [{ "id": 100 }]
-                        })),
-                    )
+                    StatusCode::INTERNAL_SERVER_ERROR
                 }
             }),
         );
@@ -300,7 +289,7 @@ when_changed = ["src/**"]
     let summary = service.review_merge_request(&event).await.unwrap();
 
     assert_eq!(summary.findings, 0);
-    assert_eq!(summary.comments, 1);
+    assert_eq!(summary.comments, 0);
     assert!(!summary.skipped);
-    assert_eq!(discussion_count.load(Ordering::SeqCst), 1);
+    assert_eq!(discussion_count.load(Ordering::SeqCst), 0);
 }
