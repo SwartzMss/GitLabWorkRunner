@@ -111,8 +111,10 @@ Behavior:
 - The service always downloads the current MR head commit archive.
 - The command runs from the extracted MR head repository root, which is the code snapshot being checked.
 - stdout and stderr are merged into one `output.log`.
-- `exit 0` means pass.
-- `exit != 0` or timeout is treated as failure, but does not create an MR comment; the service only logs it and keeps `output.log`.
+- `exit 0` means the check passed.
+- `exit 1` means the check found issues.
+- Other exit codes, missing exit codes, and timeouts mean script execution errors.
+- Found issues and execution errors do not create MR comments; the service only logs them and keeps `output.log`.
 - Timeout is enforced by the Rust process; `timeout_seconds` defaults to `60`.
 - The service appends the MR head source snapshot root to the command, so scripts can read it as their first business argument.
 

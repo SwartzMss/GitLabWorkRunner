@@ -198,7 +198,7 @@ struct Finding {
 - 将 stdout 和 stderr 合并写入同一个 `output.log`。
 - 由 Rust 进程控制 timeout，超时后 kill 子进程。
 - 任务完成后删除 `source/`，保留 `output.log` 便于排查。
-- `exit 0` 表示通过；`exit != 0` 或 timeout 时只记录日志并保留 `output.log`，不发布 MR 评论。
+- `exit 0` 表示检测通过；`exit 1` 表示检测发现问题；其他退出码、无退出码或 timeout 表示脚本执行异常。所有非通过状态都只记录日志并保留 `output.log`，不发布 MR 评论。
 
 第一版脚本任务格式：
 
@@ -223,9 +223,10 @@ when_changed = ["**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.rs"
 
 脚本输出协议：
 
-- `exit 0`: 通过，不发评论。
-- `exit != 0`: 失败，保留 `output.log`，不发 MR 评论。
-- timeout: 失败，kill 子进程，保留 `output.log`，不发 MR 评论。
+- `exit 0`: 检测通过。
+- `exit 1`: 检测发现问题，保留 `output.log`，不发 MR 评论。
+- 其他退出码或无退出码: 脚本执行异常，保留 `output.log`，不发 MR 评论。
+- timeout: 脚本执行异常，kill 子进程，保留 `output.log`，不发 MR 评论。
 
 第一版不提供 Python helper，不要求 JSON 输出，也不尝试将脚本结果映射成行级评论。
 

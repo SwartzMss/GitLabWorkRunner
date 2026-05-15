@@ -39,7 +39,8 @@ pub struct ScriptTaskResult {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ScriptTaskStatus {
     Passed,
-    Failed(Option<i32>),
+    IssueFound,
+    ExecutionFailed(Option<i32>),
     TimedOut,
 }
 
@@ -96,11 +97,7 @@ impl ScriptTaskRunner {
         let status = match time::timeout(timeout, child.wait()).await {
             Ok(status) => {
                 let status = status?;
-                if status.success() {
-                    ScriptTaskStatus::Passed
-                } else {
-                    ScriptTaskStatus::Failed(status.code())
-                }
+                script_task_status(status.code())
             }
             Err(_) => {
                 warn!(
@@ -154,6 +151,14 @@ impl ScriptTaskRunner {
 impl Default for ScriptTaskRunner {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn script_task_status(code: Option<i32>) -> ScriptTaskStatus {
+    match code {
+        Some(0) => ScriptTaskStatus::Passed,
+        Some(1) => ScriptTaskStatus::IssueFound,
+        other => ScriptTaskStatus::ExecutionFailed(other),
     }
 }
 
@@ -411,6 +416,20 @@ mod tests {
     fn sanitizes_path_segments() {
         assert_eq!(sanitize_path_segment("check/a:b"), "check_a_b");
         assert_eq!(sanitize_path_segment(""), "_");
+    }
+
+    #[test]
+    fn maps_script_exit_codes_to_statuses() {
+        assert_eq!(script_task_status(Some(0)), ScriptTaskStatus::Passed);
+        assert_eq!(script_task_status(Some(1)), ScriptTaskStatus::IssueFound);
+        assert_eq!(
+            script_task_status(Some(2)),
+            ScriptTaskStatus::ExecutionFailed(Some(2))
+        );
+        assert_eq!(
+            script_task_status(None),
+            ScriptTaskStatus::ExecutionFailed(None)
+        );
     }
 
     #[tokio::test]
