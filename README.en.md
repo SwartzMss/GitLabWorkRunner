@@ -109,15 +109,23 @@ Behavior:
 - `enabled` defaults to `true` when omitted.
 - If `when_changed` is omitted or empty, the task runs for every MR.
 - The service always downloads the current MR head commit archive.
-- The command runs from the extracted MR head repository root, which is the code snapshot being checked.
+- The command runs from the runner executable directory; relative paths in `command` are resolved from that directory.
 - stdout and stderr are merged into `run.log` for script execution logs.
 - The service passes the `result.txt` path as the second argument; scripts should write check results to that file.
 - `exit 0` means the check passed.
-- `exit 1` means the check found issues.
+- `exit 1` means the check found issues; the service reads `result.txt` and publishes MR comments.
 - Other exit codes, missing exit codes, and timeouts mean script execution errors.
-- Found issues and execution errors do not create MR comments; the service only logs them and keeps `run.log` / `result.txt`.
+- Execution errors and timeouts do not create MR comments; the service only logs them and keeps `run.log` / `result.txt`.
 - Timeout is enforced by the Rust process; `timeout_seconds` defaults to `60`.
 - The service appends the MR head source snapshot root as the first argument.
+
+`result.txt` supports a simple line-comment format:
+
+```text
+src/config.rs:5: //TODO aa
+```
+
+Each line is parsed as `repository-relative path:line number:message`. Parsed results are published as line-level comments when possible. If the result cannot be parsed, or the current MR has incomplete diff refs, the service publishes one MR-level summary comment instead. Scripts may keep header lines such as `Found //TODO or //TBD markers:` in `result.txt`; those lines are not treated as line results.
 
 Work directory:
 
@@ -129,9 +137,9 @@ work/script_tasks/<project_id>/<mr_iid>/<commit_sha>/<task_id>/
 
 After execution, the extracted `source/` directory is removed and only `run.log` and `result.txt` are kept for debugging. Script tasks remove the configured GitLab token environment variable before running the command.
 
-The repository includes a minimal script example: [examples/scripts/check_todo_tbd.py](examples/scripts/check_todo_tbd.py). It reads the first argument as the directory to check and the second argument as the result file path; process logs go to stdout and check results go to `result.txt`.
+The repository includes a minimal script example: [examples/scripts/check_todo_tbd.py](examples/scripts/check_todo_tbd.py). It reads the first argument as the directory to check and the second argument as the result file path; process logs go to stdout and check results are written to `result.txt` as `path:line:message`.
 
-Note: the relative path in `command = "python examples/scripts/check_todo_tbd.py"` is resolved from the MR source snapshot root. If the target GitLab repository does not contain that script, either copy the example script into the target repository or change `command` to an absolute path on the runner machine. On Windows, exit code `9009` usually means the command is not found; add Python to `PATH`.
+Note: the relative path in `command = "python examples/scripts/check_todo_tbd.py"` is resolved from the runner executable directory. If you use the example script from the release package, keep this path. If the script lives elsewhere, use an absolute path. On Windows, exit code `9009` usually means the command is not found; add Python to `PATH`.
 
 ## Local Run
 
