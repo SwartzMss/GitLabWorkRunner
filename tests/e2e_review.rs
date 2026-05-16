@@ -331,7 +331,7 @@ async fn posts_line_comment_when_script_task_finds_issue() {
                     "diff_refs": {
                         "base_sha": "base",
                         "start_sha": "start",
-                        "head_sha": "head123"
+                        "head_sha": "script-head"
                     }
                 }))
             }),
@@ -341,7 +341,7 @@ async fn posts_line_comment_when_script_task_finds_issue() {
             get(move |Query(query): Query<HashMap<String, String>>| {
                 let archive = Arc::clone(&archive_for_handler);
                 async move {
-                    assert_eq!(query.get("sha").map(String::as_str), Some("head123"));
+                    assert_eq!(query.get("sha").map(String::as_str), Some("script-head"));
                     archive.as_ref().clone().into_response()
                 }
             }),
@@ -356,7 +356,7 @@ async fn posts_line_comment_when_script_task_finds_issue() {
                     assert!(body["body"]
                         .as_str()
                         .unwrap()
-                        .contains("gitlab-work-runner:rule=script:check-script"));
+                        .contains("gitlab-work-runner:rule=script:comment-script"));
                     assert_eq!(body["position"]["new_path"], "src/lib.rs");
                     assert_eq!(body["position"]["new_line"], 1);
                     discussion_count.fetch_add(1, Ordering::SeqCst);
@@ -375,7 +375,7 @@ async fn posts_line_comment_when_script_task_finds_issue() {
 
     let script_path = std::env::current_dir()
         .unwrap()
-        .join("work/script_tasks/123/45/head123/check-script/source")
+        .join("work/script_tasks/123/45/script-head/comment-script/source")
         .join(if cfg!(windows) {
             "check-issue.cmd"
         } else {
@@ -389,7 +389,7 @@ async fn posts_line_comment_when_script_task_finds_issue() {
     let ruleset = Ruleset::from_toml(&format!(
         r#"
 [[script_tasks]]
-id = "check-script"
+id = "comment-script"
 title = "TODO marker check"
 command = "{}"
 timeout_seconds = 10
