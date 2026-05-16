@@ -113,11 +113,19 @@ when_changed = ["**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.rs"
 - stdout 和 stderr 合并写入 `run.log`，用于查看脚本运行过程。
 - 服务会把 `result.txt` 路径作为第二个参数传给脚本，脚本应把检测结果写入这个文件。
 - `exit 0` 表示检测通过。
-- `exit 1` 表示检测发现问题。
+- `exit 1` 表示检测发现问题，服务会读取 `result.txt` 并发布 MR 评论。
 - 其他退出码、无退出码或超时表示脚本执行异常。
-- 检测发现问题或执行异常都不会发 MR 评论；只记录服务日志并保留 `run.log` / `result.txt`。
+- 执行异常和超时不会发 MR 评论；只记录服务日志并保留 `run.log` / `result.txt`。
 - 超时由 Rust 进程控制，默认 `timeout_seconds = 60`。
 - 服务会把本次要检查的 MR head 代码快照根目录作为第一个参数追加到命令末尾。
+
+`result.txt` 支持简单的行级评论格式：
+
+```text
+src/config.rs:5: //TODO aa
+```
+
+每一行按 `仓库相对路径:行号:提示内容` 解析。能解析的结果会尽量发布到对应代码行；无法解析成该格式，或当前 MR diff refs 不完整时，会发布一条 MR 级汇总评论。脚本可以在 `result.txt` 里保留标题行，例如 `Found //TODO or //TBD markers:`，这类行不会被当成行级结果。
 
 工作目录：
 
@@ -129,7 +137,7 @@ work/script_tasks/<project_id>/<mr_iid>/<commit_sha>/<task_id>/
 
 执行完成后会删除解压出的 `source/` 目录，只保留 `run.log` 和 `result.txt` 便于排查。脚本任务会移除配置中的 GitLab token 环境变量，避免脚本直接继承服务 token。
 
-仓库提供了一个最小脚本示例：[examples/scripts/check_todo_tbd.py](examples/scripts/check_todo_tbd.py)。它读取第一个参数作为检查目录，第二个参数作为结果文件路径；过程日志写 stdout，检测结果写 `result.txt`。
+仓库提供了一个最小脚本示例：[examples/scripts/check_todo_tbd.py](examples/scripts/check_todo_tbd.py)。它读取第一个参数作为检查目录，第二个参数作为结果文件路径；过程日志写 stdout，检测结果按 `path:line:message` 写入 `result.txt`。
 
 注意：`command = "python examples/scripts/check_todo_tbd.py"` 中的相对路径是相对于 runner 可执行文件所在目录的。如果使用 release 包里的示例脚本，保持这个路径即可；如果脚本放在其他目录，可以改成绝对路径。Windows 上如果返回退出码 `9009`，通常表示命令不存在，需要把 Python 加入 `PATH`。
 

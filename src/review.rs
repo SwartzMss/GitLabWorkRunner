@@ -1,13 +1,14 @@
 use crate::{
-    comments::build_comment_drafts,
+    comments::{build_comment_drafts, CommentDraft},
     diff::parse_unified_diff,
     error::AppResult,
     gitlab::{CreateDiscussionRequest, DiscussionPosition, GitLabChange, GitLabClient},
-    rules::Ruleset,
-    script_tasks::{ScriptTaskContext, ScriptTaskRunner},
+    rules::{Finding, Ruleset, Severity},
+    script_tasks::{ScriptTaskContext, ScriptTaskResult, ScriptTaskRunner, ScriptTaskStatus},
     storage::{ReviewKey, StateStore, StoredComment},
     webhook::MergeRequestEvent,
 };
+use std::fs;
 use tracing::{info, warn};
 
 pub struct ReviewService {
@@ -201,8 +202,19 @@ impl ReviewService {
             "rule evaluation completed"
         );
 
+        self.publish_comment_drafts(event, changes, &drafts, "grouped")
+            .await
+    }
+
+    async fn publish_comment_drafts(
+        &self,
+        event: &MergeRequestEvent,
+        changes: &crate::gitlab::MergeRequestChanges,
+        drafts: &[CommentDraft],
+        record_rule_id: &str,
+    ) -> AppResult<usize> {
         let mut published = 0_usize;
-        for draft in &drafts {
+        for draft in drafts {
             info!(
                 project_id = event.project_id,
                 mr_iid = event.mr_iid,
@@ -257,7 +269,7 @@ impl ReviewService {
                     mr_iid: event.mr_iid,
                     commit_sha: &event.commit_sha,
                     ruleset_hash: self.ruleset.hash(),
-                    rule_id: "grouped",
+                    rule_id: record_rule_id,
                     path: &draft.path,
                     new_line: draft.new_line.map(i64::from),
                     discussion_id: Some(&created.id),
@@ -312,10 +324,52 @@ impl ReviewService {
             commit_sha: archive_sha,
             token_env: &self.gitlab_token_env,
         };
+        let mut published = 0_usize;
         for task in tasks {
-            runner.run(&task, &context, &archive).await?;
+            let result = runner.run(&task, &context, &archive).await?;
+            if result.status == ScriptTaskStatus::IssueFound {
+                published += self
+                    .publish_script_task_result(event, changes, &result)
+                    .await?;
+            }
         }
-        Ok(0)
+        Ok(published)
+    }
+
+    async fn publish_script_task_result(
+        &self,
+        event: &MergeRequestEvent,
+        changes: &crate::gitlab::MergeRequestChanges,
+        result: &ScriptTaskResult,
+    ) -> AppResult<usize> {
+        let result_text = match fs::read_to_string(&result.result_path) {
+            Ok(text) => text,
+            Err(err) => {
+                warn!(
+                    project_id = event.project_id,
+                    mr_iid = event.mr_iid,
+                    commit_sha = %event.commit_sha,
+                    script_task_id = %result.id,
+                    result_path = %result.result_path.display(),
+                    error = %err,
+                    "script task returned issue status but result file could not be read"
+                );
+                format!("[gitlab-work-runner] failed to read result.txt: {err}")
+            }
+        };
+        let findings = parse_script_result_findings(result, &result_text);
+        if !findings.is_empty() && changes.diff_refs.is_complete() {
+            return self.publish_line_findings(event, changes, &findings).await;
+        }
+
+        let body = build_script_result_summary(result, &result_text);
+        let draft = CommentDraft {
+            path: String::new(),
+            new_line: None,
+            body,
+        };
+        self.publish_comment_drafts(event, changes, &[draft], "script")
+            .await
     }
 }
 
@@ -334,6 +388,47 @@ fn changed_paths(changes: &[GitLabChange]) -> Vec<String> {
     paths.sort();
     paths.dedup();
     paths
+}
+
+fn parse_script_result_findings(result: &ScriptTaskResult, text: &str) -> Vec<Finding> {
+    text.lines()
+        .filter_map(parse_script_result_line)
+        .map(|(path, line, message)| Finding {
+            rule_id: format!("script:{}", result.id),
+            severity: Severity::Warning,
+            path,
+            new_line: Some(line),
+            title: result.title.clone(),
+            message,
+        })
+        .collect()
+}
+
+fn parse_script_result_line(line: &str) -> Option<(String, u32, String)> {
+    let mut parts = line.splitn(3, ':');
+    let path = parts.next()?.trim().replace('\\', "/");
+    let line_no = parts.next()?.trim().parse().ok()?;
+    let message = parts.next()?.trim().to_string();
+    if path.is_empty() || message.is_empty() {
+        return None;
+    }
+    Some((path, line_no, message))
+}
+
+fn build_script_result_summary(result: &ScriptTaskResult, text: &str) -> String {
+    let content = if text.trim().is_empty() {
+        "(result.txt is empty)"
+    } else {
+        text.trim()
+    };
+    format!(
+        "**[warning] {}**\n\n脚本任务检测发现问题，但结果无法解析成 `path:line:message` 行级格式。\n\n```text\n{}\n```\n\n结果文件：`{}`\n运行日志：`{}`\n\n<!-- gitlab-work-runner:rule=script:{} -->",
+        result.title,
+        content,
+        result.result_path.display(),
+        result.run_log_path.display(),
+        result.id
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

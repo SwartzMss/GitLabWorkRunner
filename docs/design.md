@@ -199,7 +199,7 @@ struct Finding {
 - 将 `result.txt` 路径作为第二个参数传给脚本，脚本将检测结果写入该文件。
 - 由 Rust 进程控制 timeout，超时后 kill 子进程。
 - 任务完成后删除 `source/`，保留 `run.log` 和 `result.txt` 便于排查。
-- `exit 0` 表示检测通过；`exit 1` 表示检测发现问题；其他退出码、无退出码或 timeout 表示脚本执行异常。所有非通过状态都只记录日志并保留 `run.log` / `result.txt`，不发布 MR 评论。
+- `exit 0` 表示检测通过；`exit 1` 表示检测发现问题并发布 MR 评论；其他退出码、无退出码或 timeout 表示脚本执行异常，只记录日志并保留 `run.log` / `result.txt`。
 
 第一版脚本任务格式：
 
@@ -228,13 +228,19 @@ when_changed = ["**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.rs"
 - 第一个参数: MR head 代码快照根目录。
 - 第二个参数: `result.txt` 路径。
 - stdout/stderr: 运行过程日志，写入 `run.log`。
-- `result.txt`: 检测结果摘要。
+- `result.txt`: 检测结果摘要；推荐每条结果使用 `仓库相对路径:行号:提示内容`。
 - `exit 0`: 检测通过。
-- `exit 1`: 检测发现问题，保留 `run.log` / `result.txt`，不发 MR 评论。
+- `exit 1`: 检测发现问题，读取 `result.txt` 并发布 MR 评论。
 - 其他退出码或无退出码: 脚本执行异常，保留 `run.log` / `result.txt`，不发 MR 评论。
 - timeout: 脚本执行异常，kill 子进程，保留 `run.log` / `result.txt`，不发 MR 评论。
 
-第一版不提供 Python helper，不要求 JSON 输出，也不尝试将脚本结果映射成行级评论。
+行级结果格式示例：
+
+```text
+src/config.rs:5: //TODO aa
+```
+
+服务会按 `path:line:message` 解析每一行，路径会按 GitLab diff 路径处理。能解析且当前 MR diff refs 完整时，发布到对应代码行；无法解析或 diff refs 不完整时，发布一条 MR 级汇总评论。第一版不提供 Python helper，也不要求 JSON 输出。
 
 ### Comment Builder
 
@@ -384,7 +390,7 @@ Webhook payload -> diff fixture -> rule finding -> discussion API request -> sta
 6. 在 MR 中发布行级评论。
 7. 对同一 commit 和同一规则集不重复评论。
 8. 将完整 Review 流程写入 stdout 和日志文件，并按大小轮转日志文件。
-9. 可选执行 `script_tasks`；失败或超时时只记录日志并保留 `run.log` / `result.txt`。
+9. 可选执行 `script_tasks`；`exit 1` 发布脚本结果评论，执行异常或超时时只记录日志并保留 `run.log` / `result.txt`。
 
 ## 后续扩展
 

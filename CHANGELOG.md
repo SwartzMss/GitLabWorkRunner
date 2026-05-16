@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- 脚本任务 `exit 1` 现在会读取 `result.txt` 并发布 MR 评论。
+- `result.txt` 中符合 `path:line:message` 的结果会尽量发布为行级评论；无法解析或 diff refs 不完整时发布 MR 级汇总评论。
+- 修复脚本任务切换到 runner 可执行文件目录执行后，相对 `work/` 路径传给脚本可能找不到 `result.txt` 的问题。
+
 ## v1.4.1
 
 - 修复脚本任务执行目录：`command` 现在从 runner 可执行文件所在目录执行，相对路径可直接引用 release 包内的 `examples/scripts/...`。

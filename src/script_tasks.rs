@@ -58,7 +58,7 @@ impl ScriptTaskRunner {
         context: &ScriptTaskContext<'_>,
         archive: &[u8],
     ) -> AppResult<ScriptTaskResult> {
-        let task_dir = self.task_dir(context, &task.id);
+        let task_dir = absolute_path(self.task_dir(context, &task.id))?;
         let source_dir = task_dir.join("source");
         let run_log_path = task_dir.join("run.log");
         let result_path = task_dir.join("result.txt");
@@ -319,6 +319,14 @@ fn reset_task_dir(path: &Path) -> io::Result<()> {
         fs::remove_dir_all(path)?;
     }
     fs::create_dir_all(path)
+}
+
+fn absolute_path(path: PathBuf) -> io::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
 }
 
 fn append_timeout_note(path: &Path, timeout: Duration) -> io::Result<()> {
