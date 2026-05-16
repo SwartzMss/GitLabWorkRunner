@@ -100,11 +100,7 @@ impl Ruleset {
             });
         }
         let mut script_tasks = Vec::new();
-        for config in parsed
-            .script_tasks
-            .into_iter()
-            .filter(|config| config.enabled)
-        {
+        for config in parsed.script_tasks {
             let changed_matcher = if config.when_changed.is_empty() {
                 None
             } else {
@@ -149,10 +145,19 @@ impl Ruleset {
         self.script_tasks
             .iter()
             .filter(|task| {
-                task.changed_matcher
-                    .as_ref()
-                    .is_none_or(|matcher| changed_paths.iter().any(|path| matcher.is_match(path)))
+                task.config.enabled
+                    && task.changed_matcher.as_ref().is_none_or(|matcher| {
+                        changed_paths.iter().any(|path| matcher.is_match(path))
+                    })
             })
+            .map(|task| task.config.clone())
+            .collect()
+    }
+
+    pub fn script_tasks_by_ids(&self, requested_ids: &[String]) -> Vec<ScriptTaskConfig> {
+        self.script_tasks
+            .iter()
+            .filter(|task| requested_ids.iter().any(|id| id == &task.config.id))
             .map(|task| task.config.clone())
             .collect()
     }
@@ -267,5 +272,25 @@ message = "a"
         .unwrap();
 
         assert_ne!(first.hash(), second.hash());
+    }
+
+    #[test]
+    fn disabled_script_tasks_are_manual_only() {
+        let rules = Ruleset::from_toml(
+            r#"
+[[script_tasks]]
+enabled = false
+id = "manual-check"
+title = "Manual check"
+command = "python check.py"
+when_changed = ["src/**"]
+"#,
+        )
+        .unwrap();
+
+        assert!(rules
+            .script_tasks_for_changes(&["src/lib.rs".into()])
+            .is_empty());
+        assert_eq!(rules.script_tasks_by_ids(&["manual-check".into()]).len(), 1);
     }
 }

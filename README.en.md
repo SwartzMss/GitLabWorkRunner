@@ -107,7 +107,11 @@ when_changed = ["**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.rs"
 Behavior:
 
 - `enabled` defaults to `true` when omitted.
-- If `when_changed` is omitted or empty, the task runs for every MR.
+- When `enabled = true`, MR creation or updates run the task automatically according to `when_changed`.
+- When `enabled = false`, the task does not run automatically; it can still be triggered manually from an MR comment with `@task-id`, for example `@check-todo-tbd`.
+- Manual triggers ignore `enabled` and `when_changed`; they select script tasks only by exact `id`.
+- Manual triggers are not deduplicated; each valid command comment runs once.
+- If `when_changed` is omitted or empty, automatic triggers run the task for every MR.
 - The service always downloads the current MR head commit archive.
 - The command runs from the runner executable directory; relative paths in `command` are resolved from that directory.
 - stdout and stderr are merged into `run.log` for script execution logs.
@@ -141,6 +145,19 @@ The repository includes a minimal script example: [examples/scripts/check_todo_t
 
 Note: the relative path in `command = "python examples/scripts/check_todo_tbd.py"` is resolved from the runner executable directory. If you use the example script from the release package, keep this path. If the script lives elsewhere, use an absolute path. On Windows, exit code `9009` usually means the command is not found; add Python to `PATH`.
 
+Manual triggers require the GitLab Webhook to enable both `Comments` and `Merge request events`. The service only handles standalone command tokens in MR comments, for example:
+
+```text
+@check-todo-tbd
+```
+
+It also works inside multi-line comments:
+
+```text
+Please run:
+@check-todo-tbd
+```
+
 ## Local Run
 
 Windows PowerShell:
@@ -165,9 +182,9 @@ Configure a GitLab project webhook:
 
 - URL: `http://<host>:8080/webhooks/gitlab`
 - Secret token: the value of `[server].webhook_secret`
-- Trigger: Merge request events
+- Trigger: `Merge request events`; also enable `Comments` if you need manual script task triggers from MR comments
 
-For details about when `Merge request events` are triggered and which payload fields matter, see [GitLab Webhook notes](docs/gitlab-webhook.md).
+For details about when `Merge request events` and `Comments` are triggered and which payload fields matter, see [GitLab Webhook notes](docs/gitlab-webhook.md).
 
 ## Logs
 
