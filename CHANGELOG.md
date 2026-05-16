@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.4.2
 
 - 脚本任务 `exit 1` 现在会读取 `result.txt` 并发布 MR 评论。
 - `result.txt` 中符合 `path:line:message` 的结果会尽量发布为行级评论；无法解析或 diff refs 不完整时发布 MR 级汇总评论。
