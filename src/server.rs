@@ -5,7 +5,7 @@ use crate::{
     review::ReviewService,
     rules::Ruleset,
     storage::StateStore,
-    webhook::{parse_merge_request_event, validate_token},
+    webhook::{parse_gitlab_webhook_event, validate_token, GitLabWebhookEvent},
 };
 use axum::{
     body::Bytes,
@@ -70,10 +70,10 @@ async fn gitlab_webhook(
         return (StatusCode::UNAUTHORIZED, err.to_string()).into_response();
     }
 
-    let event = match parse_merge_request_event(&body) {
+    let event = match parse_gitlab_webhook_event(&body) {
         Ok(Some(event)) => event,
         Ok(None) => {
-            info!("gitlab webhook ignored because it is not a merge request event");
+            info!("gitlab webhook ignored because it is not a supported event");
             return StatusCode::ACCEPTED.into_response();
         }
         Err(err) => {
@@ -81,16 +81,6 @@ async fn gitlab_webhook(
             return (StatusCode::BAD_REQUEST, err.to_string()).into_response();
         }
     };
-    info!(
-        project_id = event.project_id,
-        mr_iid = event.mr_iid,
-        commit_sha = %event.commit_sha,
-        action = %event.action,
-        source_branch = %event.source_branch,
-        target_branch = %event.target_branch,
-        "gitlab merge request event parsed"
-    );
-
     let gitlab_token = match state.config.gitlab_token() {
         Ok(token) => token,
         Err(err) => {
@@ -117,12 +107,56 @@ async fn gitlab_webhook(
         state.config.gitlab.token_env.clone(),
     );
 
-    match service.review_merge_request(&event).await {
-        Ok(summary) => {
+    let result = match &event {
+        GitLabWebhookEvent::MergeRequest(event) => {
             info!(
                 project_id = event.project_id,
                 mr_iid = event.mr_iid,
                 commit_sha = %event.commit_sha,
+                action = %event.action,
+                source_branch = %event.source_branch,
+                target_branch = %event.target_branch,
+                "gitlab merge request event parsed"
+            );
+            service.review_merge_request(event).await.map(|summary| {
+                (
+                    event.project_id,
+                    event.mr_iid,
+                    event.commit_sha.as_str(),
+                    summary,
+                )
+            })
+        }
+        GitLabWebhookEvent::MergeRequestNote(event) => {
+            info!(
+                project_id = event.project_id,
+                mr_iid = event.mr_iid,
+                commit_sha = %event.commit_sha,
+                action = %event.action,
+                note_id = event.note_id,
+                "gitlab merge request note event parsed"
+            );
+            service
+                .review_merge_request_note(event)
+                .await
+                .map(|summary| {
+                    (
+                        event.project_id,
+                        event.mr_iid,
+                        event.commit_sha.as_str(),
+                        summary,
+                    )
+                })
+        }
+    };
+
+    match result {
+        Ok(summary) => {
+            let (project_id, mr_iid, commit_sha, summary) = summary;
+            info!(
+                project_id,
+                mr_iid,
+                commit_sha,
                 skipped = summary.skipped,
                 findings = summary.findings,
                 comments = summary.comments,
@@ -139,10 +173,18 @@ async fn gitlab_webhook(
                 .into_response()
         }
         Err(err) => {
+            let (project_id, mr_iid, commit_sha) = match &event {
+                GitLabWebhookEvent::MergeRequest(event) => {
+                    (event.project_id, event.mr_iid, event.commit_sha.as_str())
+                }
+                GitLabWebhookEvent::MergeRequestNote(event) => {
+                    (event.project_id, event.mr_iid, event.commit_sha.as_str())
+                }
+            };
             error!(
-                project_id = event.project_id,
-                mr_iid = event.mr_iid,
-                commit_sha = %event.commit_sha,
+                project_id,
+                mr_iid,
+                commit_sha,
                 error = %err,
                 "gitlab webhook review failed"
             );

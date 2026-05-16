@@ -107,7 +107,11 @@ when_changed = ["**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.rs"
 执行规则：
 
 - `enabled` 不写时默认为 `true`。
-- `when_changed` 不写或为空时，每个 MR 都执行。
+- `enabled = true` 时，MR 创建或更新会按 `when_changed` 自动执行。
+- `enabled = false` 时，不自动执行；但可以在 MR 评论里手动发送 `@任务id` 触发，例如 `@check-todo-tbd`。
+- 手动触发会忽略 `enabled` 和 `when_changed`，只按 `id` 精确选择脚本任务。
+- 手动触发不做去重；用户每发一次合法命令，服务就执行一次。
+- `when_changed` 不写或为空时，自动触发会对每个 MR 执行。
 - 服务固定下载 MR 当前 head commit 的 archive。
 - 命令在 runner 可执行文件所在目录执行；`command` 中的相对路径也基于这个目录解析。
 - stdout 和 stderr 合并写入 `run.log`，用于查看脚本运行过程。
@@ -141,6 +145,19 @@ work/script_tasks/<project_id>/<mr_iid>/<commit_sha>/<task_id>/
 
 注意：`command = "python examples/scripts/check_todo_tbd.py"` 中的相对路径是相对于 runner 可执行文件所在目录的。如果使用 release 包里的示例脚本，保持这个路径即可；如果脚本放在其他目录，可以改成绝对路径。Windows 上如果返回退出码 `9009`，通常表示命令不存在，需要把 Python 加入 `PATH`。
 
+手动触发需要 GitLab Webhook 同时开启 `Comments` 和 `Merge request events`。服务只处理 MR 评论中的独立命令 token，例如：
+
+```text
+@check-todo-tbd
+```
+
+也可以写在多行评论中：
+
+```text
+请帮我跑一下：
+@check-todo-tbd
+```
+
 ## 本地运行
 
 Windows PowerShell：
@@ -165,9 +182,9 @@ cargo run
 
 - URL: `http://<host>:8080/webhooks/gitlab`
 - Secret token: `[server].webhook_secret` 的值
-- Trigger: Merge request events
+- Trigger: `Merge request events`；如果需要 MR 评论手动触发脚本任务，同时开启 `Comments`
 
-关于 `Merge request events` 的触发时机和 payload 字段，见 [GitLab Webhook 说明](docs/gitlab-webhook.md)。
+关于 `Merge request events`、`Comments` 的触发时机和 payload 字段，见 [GitLab Webhook 说明](docs/gitlab-webhook.md)。
 
 ## 日志
 

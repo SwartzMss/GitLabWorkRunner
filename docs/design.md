@@ -191,7 +191,8 @@ struct Finding {
 职责：
 
 - 读取 `rules.toml` 中的 `[[script_tasks]]`。
-- 根据 `when_changed` 判断任务是否需要运行。
+- 自动触发时，只选择 `enabled = true` 且匹配 `when_changed` 的任务。
+- 手动触发时，根据 MR 评论中的 `@task_id` 精确选择任务，允许执行 `enabled = false` 的任务，并忽略 `when_changed`。
 - 通过 GitLab archive API 下载 MR 当前 head commit。
 - 解压到 `work/script_tasks/<project_id>/<mr_iid>/<commit_sha>/<task_id>/source`。
 - 在 runner 可执行文件所在目录执行 `command`，相对脚本路径不绑定目标 GitLab 仓库。
@@ -215,7 +216,7 @@ when_changed = ["**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.rs"
 
 字段说明：
 
-- `enabled`: 单条任务开关，默认 `true`。
+- `enabled`: 单条任务自动触发开关，默认 `true`；`false` 时仍可通过 MR 评论 `@id` 手动触发。
 - `id`: 任务唯一标识。
 - `title`: MR 评论标题。
 - `command`: 在 runner 可执行文件所在目录执行的命令；相对路径基于该目录解析。
@@ -241,6 +242,14 @@ src/config.rs:5: //TODO aa
 ```
 
 服务会按 `path:line:message` 解析每一行，路径会按 GitLab diff 路径处理。能解析且当前 MR diff refs 完整时，发布到对应代码行；无法解析或 diff refs 不完整时，发布一条 MR 级汇总评论。第一版不提供 Python helper，也不要求 JSON 输出。
+
+手动触发规则：
+
+- GitLab Webhook 需要开启 `Comments`。
+- 只处理 MR comment event，不处理 issue、wiki、work item comment。
+- 评论正文中出现独立 token `@task_id` 时触发对应 `script_tasks.id`。
+- 手动触发不写入自动 review 去重记录；用户每发一次合法命令，服务都会执行一次。
+- 如果 `@task_id` 不存在，服务只记录日志，不发布额外评论。
 
 ### Comment Builder
 

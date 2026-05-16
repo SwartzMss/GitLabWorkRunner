@@ -7,8 +7,9 @@ use crate::{
     script_tasks::{ScriptTaskContext, ScriptTaskResult, ScriptTaskRunner, ScriptTaskStatus},
     storage::{ReviewKey, StateStore, StoredComment},
     webhook::MergeRequestEvent,
+    webhook::MergeRequestNoteEvent,
 };
-use std::fs;
+use std::{collections::BTreeSet, fs};
 use tracing::{info, warn};
 
 pub struct ReviewService {
@@ -147,6 +148,67 @@ impl ReviewService {
             skipped: line_review_skipped && published == 1,
             findings: findings.len(),
             comments: published,
+        })
+    }
+
+    pub async fn review_merge_request_note(
+        &self,
+        event: &MergeRequestNoteEvent,
+    ) -> AppResult<ReviewSummary> {
+        let requested_ids = manual_script_task_ids(&event.note);
+        let tasks = self.ruleset.script_tasks_by_ids(&requested_ids);
+        if tasks.is_empty() {
+            info!(
+                project_id = event.project_id,
+                mr_iid = event.mr_iid,
+                note_id = event.note_id,
+                requested_task_ids = ?requested_ids,
+                "merge request note did not request any configured script task"
+            );
+            return Ok(ReviewSummary {
+                skipped: true,
+                findings: 0,
+                comments: 0,
+            });
+        }
+
+        info!(
+            project_id = event.project_id,
+            mr_iid = event.mr_iid,
+            note_id = event.note_id,
+            commit_sha = %event.commit_sha,
+            action = %event.action,
+            requested_task_ids = ?requested_ids,
+            selected_tasks = tasks.len(),
+            "manual script task review started"
+        );
+        let changes = self
+            .gitlab
+            .merge_request_changes(event.project_id, event.mr_iid)
+            .await?;
+        let mr_event = MergeRequestEvent {
+            project_id: event.project_id,
+            mr_iid: event.mr_iid,
+            commit_sha: event.commit_sha.clone(),
+            action: format!("manual-note-{}", event.note_id),
+            source_branch: String::new(),
+            target_branch: String::new(),
+        };
+        let comments = self
+            .run_selected_script_tasks(&mr_event, &changes, tasks)
+            .await?;
+        info!(
+            project_id = event.project_id,
+            mr_iid = event.mr_iid,
+            note_id = event.note_id,
+            commit_sha = %event.commit_sha,
+            comments,
+            "manual script task review completed"
+        );
+        Ok(ReviewSummary {
+            skipped: false,
+            findings: 0,
+            comments,
         })
     }
 
@@ -296,6 +358,15 @@ impl ReviewService {
     ) -> AppResult<usize> {
         let changed_paths = changed_paths(&changes.changes);
         let tasks = self.ruleset.script_tasks_for_changes(&changed_paths);
+        self.run_selected_script_tasks(event, changes, tasks).await
+    }
+
+    async fn run_selected_script_tasks(
+        &self,
+        event: &MergeRequestEvent,
+        changes: &crate::gitlab::MergeRequestChanges,
+        tasks: Vec<crate::rules::ScriptTaskConfig>,
+    ) -> AppResult<usize> {
         if tasks.is_empty() {
             return Ok(0);
         }
@@ -390,6 +461,44 @@ fn changed_paths(changes: &[GitLabChange]) -> Vec<String> {
     paths
 }
 
+fn manual_script_task_ids(text: &str) -> Vec<String> {
+    let mut ids = BTreeSet::new();
+    for raw in text.split_whitespace() {
+        let token = raw.trim_matches(|ch: char| {
+            matches!(
+                ch,
+                ',' | '.'
+                    | ';'
+                    | ':'
+                    | '!'
+                    | '?'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '<'
+                    | '>'
+                    | '"'
+                    | '\''
+                    | '`'
+            )
+        });
+        let Some(id) = token.strip_prefix('@') else {
+            continue;
+        };
+        if !id.is_empty()
+            && id
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        {
+            ids.insert(id.to_string());
+        }
+    }
+    ids.into_iter().collect()
+}
+
 fn parse_script_result_findings(result: &ScriptTaskResult, text: &str) -> Vec<Finding> {
     text.lines()
         .filter_map(parse_script_result_line)
@@ -436,4 +545,23 @@ pub struct ReviewSummary {
     pub skipped: bool,
     pub findings: usize,
     pub comments: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_manual_script_task_ids() {
+        assert_eq!(
+            manual_script_task_ids("please run\n@check-todo-tbd, @other_check"),
+            vec!["check-todo-tbd".to_string(), "other_check".to_string()]
+        );
+    }
+
+    #[test]
+    fn ignores_non_standalone_manual_script_task_ids() {
+        assert!(manual_script_task_ids("please@check-todo-tbd").is_empty());
+        assert!(manual_script_task_ids("@").is_empty());
+    }
 }

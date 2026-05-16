@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- 新增 MR 评论手动触发脚本任务：在 GitLab Webhook 开启 `Comments` 后，可在 MR 评论中发送 `@script_task_id` 执行指定 `[[script_tasks]]`。
+- `enabled = false` 的脚本任务不再被配置加载阶段丢弃，可通过手动评论触发；自动 MR 触发仍只执行 `enabled = true` 的任务。
+- 手动触发忽略 `when_changed` 且不使用自动 Review 去重，用户每发一次合法命令就执行一次。
+
 ## v1.4.2
 
 - 脚本任务 `exit 1` 现在会读取 `result.txt` 并发布 MR 评论。
