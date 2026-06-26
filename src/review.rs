@@ -1,9 +1,10 @@
 use crate::{
+    ai_review::run_ai_review,
     comments::{build_comment_drafts, CommentDraft},
     diff::parse_unified_diff,
     error::AppResult,
     gitlab::{CreateDiscussionRequest, DiscussionPosition, GitLabChange, GitLabClient},
-    rules::{Finding, Ruleset, Severity},
+    rules::{AiReviewConfig, Finding, Ruleset, Severity},
     script_tasks::{ScriptTaskContext, ScriptTaskResult, ScriptTaskRunner, ScriptTaskStatus},
     storage::{ReviewKey, StateStore, StoredComment},
     webhook::MergeRequestEvent,
@@ -86,6 +87,7 @@ impl ReviewService {
         );
 
         let mut findings = Vec::new();
+        let mut ai_finding_count = 0_usize;
         let mut published = 0_usize;
         let mut line_review_skipped = false;
 
@@ -132,6 +134,10 @@ impl ReviewService {
                 .await?;
         }
 
+        let (ai_findings, ai_comments) = self.run_ai_reviews(event, &changes).await?;
+        ai_finding_count += ai_findings;
+        published += ai_comments;
+
         published += self.run_script_tasks(event, &changes).await?;
 
         self.store.mark_processed(&key, "success").await?;
@@ -140,13 +146,13 @@ impl ReviewService {
             mr_iid = event.mr_iid,
             commit_sha = %event.commit_sha,
             ruleset_hash = %self.ruleset.hash(),
-            findings = findings.len(),
+            findings = findings.len() + ai_finding_count,
             comments = published,
             "review completed"
         );
         Ok(ReviewSummary {
             skipped: line_review_skipped && published == 1,
-            findings: findings.len(),
+            findings: findings.len() + ai_finding_count,
             comments: published,
         })
     }
@@ -157,7 +163,8 @@ impl ReviewService {
     ) -> AppResult<ReviewSummary> {
         let requested_ids = manual_script_task_ids(&event.note);
         let tasks = self.ruleset.script_tasks_by_ids(&requested_ids);
-        if tasks.is_empty() {
+        let ai_reviews = self.ruleset.ai_reviews_by_ids(&requested_ids);
+        if tasks.is_empty() && ai_reviews.is_empty() {
             info!(
                 project_id = event.project_id,
                 mr_iid = event.mr_iid,
@@ -194,20 +201,25 @@ impl ReviewService {
             source_branch: String::new(),
             target_branch: String::new(),
         };
-        let comments = self
+        let (ai_findings, ai_comments) = self
+            .run_selected_ai_reviews(&mr_event, &changes, ai_reviews)
+            .await?;
+        let script_comments = self
             .run_selected_script_tasks(&mr_event, &changes, tasks)
             .await?;
+        let comments = ai_comments + script_comments;
         info!(
             project_id = event.project_id,
             mr_iid = event.mr_iid,
             note_id = event.note_id,
             commit_sha = %event.commit_sha,
+            findings = ai_findings,
             comments,
             "manual script task review completed"
         );
         Ok(ReviewSummary {
             skipped: false,
-            findings: 0,
+            findings: ai_findings,
             comments,
         })
     }
@@ -266,6 +278,60 @@ impl ReviewService {
 
         self.publish_comment_drafts(event, changes, &drafts, "grouped")
             .await
+    }
+
+    async fn run_ai_reviews(
+        &self,
+        event: &MergeRequestEvent,
+        changes: &crate::gitlab::MergeRequestChanges,
+    ) -> AppResult<(usize, usize)> {
+        let changed_paths = changed_paths(&changes.changes);
+        let reviews = self.ruleset.ai_reviews_for_changes(&changed_paths);
+        self.run_selected_ai_reviews(event, changes, reviews).await
+    }
+
+    async fn run_selected_ai_reviews(
+        &self,
+        event: &MergeRequestEvent,
+        changes: &crate::gitlab::MergeRequestChanges,
+        reviews: Vec<AiReviewConfig>,
+    ) -> AppResult<(usize, usize)> {
+        if reviews.is_empty() {
+            return Ok((0, 0));
+        }
+        if !changes.diff_refs.is_complete() {
+            warn!(
+                project_id = event.project_id,
+                mr_iid = event.mr_iid,
+                commit_sha = %event.commit_sha,
+                "AI review skipped because gitlab diff refs are incomplete"
+            );
+            return Ok((0, 0));
+        }
+
+        let mut finding_count = 0_usize;
+        let mut published = 0_usize;
+        for review in reviews {
+            match run_ai_review(&review, &changes.changes).await {
+                Ok(findings) => {
+                    finding_count += findings.len();
+                    published += self
+                        .publish_line_findings(event, changes, &findings)
+                        .await?;
+                }
+                Err(err) => {
+                    warn!(
+                        project_id = event.project_id,
+                        mr_iid = event.mr_iid,
+                        commit_sha = %event.commit_sha,
+                        ai_review_id = %review.id,
+                        error = %err,
+                        "AI review failed"
+                    );
+                }
+            }
+        }
+        Ok((finding_count, published))
     }
 
     async fn publish_comment_drafts(

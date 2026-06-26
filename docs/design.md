@@ -21,7 +21,7 @@
 - 不支持 GitHub、Bitbucket、Gitea 等其他平台。
 - 不兼容 reviewdog 的所有输入格式、reporter 和 linter adapter。
 - 不做容器沙箱、任务隔离、分布式调度。
-- 不接入 LLM 自动审查。后续可以作为规则插件扩展。
+- 原始第一版不接入 LLM 自动审查；后续版本通过 `[[ai_reviews]]` 提供原生 OpenAI-compatible AI Review 扩展。
 
 ## 推荐方案
 

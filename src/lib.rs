@@ -1,3 +1,4 @@
+pub mod ai_review;
 pub mod comments;
 pub mod config;
 pub mod diff;
