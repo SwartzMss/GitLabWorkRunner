@@ -85,6 +85,48 @@ impl ReviewService {
             "merge request diff fetched"
         );
 
+        if !changes.diff_refs.is_complete() {
+            warn!(
+                project_id = event.project_id,
+                mr_iid = event.mr_iid,
+                commit_sha = %event.commit_sha,
+                base_sha = ?changes.diff_refs.base_sha,
+                start_sha = ?changes.diff_refs.start_sha,
+                head_sha = ?changes.diff_refs.head_sha,
+                "review skipped because gitlab diff refs are incomplete"
+            );
+            let created = self
+                .gitlab
+                .create_discussion(
+                    event.project_id,
+                    event.mr_iid,
+                    &CreateDiscussionRequest {
+                        body: incomplete_diff_refs_body(),
+                        position: None,
+                    },
+                )
+                .await?;
+            self.store
+                .record_comment(&StoredComment {
+                    project_id: event.project_id,
+                    mr_iid: event.mr_iid,
+                    commit_sha: &event.commit_sha,
+                    ruleset_hash: self.ruleset.hash(),
+                    rule_id: "incomplete-diff-refs",
+                    path: "",
+                    new_line: None,
+                    discussion_id: Some(&created.id),
+                    note_id: created.notes.first().map(|note| note.id),
+                })
+                .await?;
+            self.store.mark_processed(&key, "skipped").await?;
+            return Ok(ReviewSummary {
+                skipped: true,
+                findings: 0,
+                comments: 1,
+            });
+        }
+
         let mut findings = Vec::new();
         let mut published = 0_usize;
         let mut line_review_skipped = false;
@@ -538,6 +580,10 @@ fn build_script_result_summary(result: &ScriptTaskResult, text: &str) -> String 
         result.run_log_path.display(),
         result.id
     )
+}
+
+fn incomplete_diff_refs_body() -> String {
+    "**[warning] Review 已跳过**\n\n当前 MR 的 diff 信息不完整，无法可靠发布行级评论。请先解决冲突或刷新 MR 后重新触发检查。\n\n<!-- gitlab-work-runner:rule=incomplete-diff-refs -->".into()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
