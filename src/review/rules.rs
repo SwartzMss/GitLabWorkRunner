@@ -183,6 +183,18 @@ impl Ruleset {
         !self.rules.is_empty()
     }
 
+    pub fn line_rule_count(&self) -> usize {
+        self.rules.len()
+    }
+
+    pub fn script_task_count(&self) -> usize {
+        self.script_tasks.len()
+    }
+
+    pub fn ai_review_count(&self) -> usize {
+        self.ai_reviews.len()
+    }
+
     pub fn script_tasks_for_changes(&self, changed_paths: &[String]) -> Vec<ScriptTaskConfig> {
         self.script_tasks
             .iter()

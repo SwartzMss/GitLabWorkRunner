@@ -5,6 +5,7 @@ use sqlx::{
     SqlitePool,
 };
 use std::str::FromStr;
+use tracing::info;
 
 #[derive(Clone)]
 pub struct StateStore {
@@ -35,14 +36,17 @@ pub struct StoredComment<'a> {
 impl StateStore {
     pub async fn connect(database_url: &str) -> AppResult<Self> {
         let options = SqliteConnectOptions::from_str(database_url)?.create_if_missing(true);
+        info!(database_url, "connecting state store");
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(options)
             .await?;
+        info!(database_url, "state store connected");
         Ok(Self { pool })
     }
 
     pub async fn migrate(&self) -> AppResult<()> {
+        info!("state store migration started");
         sqlx::query(
             r#"
 create table if not exists processed_reviews (
@@ -79,6 +83,7 @@ create table if not exists review_comments (
         )
         .execute(&self.pool)
         .await?;
+        info!("state store migration completed");
         Ok(())
     }
 
@@ -95,7 +100,16 @@ where project_id = ? and mr_iid = ? and commit_sha = ? and ruleset_hash = ?
         .bind(key.ruleset_hash)
         .fetch_one(&self.pool)
         .await?;
-        Ok(count > 0)
+        let processed = count > 0;
+        info!(
+            project_id = key.project_id,
+            mr_iid = key.mr_iid,
+            commit_sha = %key.commit_sha,
+            ruleset_hash = %key.ruleset_hash,
+            processed,
+            "processed review lookup completed"
+        );
+        Ok(processed)
     }
 
     pub async fn mark_processed(&self, key: &ReviewKey<'_>, status: &str) -> AppResult<()> {
@@ -118,6 +132,14 @@ do update set status = excluded.status, updated_at = excluded.updated_at
         .bind(&now)
         .execute(&self.pool)
         .await?;
+        info!(
+            project_id = key.project_id,
+            mr_iid = key.mr_iid,
+            commit_sha = %key.commit_sha,
+            ruleset_hash = %key.ruleset_hash,
+            status,
+            "processed review state recorded"
+        );
         Ok(())
     }
 
@@ -142,6 +164,18 @@ values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         .bind(now)
         .execute(&self.pool)
         .await?;
+        info!(
+            project_id = comment.project_id,
+            mr_iid = comment.mr_iid,
+            commit_sha = %comment.commit_sha,
+            ruleset_hash = %comment.ruleset_hash,
+            rule_id = %comment.rule_id,
+            path = %comment.path,
+            new_line = ?comment.new_line,
+            discussion_id = ?comment.discussion_id,
+            note_id = ?comment.note_id,
+            "review comment state recorded"
+        );
         Ok(())
     }
 }

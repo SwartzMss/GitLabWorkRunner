@@ -1,6 +1,7 @@
 use crate::error::AppResult;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 use tracing::{info, warn};
 
 #[derive(Clone)]
@@ -94,17 +95,32 @@ impl GitLabClient {
             "{}/api/v4/projects/{}/merge_requests/{}/changes",
             self.base_url, project_id, mr_iid
         );
+        let started = Instant::now();
         let response = self
             .http
             .get(url)
             .header("PRIVATE-TOKEN", &self.token)
             .send()
-            .await?
-            .error_for_status()?;
-        let changes = response.json().await?;
+            .await?;
+        let status = response.status();
         info!(
             project_id,
-            mr_iid, "merge request changes fetched from gitlab"
+            mr_iid,
+            status = status.as_u16(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "gitlab merge request changes response received"
+        );
+        let response = response.error_for_status()?;
+        let changes: MergeRequestChanges = response.json().await?;
+        info!(
+            project_id,
+            mr_iid,
+            changed_files = changes.changes.len(),
+            diff_refs_complete = changes.diff_refs.is_complete(),
+            base_sha = ?changes.diff_refs.base_sha,
+            start_sha = ?changes.diff_refs.start_sha,
+            head_sha = ?changes.diff_refs.head_sha,
+            "merge request changes fetched from gitlab"
         );
         Ok(changes)
     }
@@ -120,17 +136,23 @@ impl GitLabClient {
             "{}/api/v4/projects/{}/repository/archive.zip",
             self.base_url, project_id
         );
-        let archive = self
+        let started = Instant::now();
+        let response = self
             .http
             .get(url)
             .query(&[("sha", sha)])
             .header("PRIVATE-TOKEN", &self.token)
             .send()
-            .await?
-            .error_for_status()?
-            .bytes()
-            .await?
-            .to_vec();
+            .await?;
+        let status = response.status();
+        info!(
+            project_id,
+            sha,
+            status = status.as_u16(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "gitlab repository archive response received"
+        );
+        let archive = response.error_for_status()?.bytes().await?.to_vec();
         info!(
             project_id,
             sha,
@@ -156,6 +178,7 @@ impl GitLabClient {
             "{}/api/v4/projects/{}/merge_requests/{}/discussions",
             self.base_url, project_id, mr_iid
         );
+        let started = Instant::now();
         let response = self
             .http
             .post(&url)
@@ -163,6 +186,15 @@ impl GitLabClient {
             .json(request)
             .send()
             .await?;
+        let status = response.status();
+        info!(
+            project_id,
+            mr_iid,
+            status = status.as_u16(),
+            has_position = request.position.is_some(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "gitlab create discussion response received"
+        );
         if response.status() == StatusCode::BAD_REQUEST && request.position.is_some() {
             warn!(
                 project_id,
@@ -173,6 +205,7 @@ impl GitLabClient {
                 body: request.body.clone(),
                 position: None,
             };
+            let fallback_started = Instant::now();
             let created: CreatedDiscussion = self
                 .http
                 .post(url)
@@ -187,6 +220,7 @@ impl GitLabClient {
                 project_id,
                 mr_iid,
                 discussion_id = %created.id,
+                elapsed_ms = fallback_started.elapsed().as_millis(),
                 "fallback merge-request-level discussion created"
             );
             return Ok(created);

@@ -80,6 +80,7 @@ impl ReviewService {
             mr_iid = event.mr_iid,
             commit_sha = %event.commit_sha,
             changed_files = changes.changes.len(),
+            changed_paths = changed_paths(&changes.changes).len(),
             base_sha = ?changes.diff_refs.base_sha,
             start_sha = ?changes.diff_refs.start_sha,
             head_sha = ?changes.diff_refs.head_sha,
@@ -212,7 +213,7 @@ impl ReviewService {
                 mr_iid = event.mr_iid,
                 note_id = event.note_id,
                 requested_task_ids = ?requested_ids,
-                "merge request note did not request any configured script task"
+                "merge request note did not request any configured manual review"
             );
             return Ok(ReviewSummary {
                 skipped: true,
@@ -229,7 +230,8 @@ impl ReviewService {
             action = %event.action,
             requested_task_ids = ?requested_ids,
             selected_tasks = tasks.len(),
-            "manual script task review started"
+            selected_ai_reviews = ai_reviews.len(),
+            "manual review started"
         );
         let changes = self
             .gitlab
@@ -257,7 +259,7 @@ impl ReviewService {
             commit_sha = %event.commit_sha,
             findings = ai_findings,
             comments,
-            "manual script task review completed"
+            "manual review completed"
         );
         Ok(ReviewSummary {
             skipped: false,
@@ -295,6 +297,7 @@ impl ReviewService {
                 findings = file_findings.len(),
                 new_file = change.new_file,
                 renamed_file = change.renamed_file,
+                deleted_file = change.deleted_file,
                 "diff file evaluated"
             );
             findings.extend(file_findings);
@@ -329,6 +332,14 @@ impl ReviewService {
     ) -> AppResult<(usize, usize)> {
         let changed_paths = changed_paths(&changes.changes);
         let reviews = self.ruleset.ai_reviews_for_changes(&changed_paths);
+        info!(
+            project_id = event.project_id,
+            mr_iid = event.mr_iid,
+            commit_sha = %event.commit_sha,
+            changed_paths = changed_paths.len(),
+            selected_ai_reviews = reviews.len(),
+            "automatic AI reviews selected"
+        );
         self.run_selected_ai_reviews(event, changes, reviews).await
     }
 
@@ -339,6 +350,12 @@ impl ReviewService {
         reviews: Vec<AiReviewConfig>,
     ) -> AppResult<(usize, usize)> {
         if reviews.is_empty() {
+            info!(
+                project_id = event.project_id,
+                mr_iid = event.mr_iid,
+                commit_sha = %event.commit_sha,
+                "no AI reviews selected"
+            );
             return Ok((0, 0));
         }
         if !changes.diff_refs.is_complete() {
@@ -354,12 +371,29 @@ impl ReviewService {
         let mut finding_count = 0_usize;
         let mut published = 0_usize;
         for review in reviews {
+            info!(
+                project_id = event.project_id,
+                mr_iid = event.mr_iid,
+                commit_sha = %event.commit_sha,
+                ai_review_id = %review.id,
+                "AI review started"
+            );
             match run_ai_review(&review, &changes.changes).await {
                 Ok(findings) => {
-                    finding_count += findings.len();
+                    let review_findings = findings.len();
+                    finding_count += review_findings;
                     published += self
                         .publish_line_findings(event, changes, &findings)
                         .await?;
+                    info!(
+                        project_id = event.project_id,
+                        mr_iid = event.mr_iid,
+                        commit_sha = %event.commit_sha,
+                        ai_review_id = %review.id,
+                        findings = review_findings,
+                        comments = published,
+                        "AI review completed"
+                    );
                 }
                 Err(err) => {
                     warn!(
@@ -466,6 +500,14 @@ impl ReviewService {
     ) -> AppResult<usize> {
         let changed_paths = changed_paths(&changes.changes);
         let tasks = self.ruleset.script_tasks_for_changes(&changed_paths);
+        info!(
+            project_id = event.project_id,
+            mr_iid = event.mr_iid,
+            commit_sha = %event.commit_sha,
+            changed_paths = changed_paths.len(),
+            selected_script_tasks = tasks.len(),
+            "automatic script tasks selected"
+        );
         self.run_selected_script_tasks(event, changes, tasks).await
     }
 
@@ -476,6 +518,12 @@ impl ReviewService {
         tasks: Vec<crate::rules::ScriptTaskConfig>,
     ) -> AppResult<usize> {
         if tasks.is_empty() {
+            info!(
+                project_id = event.project_id,
+                mr_iid = event.mr_iid,
+                commit_sha = %event.commit_sha,
+                "no script tasks selected"
+            );
             return Ok(0);
         }
 
@@ -505,13 +553,36 @@ impl ReviewService {
         };
         let mut published = 0_usize;
         for task in tasks {
+            info!(
+                project_id = event.project_id,
+                mr_iid = event.mr_iid,
+                commit_sha = archive_sha,
+                script_task_id = %task.id,
+                "script task selected"
+            );
             let result = runner.run(&task, &context, &archive).await?;
             if result.status == ScriptTaskStatus::IssueFound {
                 published += self
                     .publish_script_task_result(event, changes, &result)
                     .await?;
+            } else {
+                info!(
+                    project_id = event.project_id,
+                    mr_iid = event.mr_iid,
+                    commit_sha = archive_sha,
+                    script_task_id = %result.id,
+                    status = ?result.status,
+                    "script task produced no publishable issue"
+                );
             }
         }
+        info!(
+            project_id = event.project_id,
+            mr_iid = event.mr_iid,
+            commit_sha = archive_sha,
+            comments = published,
+            "script tasks completed"
+        );
         Ok(published)
     }
 
@@ -537,10 +608,29 @@ impl ReviewService {
             }
         };
         let findings = parse_script_result_findings(result, &result_text);
+        info!(
+            project_id = event.project_id,
+            mr_iid = event.mr_iid,
+            commit_sha = %event.commit_sha,
+            script_task_id = %result.id,
+            result_bytes = result_text.len(),
+            parsed_findings = findings.len(),
+            diff_refs_complete = changes.diff_refs.is_complete(),
+            "script task result parsed"
+        );
         if !findings.is_empty() && changes.diff_refs.is_complete() {
             return self.publish_line_findings(event, changes, &findings).await;
         }
 
+        info!(
+            project_id = event.project_id,
+            mr_iid = event.mr_iid,
+            commit_sha = %event.commit_sha,
+            script_task_id = %result.id,
+            parsed_findings = findings.len(),
+            diff_refs_complete = changes.diff_refs.is_complete(),
+            "publishing script task result as merge-request-level summary"
+        );
         let body = build_script_result_summary(result, &result_text);
         let draft = CommentDraft {
             path: String::new(),

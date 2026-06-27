@@ -99,6 +99,14 @@ async fn gitlab_webhook(
             return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
         }
     };
+    info!(
+        rules_file = %state.config.rules.file,
+        ruleset_hash = %ruleset.hash(),
+        line_rules = ruleset.line_rule_count(),
+        script_tasks = ruleset.script_task_count(),
+        ai_reviews = ruleset.ai_review_count(),
+        "ruleset loaded"
+    );
     let gitlab = GitLabClient::new(state.config.gitlab.base_url.clone(), gitlab_token);
     let service = ReviewService::new(
         gitlab,

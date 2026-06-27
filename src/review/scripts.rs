@@ -7,7 +7,7 @@ use std::{
     io::{self, Cursor, Write},
     path::{Component, Path, PathBuf},
     process::Stdio,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{process::Command, time};
 use tracing::{info, warn};
@@ -62,9 +62,27 @@ impl ScriptTaskRunner {
         let source_dir = task_dir.join("source");
         let run_log_path = task_dir.join("run.log");
         let result_path = task_dir.join("result.txt");
+        info!(
+            project_id = context.project_id,
+            mr_iid = context.mr_iid,
+            commit_sha = %context.commit_sha,
+            script_task_id = %task.id,
+            work_dir = %task_dir.display(),
+            "preparing script task work directory"
+        );
         reset_task_dir(&task_dir)?;
         fs::create_dir_all(&source_dir)?;
-        extract_zip_archive(archive, &source_dir)?;
+        let extracted_files = extract_zip_archive(archive, &source_dir)?;
+        info!(
+            project_id = context.project_id,
+            mr_iid = context.mr_iid,
+            commit_sha = %context.commit_sha,
+            script_task_id = %task.id,
+            archive_bytes = archive.len(),
+            extracted_files,
+            source_dir = %source_dir.display(),
+            "script task archive extracted"
+        );
         let script_cwd = script_working_dir()?;
 
         let command_with_args = command_with_script_args(&task.command, &source_dir, &result_path);
@@ -97,12 +115,32 @@ impl ScriptTaskRunner {
             .stdout(Stdio::from(run_log.try_clone()?))
             .stderr(Stdio::from(run_log));
 
+        let started = Instant::now();
         let mut child = command.spawn()?;
+        info!(
+            project_id = context.project_id,
+            mr_iid = context.mr_iid,
+            commit_sha = %context.commit_sha,
+            script_task_id = %task.id,
+            child_pid = ?child.id(),
+            "script task process started"
+        );
         let timeout = Duration::from_secs(task.timeout_seconds.max(1));
         let status = match time::timeout(timeout, child.wait()).await {
             Ok(status) => {
                 let status = status?;
-                script_task_status(status.code())
+                let mapped = script_task_status(status.code());
+                info!(
+                    project_id = context.project_id,
+                    mr_iid = context.mr_iid,
+                    commit_sha = %context.commit_sha,
+                    script_task_id = %task.id,
+                    exit_code = ?status.code(),
+                    status = ?mapped,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "script task process exited"
+                );
+                mapped
             }
             Err(_) => {
                 warn!(
@@ -111,6 +149,7 @@ impl ScriptTaskRunner {
                     commit_sha = %context.commit_sha,
                     script_task_id = %task.id,
                     timeout_seconds = task.timeout_seconds,
+                    elapsed_ms = started.elapsed().as_millis(),
                     "script task timed out"
                 );
                 kill_process_tree(&mut child).await;
@@ -122,6 +161,14 @@ impl ScriptTaskRunner {
 
         if source_dir.exists() {
             fs::remove_dir_all(&source_dir)?;
+            info!(
+                project_id = context.project_id,
+                mr_iid = context.mr_iid,
+                commit_sha = %context.commit_sha,
+                script_task_id = %task.id,
+                source_dir = %source_dir.display(),
+                "script task source directory removed"
+            );
         }
 
         info!(
@@ -133,6 +180,7 @@ impl ScriptTaskRunner {
             source_dir = %source_dir.display(),
             run_log_path = %run_log_path.display(),
             result_path = %result_path.display(),
+            elapsed_ms = started.elapsed().as_millis(),
             "script task completed"
         );
         Ok(ScriptTaskResult {
@@ -338,10 +386,11 @@ fn append_timeout_note(path: &Path, timeout: Duration) -> io::Result<()> {
     )
 }
 
-fn extract_zip_archive(bytes: &[u8], destination: &Path) -> AppResult<()> {
+fn extract_zip_archive(bytes: &[u8], destination: &Path) -> AppResult<usize> {
     let reader = Cursor::new(bytes);
     let mut archive =
         ZipArchive::new(reader).map_err(|err| AppError::ScriptTask(err.to_string()))?;
+    let mut extracted_files = 0_usize;
     for index in 0..archive.len() {
         let mut file = archive
             .by_index(index)
@@ -364,8 +413,9 @@ fn extract_zip_archive(bytes: &[u8], destination: &Path) -> AppResult<()> {
         let mut output = File::create(&output_path)?;
         io::copy(&mut file, &mut output)?;
         set_unix_mode(&output_path, file.unix_mode())?;
+        extracted_files += 1;
     }
-    Ok(())
+    Ok(extracted_files)
 }
 
 fn strip_first_component(path: &Path) -> PathBuf {
