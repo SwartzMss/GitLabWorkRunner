@@ -8,7 +8,7 @@
 2. 服务校验事件并做去重。
 3. 通过 GitLab API 获取 MR diff。
 4. 解析 diff，建立文件、hunk、行号映射。
-5. 执行配置文件定义的行级规则和可选脚本任务。
+5. 执行配置文件定义的行级规则、AI Review 和可选脚本任务。
 6. 在 GitLab MR Discussion 中发布行级或 MR 级评论。
 7. 记录已处理 commit、评论 note id 和 MR 状态，避免重复评论。
 
@@ -21,18 +21,18 @@
 - 不支持 GitHub、Bitbucket、Gitea 等其他平台。
 - 不兼容 reviewdog 的所有输入格式、reporter 和 linter adapter。
 - 不做容器沙箱、任务隔离、分布式调度。
-- 原始第一版不接入 LLM 自动审查；后续版本通过 `[[ai_reviews]]` 提供原生 OpenAI-compatible AI Review 扩展。
+- 不提供通用 LLM 插件系统；当前只通过 `[[ai_reviews]]` 支持 OpenAI-compatible AI Review。
 
 ## 推荐方案
 
 采用“Webhook 实时触发 + GitLab API 获取 Diff + SQLite 状态存储 + 配置化规则引擎 + GitLab MR Discussion 输出”的服务化架构。
 
-这个方案比内置写死规则更灵活，也比第一版直接做插件系统更可控。行级规则先放在 `rules.toml` 中，通过路径匹配、正则匹配和提示模板完成基础 review；复杂检查通过独立的 `script_tasks` 下载 MR head 快照后执行。
+这个方案比内置写死规则更灵活，也比第一版直接做插件系统更可控。行级规则、AI Review 和脚本任务都放在 `rules.toml` 中：基础 review 通过路径匹配、正则匹配和提示模板完成；AI Review 调用 OpenAI-compatible API；复杂检查通过独立的 `script_tasks` 下载 MR head 快照后执行。
 
 ## 系统架构
 
 ```text
-GitLab Merge Request Event
+GitLab Merge Request / MR Note Event
   -> Webhook Server
   -> Event Scheduler / Deduplicator
   -> GitLab API Client
@@ -52,8 +52,9 @@ GitLab Merge Request Event
 
 - 暴露 HTTP endpoint，例如 `POST /webhooks/gitlab`。
 - 校验 `X-Gitlab-Token`。
-- 只接受 Merge Request event。
-- 从 payload 中提取 `project_id`、`merge_request.iid`、source branch、target branch、last commit sha、event action。
+- 接受 Merge Request event 和 MR comment note event。
+- 从 MR event payload 中提取 `project_id`、`merge_request.iid`、source branch、target branch、last commit sha、event action。
+- 从 MR note event payload 中提取 `project_id`、`merge_request.iid`、note id、note 内容和 last commit sha。
 - 返回快速响应，不在 HTTP 请求中长时间执行 review。
 
 第一版可以同步执行 review，但代码边界上要保留异步任务调度入口，便于后续接入队列。
@@ -241,13 +242,14 @@ when_changed = ["**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.rs"
 src/config.rs:5: //TODO aa
 ```
 
-服务会按 `path:line:message` 解析每一行，路径会按 GitLab diff 路径处理。能解析且当前 MR diff refs 完整时，发布到对应代码行；无法解析或 diff refs 不完整时，发布一条 MR 级汇总评论。第一版不提供 Python helper，也不要求 JSON 输出。
+服务会按 `path:line:message` 解析每一行，路径会按 GitLab diff 路径处理。能解析且当前 MR diff refs 完整时，发布到对应代码行；无法解析时，发布一条 MR 级汇总评论。自动 MR Review 在 GitLab 返回的 diff refs 不完整时会整体跳过，并发布一条 MR 级跳过提示，因此不会继续执行自动脚本任务；手动触发脚本任务在 diff refs 不完整但 archive 可下载时仍会执行，发现问题后以 MR 级汇总评论发布。第一版不提供 Python helper，也不要求 JSON 输出。
 
 手动触发规则：
 
 - GitLab Webhook 需要开启 `Comments`。
 - 只处理 MR comment event，不处理 issue、wiki、work item comment。
 - 评论正文中出现独立 token `@task_id` 时触发对应 `script_tasks.id`。
+- 评论正文中出现独立 token `@ai_review_id` 时触发对应 `ai_reviews.id`，但 `trigger` 必须允许 `manual`。
 - 手动触发不写入自动 review 去重记录；用户每发一次合法命令，服务都会执行一次。
 - 如果 `@task_id` 不存在，服务只记录日志，不发布额外评论。
 
@@ -353,17 +355,17 @@ max_bytes = 10485760
 max_files = 5
 ```
 
-规则配置使用 `rules.toml`，第一版只支持正则匹配新增行。后续可以扩展成多种 rule kind。
-脚本任务使用同一个 `rules.toml`，但作为独立任务执行，不与行级规则共享 Finding 模型。
+规则配置使用 `rules.toml`。当前支持三类配置：`[[rules]]` 正则匹配新增行、`[[ai_reviews]]` 调用 OpenAI-compatible API、`[[script_tasks]]` 下载 MR head 快照后执行外部脚本。脚本任务使用同一个 `rules.toml`，但作为独立任务执行，不与行级规则共享 Finding 模型。
 
 ## 错误处理
 
 - Webhook token 不匹配：返回 `401 Unauthorized`。
 - 非 MR event：返回 `202 Accepted` 并忽略。
 - payload 缺少关键字段：返回 `400 Bad Request`。
-- GitLab API 失败：记录 review 状态为 `failed`，返回可观测日志。
-- diff 解析失败：跳过单个文件，继续处理其他文件，并记录 warning。
-- 评论发布失败：保留 finding 和失败原因，避免整个任务静默成功。
+- GitLab API 失败：记录错误日志，当前 webhook 请求返回 `500 Internal Server Error`；不会写入已处理状态。
+- GitLab diff refs 不完整：自动 MR Review 发布 MR 级跳过提示并标记为 skipped；手动 AI Review 跳过；手动脚本任务仍可执行，但发现问题时只能发布 MR 级汇总评论。
+- diff 解析失败：当前 review 失败并返回 `500 Internal Server Error`。
+- 评论发布失败：当前 review 失败并返回 `500 Internal Server Error`，错误原因写入日志。
 - 重复事件：返回 `202 Accepted`，不重复评论。
 - 日志文件超过大小限制：轮转当前日志文件，并最多保留配置数量的历史文件。
 - 脚本任务超时：kill 子进程，保留 `run.log` / `result.txt`，不发布 MR 评论。
@@ -377,6 +379,7 @@ max_files = 5
 - 去重 key 生成。
 - unified diff parser 的新增行、删除行、上下文行号映射。
 - rules.toml 解析和正则匹配。
+- AI Review 配置解析、自动/手动选择、OpenAI-compatible 响应解析和新增行过滤。
 - finding 到 GitLab discussion payload 的转换。
 - script task 的 archive 下载、解压、输出文件和 timeout 处理。
 - SQLite 状态写入和重复处理。
@@ -399,13 +402,14 @@ Webhook payload -> diff fixture -> rule finding -> discussion API request -> sta
 6. 在 MR 中发布行级评论。
 7. 对同一 commit 和同一规则集不重复评论。
 8. 将完整 Review 流程写入 stdout 和日志文件，并按大小轮转日志文件。
-9. 可选执行 `script_tasks`；`exit 1` 发布脚本结果评论，执行异常或超时时只记录日志并保留 `run.log` / `result.txt`。
+9. 可选执行 `ai_reviews`；AI 返回的 finding 只发布到当前 MR diff 的新增行。
+10. 可选执行 `script_tasks`；`exit 1` 发布脚本结果评论，执行异常或超时时只记录日志并保留 `run.log` / `result.txt`。
 
 ## 后续扩展
 
 - 支持规则插件。
-- 支持 LLM review provider。
-- 支持 MR 级汇总评论。
+- 支持更多 AI review provider。
+- 支持更完整的 MR 级汇总评论。
 - 支持 Redis / PostgreSQL。
 - 支持任务队列和并发 worker。
 - 支持定时轮询补偿。

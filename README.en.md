@@ -130,6 +130,7 @@ Behavior:
 - `max_diff_bytes` limits the diff text sent to AI; the default is `60000`.
 - AI findings are published only when they point to added lines in the current MR diff. Other findings are filtered and logged.
 - AI failures, timeouts, non-2xx responses, and invalid JSON do not block regex rules or script tasks.
+- If GitLab returns incomplete diff refs, automatic MR review skips line rules, AI Review, and script tasks as a whole, then publishes one MR-level skip notice; manual AI Review is also skipped.
 
 The AI service should return an OpenAI-compatible chat completion whose assistant message `content` is strict JSON:
 
@@ -182,7 +183,9 @@ Behavior:
 src/config.rs:5: //TODO aa
 ```
 
-Each line is parsed as `repository-relative path:line number:message`. Parsed results are published as line-level comments when possible. If the result cannot be parsed, or the current MR has incomplete diff refs, the service publishes one MR-level summary comment instead. Scripts may keep header lines such as `Found //TODO or //TBD markers:` in `result.txt`; those lines are not treated as line results.
+Each line is parsed as `repository-relative path:line number:message`. Parsed results are published as line-level comments when possible and when the current MR diff refs are complete. If the result cannot be parsed, the service publishes one MR-level summary comment instead. Scripts may keep header lines such as `Found //TODO or //TBD markers:` in `result.txt`; those lines are not treated as line results.
+
+Note: automatic MR review skips the whole review when GitLab returns incomplete diff refs and publishes one MR-level skip notice, so automatic script tasks do not continue in that case. For manually triggered script tasks, if diff refs are incomplete but the archive can be downloaded, the task still runs; issue results are published as an MR-level summary comment.
 
 Work directory:
 

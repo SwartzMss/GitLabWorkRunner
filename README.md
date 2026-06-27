@@ -130,6 +130,7 @@ when_changed = ["**/*.rs", "**/*.toml"]
 - `max_diff_bytes` 控制发送给 AI 的 diff 文本上限，默认 `60000`。
 - AI 返回的结果只会发布到当前 MR diff 的新增行；不在新增行上的结果会被过滤并写日志。
 - AI 调用失败、超时、非 2xx 或返回 JSON 无法解析时，不会阻断正则规则和脚本任务。
+- 如果 GitLab 返回的 diff refs 不完整，自动 MR Review 会整体跳过行级规则、AI Review 和脚本任务，并发布一条 MR 级跳过提示；手动 AI Review 也会跳过。
 
 AI 服务应返回 OpenAI-compatible chat completion，并在 assistant message 的 `content` 中返回严格 JSON：
 
@@ -182,7 +183,9 @@ export OPENAI_API_KEY="<your-ai-api-key>"
 src/config.rs:5: //TODO aa
 ```
 
-每一行按 `仓库相对路径:行号:提示内容` 解析。能解析的结果会尽量发布到对应代码行；无法解析成该格式，或当前 MR diff refs 不完整时，会发布一条 MR 级汇总评论。脚本可以在 `result.txt` 里保留标题行，例如 `Found //TODO or //TBD markers:`，这类行不会被当成行级结果。
+每一行按 `仓库相对路径:行号:提示内容` 解析。能解析且当前 MR diff refs 完整的结果会尽量发布到对应代码行；无法解析成该格式时，会发布一条 MR 级汇总评论。脚本可以在 `result.txt` 里保留标题行，例如 `Found //TODO or //TBD markers:`，这类行不会被当成行级结果。
+
+注意：自动 MR Review 在 GitLab 返回的 diff refs 不完整时会整体跳过，并发布一条 MR 级跳过提示，因此不会继续执行自动脚本任务。手动触发脚本任务时，如果 diff refs 不完整但 archive 可下载，脚本仍会执行；若脚本发现问题，结果会以 MR 级汇总评论发布。
 
 工作目录：
 
