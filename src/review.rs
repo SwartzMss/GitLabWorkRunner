@@ -648,10 +648,6 @@ fn build_script_result_summary(result: &ScriptTaskResult, text: &str) -> String 
     )
 }
 
-fn incomplete_diff_refs_body() -> String {
-    "**[warning] Review 已跳过**\n\n当前 MR 的 diff 信息不完整，无法可靠发布行级评论。请先解决冲突或刷新 MR 后重新触发检查。\n\n<!-- gitlab-work-runner:rule=incomplete-diff-refs -->".into()
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReviewSummary {
     pub skipped: bool,
