@@ -16,7 +16,23 @@ Secret token: config.toml 中 [server].webhook_secret 的值
 Trigger: Merge request events, Comments
 ```
 
-自动 Review 需要开启 `Merge request events`。如果需要在 MR 评论中用 `@script_task_id` 手动触发 disabled script task，或用 `@ai_review_id` 手动触发 AI Review，还需要开启 `Comments`。通常不需要同时开启 `Push events`，因为 GitLab 的 Merge Request event 本身会覆盖“source branch 新增 commit”的场景。
+自动 Review 需要开启 `Merge request events`。如果需要在 MR 评论中用 `@script_task_id` 手动触发 disabled script task，或用 `@ai_review_id` 手动触发 AI Review，还需要开启 `Comments`。不需要开启 `Push events`。
+
+## Webhook Secret 和 GitLab API Token
+
+Webhook 页面里的 `Secret token` 只用于校验收到的请求是否来自 GitLab。GitLab 会把它放在 `X-Gitlab-Token` 请求头里，服务会用 `config.toml` 的 `[server].webhook_secret` 校验它。
+
+服务真正调用 GitLab API 时使用的是环境变量里的 `GITLAB_TOKEN`，也就是 `config.toml` 的 `[gitlab].token_env` 指向的 token。建议使用 Project Access Token 或专用 Bot 用户 token，scope 使用 `api`，项目角色至少 `Developer`。
+
+当前服务会用这个 token 调用：
+
+```text
+GET /projects/:id/merge_requests/:merge_request_iid/changes
+GET /projects/:id/repository/archive.zip
+POST /projects/:id/merge_requests/:merge_request_iid/discussions
+```
+
+因此 token 需要能读取 MR diff、读取仓库 archive，并发布 MR discussion。
 
 ## Merge request events 什么时候触发
 
@@ -112,6 +128,13 @@ object_attributes.noteable_type = "MergeRequest"
 - 如果评论里没有合法脚本任务或 AI Review 命令，或 `@id` 不存在，服务只记录日志并返回 accepted。
 - issue、wiki、work item 等非 MR 评论会被忽略。
 
+权限边界：
+
+- Webhook 只负责把 MR 评论事件发给服务，不代表评论人一定有执行任务的额外权限。
+- 当前实现不会额外查询或校验评论人的 GitLab 角色。
+- 只要用户能在 MR 评论，并且评论内容包含合法的 `@id`，服务就会执行对应手动任务。
+- 如果需要限制只有 Maintainer 或指定用户可以手动触发，需要在服务侧增加评论人权限校验或 allowlist。
+
 这意味着可以把高成本或低频脚本配置为：
 
 ```toml
@@ -125,20 +148,6 @@ when_changed = ["**/*.rs"]
 ```
 
 平时 MR 更新不会自动执行；需要时在 MR 评论区发送 `@check-todo-tbd` 即可。
-
-## 为什么不依赖 Push events
-
-GitLab 的 `Push events` 会在仓库 push 时触发，但它不一定直接告诉服务“这个 push 对应哪个 MR”。如果用 Push event，需要额外查询 commit 和 MR 的关系。
-
-而 `Merge request events` 的 payload 直接包含：
-
-- project id
-- MR iid
-- source branch
-- target branch
-- last commit
-
-这些字段已经足够让服务拉取 MR diff 并发布 MR Discussion。因此第一版选择只依赖 `Merge request events`。
 
 ## 当前服务的处理流程
 

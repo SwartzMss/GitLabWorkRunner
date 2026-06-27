@@ -148,7 +148,7 @@ max_bytes = 10485760
 max_files = 5
 ```
 
-`GITLAB_TOKEN` 需要能读取 MR diff 并发布 discussion。
+`GITLAB_TOKEN` 是服务调用 GitLab API 使用的 token，和 Webhook 里的 `Secret token` 不是同一个东西。建议使用 Project Access Token 或专用 Bot 用户 token，scope 使用 `api`，项目角色至少 `Developer`。它需要能读取 MR diff、下载仓库 archive，并发布 MR discussion。
 
 ## 规则配置
 
@@ -215,6 +215,8 @@ src/config.rs:5: //TODO aa
 ```
 
 手动触发不会使用自动 Review 的去重键；每条合法命令评论都会执行一次。
+
+当前实现不会额外校验评论人的 GitLab 角色；只要用户能在 MR 评论，并且评论内容包含合法的 `@id`，服务就会执行对应手动任务。如果需要限制只有 Maintainer 或指定用户可以触发，需要在服务侧增加权限校验或 allowlist。
 
 ## 日志
 

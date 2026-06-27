@@ -148,7 +148,7 @@ max_bytes = 10485760
 max_files = 5
 ```
 
-`GITLAB_TOKEN` must be able to read MR diffs and publish discussions.
+`GITLAB_TOKEN` is the token used by the service when calling the GitLab API. It is different from the webhook `Secret token`. Prefer a Project Access Token or a dedicated bot user token with the `api` scope and at least the `Developer` project role. It must be able to read MR diffs, download repository archives, and publish MR discussions.
 
 ## Rules Config
 
@@ -215,6 +215,8 @@ After enabling GitLab webhook `Comments`, add standalone commands in an MR comme
 ```
 
 Manual triggers do not use the automatic review dedupe key; every valid command comment runs once.
+
+The current implementation does not perform an extra GitLab role check for the comment author. If a user can comment on the MR and the comment contains a valid `@id`, the service runs the matching manual task. Add a service-side permission check or allowlist if only Maintainers or selected users should be allowed to trigger manual tasks.
 
 ## Logs
 
