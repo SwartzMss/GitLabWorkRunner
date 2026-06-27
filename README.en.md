@@ -76,13 +76,27 @@ cargo run
 
 Add a GitLab project webhook:
 
+1. Open your GitLab project, then go to `Settings` -> `Webhooks`.
+2. Set `URL` to the service endpoint:
+
 ```text
-URL: http://<host>:8080/webhooks/gitlab
-Secret token: value from [server].webhook_secret in config.toml
-Trigger: Merge request events
+http://<host>:8080/webhooks/gitlab
 ```
 
-Enable `Comments` as well if you want manual script task or AI Review triggers from MR comments. See [docs/gitlab-webhook.md](docs/gitlab-webhook.md) for webhook details.
+`<host>` must be reachable from GitLab. If the service only runs on your local development machine, use a tunnel, reverse proxy, or deploy it to a host GitLab can access. `localhost` usually points to the GitLab server itself, not your workstation.
+
+3. Set `Secret token` to the value of `[server].webhook_secret` in `config.toml`:
+
+```toml
+[server]
+webhook_secret = "change-me"
+```
+
+4. Enable `Merge request events`.
+5. Enable `Comments` as well if you want manual script task or AI Review triggers from MR comments.
+6. After saving, use the `Test` action on the GitLab Webhook page to send a test event. The service logs should show the received webhook, token validation, parsed event, and processing result.
+
+See [docs/gitlab-webhook.md](docs/gitlab-webhook.md) for webhook behavior details.
 
 ## Build
 

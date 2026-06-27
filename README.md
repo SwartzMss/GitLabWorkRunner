@@ -76,13 +76,27 @@ cargo run
 
 在 GitLab 项目中添加 Webhook：
 
+1. 进入 GitLab 项目，打开 `Settings` -> `Webhooks`。
+2. `URL` 填写服务地址：
+
 ```text
-URL: http://<host>:8080/webhooks/gitlab
-Secret token: config.toml 中 [server].webhook_secret 的值
-Trigger: Merge request events
+http://<host>:8080/webhooks/gitlab
 ```
 
-如果需要在 MR 评论里手动触发脚本任务或 AI Review，同时开启 `Comments`。Webhook 行为说明见 [docs/gitlab-webhook.md](docs/gitlab-webhook.md)。
+其中 `<host>` 是 GitLab 能访问到的 GitLabWorkRunner 地址。如果服务只在本机开发环境运行，需要用内网穿透、反向代理或部署到 GitLab 可访问的机器上；`localhost` 通常只对 GitLab 服务器自己生效。
+
+3. `Secret token` 填写 `config.toml` 中 `[server].webhook_secret` 的值：
+
+```toml
+[server]
+webhook_secret = "change-me"
+```
+
+4. 勾选 `Merge request events`。
+5. 如果需要在 MR 评论里手动触发脚本任务或 AI Review，同时勾选 `Comments`。
+6. 保存后可以使用 GitLab Webhook 页面里的 `Test` 功能发送测试事件；服务日志中应能看到收到 Webhook、校验 token、解析事件和后续处理结果。
+
+Webhook 行为说明见 [docs/gitlab-webhook.md](docs/gitlab-webhook.md)。
 
 ## 构建
 
