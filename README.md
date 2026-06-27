@@ -84,6 +84,31 @@ Trigger: Merge request events
 
 如果需要在 MR 评论里手动触发脚本任务或 AI Review，同时开启 `Comments`。Webhook 行为说明见 [docs/gitlab-webhook.md](docs/gitlab-webhook.md)。
 
+## 构建
+
+开发构建：
+
+```bash
+cargo build
+```
+
+发布/部署构建：
+
+```bash
+cargo build --release
+```
+
+构建产物：
+
+```text
+target/debug/gitlab-work-runner.exe      # Windows debug
+target/release/gitlab-work-runner.exe    # Windows release
+target/debug/gitlab-work-runner          # Linux / macOS debug
+target/release/gitlab-work-runner        # Linux / macOS release
+```
+
+运行前仍需要准备 `config.toml`、`rules.toml`，并设置 `GITLAB_TOKEN`。
+
 ## 服务配置
 
 `config.toml` 控制服务、GitLab、存储、规则文件和日志：

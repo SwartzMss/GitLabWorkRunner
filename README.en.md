@@ -84,6 +84,31 @@ Trigger: Merge request events
 
 Enable `Comments` as well if you want manual script task or AI Review triggers from MR comments. See [docs/gitlab-webhook.md](docs/gitlab-webhook.md) for webhook details.
 
+## Build
+
+Development build:
+
+```bash
+cargo build
+```
+
+Release/deployment build:
+
+```bash
+cargo build --release
+```
+
+Build outputs:
+
+```text
+target/debug/gitlab-work-runner.exe      # Windows debug
+target/release/gitlab-work-runner.exe    # Windows release
+target/debug/gitlab-work-runner          # Linux / macOS debug
+target/release/gitlab-work-runner        # Linux / macOS release
+```
+
+Before running the binary, still prepare `config.toml`, `rules.toml`, and set `GITLAB_TOKEN`.
+
 ## Service Config
 
 `config.toml` controls the service, GitLab access, storage, rules file, and logs:
