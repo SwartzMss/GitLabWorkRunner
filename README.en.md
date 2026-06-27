@@ -49,6 +49,7 @@ The first version currently supports:
 - Validating the webhook secret token.
 - Fetching MR changes from GitLab.
 - Applying regex-based rules to added lines.
+- Calling an OpenAI-compatible API for configured AI Review.
 - Downloading the MR head snapshot and running configured script tasks.
 - Publishing line-level MR comments.
 - Avoiding reprocessing the same commit and ruleset.
@@ -98,6 +99,58 @@ title = "TODO/TBD marker check"
 command = "python examples/scripts/check_todo_tbd.py"
 timeout_seconds = 30
 when_changed = ["**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.rs"]
+
+[[ai_reviews]]
+enabled = false
+id = "ai-review"
+title = "AI Review"
+provider = "openai-compatible"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+model = "gpt-4.1-mini"
+trigger = "auto_and_manual"
+timeout_seconds = 60
+max_diff_bytes = 60000
+when_changed = ["**/*.rs", "**/*.toml"]
+```
+
+### AI Review
+
+`[[ai_reviews]]` configures native AI Review independently from `[[rules]]` and `[[script_tasks]]`. The current provider is an OpenAI-compatible `POST /chat/completions` API.
+
+Behavior:
+
+- `enabled` defaults to `true` and controls automatic execution only.
+- `trigger` supports `auto`, `manual`, and `auto_and_manual`; the default is `auto_and_manual`.
+- Automatic execution requires `enabled = true`, an automatic-capable `trigger`, and an empty or matching `when_changed`.
+- Manual execution uses a standalone command token in an MR comment, for example `@ai-review`.
+- Manual execution ignores `enabled` and `when_changed`, but `trigger` must allow `manual`.
+- `api_key_env` names the environment variable that contains the AI API token; tokens are not logged.
+- The service sends only the GitLab MR diff to AI and does not download the full repository.
+- `max_diff_bytes` limits the diff text sent to AI; the default is `60000`.
+- AI findings are published only when they point to added lines in the current MR diff. Other findings are filtered and logged.
+- AI failures, timeouts, non-2xx responses, and invalid JSON do not block regex rules or script tasks.
+
+The AI service should return an OpenAI-compatible chat completion whose assistant message `content` is strict JSON:
+
+```json
+{
+  "findings": [
+    {
+      "path": "src/lib.rs",
+      "line": 42,
+      "severity": "warning",
+      "title": "Possible panic",
+      "message": "This unwrap can panic when the value is absent."
+    }
+  ]
+}
+```
+
+Set the AI token before running locally, for example:
+
+```bash
+export OPENAI_API_KEY="<your-ai-api-key>"
 ```
 
 ### Script Tasks
@@ -182,7 +235,7 @@ Configure a GitLab project webhook:
 
 - URL: `http://<host>:8080/webhooks/gitlab`
 - Secret token: the value of `[server].webhook_secret`
-- Trigger: `Merge request events`; also enable `Comments` if you need manual script task triggers from MR comments
+- Trigger: `Merge request events`; also enable `Comments` if you need manual script task or AI Review triggers from MR comments
 
 For details about when `Merge request events` and `Comments` are triggered and which payload fields matter, see [GitLab Webhook notes](docs/gitlab-webhook.md).
 
@@ -212,6 +265,7 @@ For each Merge Request webhook, the log flow includes:
 - Review start with `ruleset_hash`.
 - Duplicate commit/ruleset skip decision.
 - GitLab MR changes fetch start and completion.
+- AI Review provider, model, result, and finding count.
 - Script task archive download, execution, timeout, and output file path.
 - diff refs: `base_sha`, `start_sha`, `head_sha`.
 - Changed file count.

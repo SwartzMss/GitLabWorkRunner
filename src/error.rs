@@ -10,6 +10,8 @@ pub enum AppError {
     Rule(String),
     #[error("script task error: {0}")]
     ScriptTask(String),
+    #[error("ai review error: {0}")]
+    AiReview(String),
     #[error("gitlab api error: {0}")]
     GitLab(String),
     #[error("storage error: {0}")]

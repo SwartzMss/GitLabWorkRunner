@@ -14,6 +14,8 @@ pub struct RulesFile {
     pub rules: Vec<RuleConfig>,
     #[serde(default)]
     pub script_tasks: Vec<ScriptTaskConfig>,
+    #[serde(default)]
+    pub ai_reviews: Vec<AiReviewConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -39,6 +41,44 @@ pub struct ScriptTaskConfig {
     pub timeout_seconds: u64,
     #[serde(default)]
     pub when_changed: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct AiReviewConfig {
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    pub id: String,
+    pub title: String,
+    pub provider: String,
+    pub base_url: String,
+    pub api_key_env: String,
+    pub model: String,
+    #[serde(default = "default_ai_review_trigger")]
+    pub trigger: AiReviewTrigger,
+    #[serde(default = "default_ai_timeout_seconds")]
+    pub timeout_seconds: u64,
+    #[serde(default = "default_ai_max_diff_bytes")]
+    pub max_diff_bytes: usize,
+    #[serde(default)]
+    pub when_changed: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AiReviewTrigger {
+    Auto,
+    Manual,
+    AutoAndManual,
+}
+
+impl AiReviewTrigger {
+    fn allows_auto(&self) -> bool {
+        matches!(self, Self::Auto | Self::AutoAndManual)
+    }
+
+    fn allows_manual(&self) -> bool {
+        matches!(self, Self::Manual | Self::AutoAndManual)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -71,10 +111,17 @@ pub struct CompiledScriptTask {
     changed_matcher: Option<GlobSet>,
 }
 
+#[derive(Clone)]
+pub struct CompiledAiReview {
+    pub config: AiReviewConfig,
+    changed_matcher: Option<GlobSet>,
+}
+
 pub struct Ruleset {
     hash: String,
     rules: Vec<CompiledRule>,
     script_tasks: Vec<CompiledScriptTask>,
+    ai_reviews: Vec<CompiledAiReview>,
 }
 
 impl Ruleset {
@@ -101,26 +148,20 @@ impl Ruleset {
         }
         let mut script_tasks = Vec::new();
         for config in parsed.script_tasks {
-            let changed_matcher = if config.when_changed.is_empty() {
-                None
-            } else {
-                let mut builder = GlobSetBuilder::new();
-                for pattern in &config.when_changed {
-                    builder.add(Glob::new(pattern).map_err(|err| {
-                        AppError::Rule(format!(
-                            "invalid when_changed glob for script task {}: {err}",
-                            config.id
-                        ))
-                    })?);
-                }
-                Some(builder.build().map_err(|err| {
-                    AppError::Rule(format!(
-                        "invalid when_changed glob set for script task {}: {err}",
-                        config.id
-                    ))
-                })?)
-            };
+            let changed_matcher = build_optional_glob_set(
+                &config.when_changed,
+                &format!("script task {}", config.id),
+            )?;
             script_tasks.push(CompiledScriptTask {
+                config,
+                changed_matcher,
+            });
+        }
+        let mut ai_reviews = Vec::new();
+        for config in parsed.ai_reviews {
+            let changed_matcher =
+                build_optional_glob_set(&config.when_changed, &format!("AI review {}", config.id))?;
+            ai_reviews.push(CompiledAiReview {
                 config,
                 changed_matcher,
             });
@@ -130,6 +171,7 @@ impl Ruleset {
             hash,
             rules,
             script_tasks,
+            ai_reviews,
         })
     }
 
@@ -159,6 +201,31 @@ impl Ruleset {
             .iter()
             .filter(|task| requested_ids.iter().any(|id| id == &task.config.id))
             .map(|task| task.config.clone())
+            .collect()
+    }
+
+    pub fn ai_reviews_for_changes(&self, changed_paths: &[String]) -> Vec<AiReviewConfig> {
+        self.ai_reviews
+            .iter()
+            .filter(|review| {
+                review.config.enabled
+                    && review.config.trigger.allows_auto()
+                    && review.changed_matcher.as_ref().is_none_or(|matcher| {
+                        changed_paths.iter().any(|path| matcher.is_match(path))
+                    })
+            })
+            .map(|review| review.config.clone())
+            .collect()
+    }
+
+    pub fn ai_reviews_by_ids(&self, requested_ids: &[String]) -> Vec<AiReviewConfig> {
+        self.ai_reviews
+            .iter()
+            .filter(|review| {
+                review.config.trigger.allows_manual()
+                    && requested_ids.iter().any(|id| id == &review.config.id)
+            })
+            .map(|review| review.config.clone())
             .collect()
     }
 
@@ -193,6 +260,34 @@ fn default_enabled() -> bool {
 
 fn default_script_timeout_seconds() -> u64 {
     60
+}
+
+fn default_ai_review_trigger() -> AiReviewTrigger {
+    AiReviewTrigger::AutoAndManual
+}
+
+fn default_ai_timeout_seconds() -> u64 {
+    60
+}
+
+fn default_ai_max_diff_bytes() -> usize {
+    60_000
+}
+
+fn build_optional_glob_set(patterns: &[String], owner: &str) -> AppResult<Option<GlobSet>> {
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        builder.add(Glob::new(pattern).map_err(|err| {
+            AppError::Rule(format!("invalid when_changed glob for {owner}: {err}"))
+        })?);
+    }
+    let matcher = builder.build().map_err(|err| {
+        AppError::Rule(format!("invalid when_changed glob set for {owner}: {err}"))
+    })?;
+    Ok(Some(matcher))
 }
 
 #[cfg(test)]
@@ -292,5 +387,54 @@ when_changed = ["src/**"]
             .script_tasks_for_changes(&["src/lib.rs".into()])
             .is_empty());
         assert_eq!(rules.script_tasks_by_ids(&["manual-check".into()]).len(), 1);
+    }
+
+    #[test]
+    fn parses_ai_review_defaults_and_selects_auto_reviews() {
+        let rules = Ruleset::from_toml(
+            r#"
+[[ai_reviews]]
+id = "ai-review"
+title = "AI Review"
+provider = "openai-compatible"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+model = "gpt-4.1-mini"
+when_changed = ["src/**"]
+"#,
+        )
+        .unwrap();
+
+        let reviews = rules.ai_reviews_for_changes(&["src/lib.rs".into()]);
+
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].id, "ai-review");
+        assert_eq!(reviews[0].trigger, AiReviewTrigger::AutoAndManual);
+        assert_eq!(reviews[0].timeout_seconds, 60);
+        assert_eq!(reviews[0].max_diff_bytes, 60_000);
+    }
+
+    #[test]
+    fn manual_ai_review_selection_ignores_enabled_and_when_changed() {
+        let rules = Ruleset::from_toml(
+            r#"
+[[ai_reviews]]
+enabled = false
+id = "ai-review"
+title = "AI Review"
+provider = "openai-compatible"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+model = "gpt-4.1-mini"
+trigger = "manual"
+when_changed = ["src/**"]
+"#,
+        )
+        .unwrap();
+
+        assert!(rules
+            .ai_reviews_for_changes(&["README.md".into()])
+            .is_empty());
+        assert_eq!(rules.ai_reviews_by_ids(&["ai-review".into()]).len(), 1);
     }
 }

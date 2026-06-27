@@ -15,3 +15,16 @@ title = "TODO/TBD marker check"
 command = "python examples/scripts/check_todo_tbd.py"
 timeout_seconds = 30
 when_changed = ["**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.rs"]
+
+[[ai_reviews]]
+enabled = false
+id = "ai-review"
+title = "AI Review"
+provider = "openai-compatible"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+model = "gpt-4.1-mini"
+trigger = "auto_and_manual"
+timeout_seconds = 60
+max_diff_bytes = 60000
+when_changed = ["**/*.rs", "**/*.toml"]

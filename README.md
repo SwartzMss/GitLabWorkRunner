@@ -49,6 +49,7 @@ GitLab Merge Request Event
 - 校验 Webhook secret token。
 - 从 GitLab 拉取 MR changes。
 - 对新增行执行正则规则。
+- 可按配置调用 OpenAI-compatible API 执行 AI Review。
 - 可按配置下载 MR head 快照并执行独立脚本任务。
 - 发布行级 MR 评论。
 - 对相同 commit 和规则集做去重。
@@ -98,6 +99,58 @@ title = "TODO/TBD marker check"
 command = "python examples/scripts/check_todo_tbd.py"
 timeout_seconds = 30
 when_changed = ["**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.rs"]
+
+[[ai_reviews]]
+enabled = false
+id = "ai-review"
+title = "AI Review"
+provider = "openai-compatible"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+model = "gpt-4.1-mini"
+trigger = "auto_and_manual"
+timeout_seconds = 60
+max_diff_bytes = 60000
+when_changed = ["**/*.rs", "**/*.toml"]
+```
+
+### AI Review
+
+`[[ai_reviews]]` 是原生 AI Review 配置，独立于 `[[rules]]` 和 `[[script_tasks]]`。当前支持 OpenAI-compatible 的 `POST /chat/completions` API。
+
+执行规则：
+
+- `enabled` 不写时默认为 `true`，只控制自动触发。
+- `trigger` 支持 `auto`、`manual`、`auto_and_manual`，默认 `auto_and_manual`。
+- 自动触发要求 `enabled = true`、`trigger` 允许自动执行，并且 `when_changed` 为空或匹配变更文件。
+- 手动触发使用 MR 评论中的独立命令 token，例如 `@ai-review`。
+- 手动触发会忽略 `enabled` 和 `when_changed`，但 `trigger` 必须允许 `manual`。
+- `api_key_env` 指定 AI API token 的环境变量名；token 不会写入日志。
+- 服务只把 GitLab MR diff 发给 AI，不下载完整仓库。
+- `max_diff_bytes` 控制发送给 AI 的 diff 文本上限，默认 `60000`。
+- AI 返回的结果只会发布到当前 MR diff 的新增行；不在新增行上的结果会被过滤并写日志。
+- AI 调用失败、超时、非 2xx 或返回 JSON 无法解析时，不会阻断正则规则和脚本任务。
+
+AI 服务应返回 OpenAI-compatible chat completion，并在 assistant message 的 `content` 中返回严格 JSON：
+
+```json
+{
+  "findings": [
+    {
+      "path": "src/lib.rs",
+      "line": 42,
+      "severity": "warning",
+      "title": "Possible panic",
+      "message": "This unwrap can panic when the value is absent."
+    }
+  ]
+}
+```
+
+本地运行前需要设置 AI token，例如：
+
+```bash
+export OPENAI_API_KEY="<your-ai-api-key>"
 ```
 
 ### 脚本任务
@@ -182,7 +235,7 @@ cargo run
 
 - URL: `http://<host>:8080/webhooks/gitlab`
 - Secret token: `[server].webhook_secret` 的值
-- Trigger: `Merge request events`；如果需要 MR 评论手动触发脚本任务，同时开启 `Comments`
+- Trigger: `Merge request events`；如果需要 MR 评论手动触发脚本任务或 AI Review，同时开启 `Comments`
 
 关于 `Merge request events`、`Comments` 的触发时机和 payload 字段，见 [GitLab Webhook 说明](docs/gitlab-webhook.md)。
 
@@ -212,6 +265,7 @@ cargo run
 - Review 开始和 `ruleset_hash`。
 - 相同 commit / ruleset 的跳过决策。
 - GitLab MR changes 拉取开始和完成。
+- AI Review provider、model、调用结果和 finding 数量。
 - script task archive 下载、执行、超时和输出文件路径。
 - diff refs：`base_sha`、`start_sha`、`head_sha`。
 - changed file 数量。
