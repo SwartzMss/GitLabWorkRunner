@@ -108,12 +108,7 @@ async fn gitlab_webhook(
         "ruleset loaded"
     );
     let gitlab = GitLabClient::new(state.config.gitlab.base_url.clone(), gitlab_token);
-    let service = ReviewService::new(
-        gitlab,
-        state.store.clone(),
-        ruleset,
-        state.config.gitlab.token_env.clone(),
-    );
+    let service = ReviewService::new(gitlab, state.store.clone(), ruleset);
 
     let result = match &event {
         GitLabWebhookEvent::MergeRequest(event) => {

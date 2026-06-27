@@ -25,7 +25,7 @@ pub struct ServerConfig {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct GitLabConfig {
     pub base_url: String,
-    pub token_env: String,
+    pub token: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -77,12 +77,13 @@ impl AppConfig {
     }
 
     pub fn gitlab_token(&self) -> AppResult<String> {
-        std::env::var(&self.gitlab.token_env).map_err(|_| {
-            AppError::Config(format!(
-                "environment variable {name} is not set. Create a GitLab access token with the api scope, then set it before starting the service. Windows cmd: set {name}=<your-gitlab-token>. PowerShell: $env:{name} = \"<your-gitlab-token>\". Linux/macOS: export {name}=<your-gitlab-token>.",
-                name = self.gitlab.token_env
-            ))
-        })
+        let token = self.gitlab.token.trim();
+        if token.is_empty() {
+            return Err(AppError::Config(
+                "[gitlab].token is empty. Create a GitLab access token with the api scope, then set token in config.toml.".into(),
+            ));
+        }
+        Ok(token.to_owned())
     }
 }
 
@@ -103,7 +104,7 @@ webhook_secret = "secret"
 
 [gitlab]
 base_url = "https://gitlab.example.com"
-token_env = "GITLAB_TOKEN"
+token = "glpat-test-token"
 
 [storage]
 database_url = "sqlite::memory:"
@@ -119,6 +120,8 @@ file = "rules.toml"
         assert_eq!(config.server.bind, "127.0.0.1:8080");
         assert_eq!(config.server.webhook_secret, "secret");
         assert_eq!(config.gitlab.base_url, "https://gitlab.example.com");
+        assert_eq!(config.gitlab.token, "glpat-test-token");
+        assert_eq!(config.gitlab_token().unwrap(), "glpat-test-token");
         assert_eq!(config.storage.database_url, "sqlite::memory:");
         assert_eq!(config.rules.file, "rules.toml");
         assert_eq!(config.logging.file, "logs/gitlab-work-runner.log");
@@ -127,7 +130,7 @@ file = "rules.toml"
     }
 
     #[test]
-    fn returns_error_when_token_env_is_missing() {
+    fn returns_error_when_gitlab_token_is_empty() {
         let config = AppConfig {
             server: ServerConfig {
                 bind: "127.0.0.1:8080".into(),
@@ -135,7 +138,7 @@ file = "rules.toml"
             },
             gitlab: GitLabConfig {
                 base_url: "https://gitlab.example.com".into(),
-                token_env: "GITLAB_WORK_RUNNER_MISSING_TOKEN".into(),
+                token: "  ".into(),
             },
             storage: StorageConfig {
                 database_url: "sqlite::memory:".into(),
@@ -147,10 +150,7 @@ file = "rules.toml"
         };
 
         let err = config.gitlab_token().unwrap_err().to_string();
-        assert!(err.contains("GITLAB_WORK_RUNNER_MISSING_TOKEN"));
-        assert!(err.contains("set GITLAB_WORK_RUNNER_MISSING_TOKEN=<your-gitlab-token>"));
-        assert!(err.contains("$env:GITLAB_WORK_RUNNER_MISSING_TOKEN"));
-        assert!(err.contains("export GITLAB_WORK_RUNNER_MISSING_TOKEN=<your-gitlab-token>"));
+        assert!(err.contains("[gitlab].token is empty"));
     }
 
     #[test]
@@ -165,7 +165,7 @@ webhook_secret = "secret"
 
 [gitlab]
 base_url = "https://gitlab.example.com"
-token_env = "GITLAB_TOKEN"
+token = "glpat-test-token"
 
 [storage]
 database_url = "sqlite::memory:"

@@ -4,7 +4,7 @@ webhook_secret = "change-me"
 
 [gitlab]
 base_url = "https://gitlab.example.com"
-token_env = "GITLAB_TOKEN"
+token = "<your-gitlab-token>"
 
 [storage]
 database_url = "sqlite://gitlab-work-runner.db"

@@ -22,7 +22,7 @@ Trigger: Merge request events, Comments
 
 Webhook 页面里的 `Secret token` 只用于校验收到的请求是否来自 GitLab。GitLab 会把它放在 `X-Gitlab-Token` 请求头里，服务会用 `config.toml` 的 `[server].webhook_secret` 校验它。
 
-服务真正调用 GitLab API 时使用的是环境变量里的 `GITLAB_TOKEN`，也就是 `config.toml` 的 `[gitlab].token_env` 指向的 token。建议使用 Project Access Token 或专用 Bot 用户 token，scope 使用 `api`，项目角色至少 `Developer`。
+服务真正调用 GitLab API 时使用的是 `config.toml` 里的 `[gitlab].token`。建议使用 Project Access Token 或专用 Bot 用户 token，scope 使用 `api`，项目角色至少 `Developer`。不要把包含真实 token 的 `config.toml` 提交到仓库。
 
 当前服务会用这个 token 调用：
 

@@ -60,7 +60,6 @@ Create local config files:
 ```powershell
 Copy-Item config.example.toml config.toml
 Copy-Item rules.example.toml rules.toml
-$env:GITLAB_TOKEN = "<your-gitlab-token>"
 cargo run
 ```
 
@@ -69,7 +68,6 @@ Linux / macOS:
 ```bash
 cp config.example.toml config.toml
 cp rules.example.toml rules.toml
-export GITLAB_TOKEN="<your-gitlab-token>"
 cargo run
 ```
 
@@ -120,7 +118,7 @@ target/debug/gitlab-work-runner          # Linux / macOS debug
 target/release/gitlab-work-runner        # Linux / macOS release
 ```
 
-Before running the binary, still prepare `config.toml`, `rules.toml`, and set `GITLAB_TOKEN`.
+Before running the binary, still prepare `config.toml` and `rules.toml`.
 
 ## Service Config
 
@@ -133,7 +131,7 @@ webhook_secret = "change-me"
 
 [gitlab]
 base_url = "https://gitlab.example.com"
-token_env = "GITLAB_TOKEN"
+token = "<your-gitlab-token>"
 
 [storage]
 database_url = "sqlite://gitlab-work-runner.db"
@@ -143,7 +141,7 @@ file = "rules.toml"
 
 ```
 
-`GITLAB_TOKEN` is the token used by the service when calling the GitLab API. It is different from the webhook `Secret token`. Prefer a Project Access Token or a dedicated bot user token with the `api` scope and at least the `Developer` project role. It must be able to read MR diffs, download repository archives, and publish MR discussions.
+`[gitlab].token` is the token used by the service when calling the GitLab API. It is different from the webhook `Secret token`. Prefer a Project Access Token or a dedicated bot user token with the `api` scope and at least the `Developer` project role. It must be able to read MR diffs, download repository archives, and publish MR discussions. Do not commit a real `config.toml` token to the repository.
 
 ## Rules Config
 

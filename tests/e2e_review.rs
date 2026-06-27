@@ -110,12 +110,7 @@ message = "Do not unwrap."
 "#,
     )
     .unwrap();
-    let service = ReviewService::new(
-        GitLabClient::new(base_url, "token".into()),
-        store,
-        ruleset,
-        "GITLAB_TOKEN".into(),
-    );
+    let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset);
     let event = MergeRequestEvent {
         project_id: 123,
         mr_iid: 45,
@@ -195,12 +190,7 @@ message = "Do not unwrap."
 "#,
     )
     .unwrap();
-    let service = ReviewService::new(
-        GitLabClient::new(base_url, "token".into()),
-        store,
-        ruleset,
-        "GITLAB_TOKEN".into(),
-    );
+    let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset);
     let event = MergeRequestEvent {
         project_id: 123,
         mr_iid: 45,
@@ -288,12 +278,7 @@ when_changed = ["src/**"]
     .unwrap();
     let store = StateStore::connect("sqlite::memory:").await.unwrap();
     store.migrate().await.unwrap();
-    let service = ReviewService::new(
-        GitLabClient::new(base_url, "token".into()),
-        store,
-        ruleset,
-        "GITLAB_TOKEN".into(),
-    );
+    let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset);
     let event = MergeRequestEvent {
         project_id: 123,
         mr_iid: 45,
@@ -418,12 +403,7 @@ when_changed = ["src/**"]
     .unwrap();
     let store = StateStore::connect("sqlite::memory:").await.unwrap();
     store.migrate().await.unwrap();
-    let service = ReviewService::new(
-        GitLabClient::new(base_url, "token".into()),
-        store,
-        ruleset,
-        "GITLAB_TOKEN".into(),
-    );
+    let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset);
     let event = MergeRequestEvent {
         project_id: 123,
         mr_iid: 45,
@@ -545,12 +525,7 @@ when_changed = ["does-not-match/**"]
         .is_empty());
     let store = StateStore::connect("sqlite::memory:").await.unwrap();
     store.migrate().await.unwrap();
-    let service = ReviewService::new(
-        GitLabClient::new(base_url, "token".into()),
-        store,
-        ruleset,
-        "GITLAB_TOKEN".into(),
-    );
+    let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset);
     let event = MergeRequestNoteEvent {
         project_id: 123,
         mr_iid: 45,
@@ -661,12 +636,7 @@ when_changed = ["src/**"]
     .unwrap();
     let store = StateStore::connect("sqlite::memory:").await.unwrap();
     store.migrate().await.unwrap();
-    let service = ReviewService::new(
-        GitLabClient::new(base_url, "token".into()),
-        store,
-        ruleset,
-        "GITLAB_TOKEN".into(),
-    );
+    let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset);
     let event = MergeRequestEvent {
         project_id: 123,
         mr_iid: 45,
@@ -780,12 +750,7 @@ when_changed = ["does-not-match/**"]
         .is_empty());
     let store = StateStore::connect("sqlite::memory:").await.unwrap();
     store.migrate().await.unwrap();
-    let service = ReviewService::new(
-        GitLabClient::new(base_url, "token".into()),
-        store,
-        ruleset,
-        "GITLAB_TOKEN".into(),
-    );
+    let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset);
     let event = MergeRequestNoteEvent {
         project_id: 123,
         mr_iid: 45,

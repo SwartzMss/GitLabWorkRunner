@@ -23,7 +23,6 @@ pub struct ScriptTaskContext<'a> {
     pub project_id: i64,
     pub mr_iid: i64,
     pub commit_sha: &'a str,
-    pub token_env: &'a str,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -110,8 +109,6 @@ impl ScriptTaskRunner {
         configure_process_group(&mut command);
         command
             .current_dir(&script_cwd)
-            .env_remove(context.token_env)
-            .env_remove("GITLAB_TOKEN")
             .stdout(Stdio::from(run_log.try_clone()?))
             .stderr(Stdio::from(run_log));
 
@@ -551,7 +548,6 @@ mod tests {
             project_id: 1,
             mr_iid: 2,
             commit_sha: "abc",
-            token_env: "GITLAB_TOKEN",
         };
 
         let result = runner.run(&task, &context, &test_archive()).await.unwrap();

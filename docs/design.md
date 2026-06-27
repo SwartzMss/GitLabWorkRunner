@@ -91,8 +91,8 @@ project_id + mr_iid + commit_sha + ruleset_hash
 
 认证方式：
 
-- 使用环境变量 `GITLAB_TOKEN`。
-- token 需要 `read_api` 和 `api` 权限。
+- 使用 `config.toml` 中的 `[gitlab].token`。
+- token 需要 `api` scope。
 
 ### Diff Fetcher
 
@@ -341,7 +341,7 @@ webhook_secret = "change-me"
 
 [gitlab]
 base_url = "https://gitlab.example.com"
-token_env = "GITLAB_TOKEN"
+token = "<your-gitlab-token>"
 
 [storage]
 database_url = "sqlite://gitlab-work-runner.db"

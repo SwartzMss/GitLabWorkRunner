@@ -60,7 +60,6 @@ sequenceDiagram
 ```powershell
 Copy-Item config.example.toml config.toml
 Copy-Item rules.example.toml rules.toml
-$env:GITLAB_TOKEN = "<your-gitlab-token>"
 cargo run
 ```
 
@@ -69,7 +68,6 @@ Linux / macOS：
 ```bash
 cp config.example.toml config.toml
 cp rules.example.toml rules.toml
-export GITLAB_TOKEN="<your-gitlab-token>"
 cargo run
 ```
 
@@ -120,7 +118,7 @@ target/debug/gitlab-work-runner          # Linux / macOS debug
 target/release/gitlab-work-runner        # Linux / macOS release
 ```
 
-运行前仍需要准备 `config.toml`、`rules.toml`，并设置 `GITLAB_TOKEN`。
+运行前仍需要准备 `config.toml` 和 `rules.toml`。
 
 ## 服务配置
 
@@ -133,7 +131,7 @@ webhook_secret = "change-me"
 
 [gitlab]
 base_url = "https://gitlab.example.com"
-token_env = "GITLAB_TOKEN"
+token = "<your-gitlab-token>"
 
 [storage]
 database_url = "sqlite://gitlab-work-runner.db"
@@ -143,7 +141,7 @@ file = "rules.toml"
 
 ```
 
-`GITLAB_TOKEN` 是服务调用 GitLab API 使用的 token，和 Webhook 里的 `Secret token` 不是同一个东西。建议使用 Project Access Token 或专用 Bot 用户 token，scope 使用 `api`，项目角色至少 `Developer`。它需要能读取 MR diff、下载仓库 archive，并发布 MR discussion。
+`[gitlab].token` 是服务调用 GitLab API 使用的 token，和 Webhook 里的 `Secret token` 不是同一个东西。建议使用 Project Access Token 或专用 Bot 用户 token，scope 使用 `api`，项目角色至少 `Developer`。它需要能读取 MR diff、下载仓库 archive，并发布 MR discussion。不要把包含真实 token 的 `config.toml` 提交到仓库。
 
 ## 规则配置
 

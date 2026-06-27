@@ -17,21 +17,14 @@ pub struct ReviewService {
     gitlab: GitLabClient,
     store: StateStore,
     ruleset: Ruleset,
-    gitlab_token_env: String,
 }
 
 impl ReviewService {
-    pub fn new(
-        gitlab: GitLabClient,
-        store: StateStore,
-        ruleset: Ruleset,
-        gitlab_token_env: String,
-    ) -> Self {
+    pub fn new(gitlab: GitLabClient, store: StateStore, ruleset: Ruleset) -> Self {
         Self {
             gitlab,
             store,
             ruleset,
-            gitlab_token_env,
         }
     }
 
@@ -549,7 +542,6 @@ impl ReviewService {
             project_id: event.project_id,
             mr_iid: event.mr_iid,
             commit_sha: archive_sha,
-            token_env: &self.gitlab_token_env,
         };
         let mut published = 0_usize;
         for task in tasks {
