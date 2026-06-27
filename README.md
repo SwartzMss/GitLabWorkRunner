@@ -52,7 +52,6 @@ sequenceDiagram
 - `[[script_tasks]]`：下载 MR head 快照并执行本地脚本。
 - MR 评论手动触发脚本任务或 AI Review，例如 `@check-todo-tbd`、`@ai-review`。
 - SQLite 去重，避免同一 commit 和规则集重复评论。
-- stdout + 文件日志，内置按大小轮转。
 
 ## 快速开始
 
@@ -83,7 +82,7 @@ cargo run
 http://<host>:8080/webhooks/gitlab
 ```
 
-其中 `<host>` 是 GitLab 能访问到的 GitLabWorkRunner 地址。如果服务只在本机开发环境运行，需要用内网穿透、反向代理或部署到 GitLab 可访问的机器上；`localhost` 通常只对 GitLab 服务器自己生效。
+其中 `<host>` 是 GitLab 能访问到的 GitLabWorkRunner 地址。
 
 3. `Secret token` 填写 `config.toml` 中 `[server].webhook_secret` 的值：
 
@@ -94,7 +93,7 @@ webhook_secret = "change-me"
 
 4. 勾选 `Merge request events`。
 5. 如果需要在 MR 评论里手动触发脚本任务或 AI Review，同时勾选 `Comments`。
-6. 保存后可以使用 GitLab Webhook 页面里的 `Test` 功能发送测试事件；服务日志中应能看到收到 Webhook、校验 token、解析事件和后续处理结果。
+6. 保存后可以使用 GitLab Webhook 页面里的 `Test` 功能发送测试事件。
 
 Webhook 行为说明见 [docs/gitlab-webhook.md](docs/gitlab-webhook.md)。
 
@@ -125,7 +124,7 @@ target/release/gitlab-work-runner        # Linux / macOS release
 
 ## 服务配置
 
-`config.toml` 控制服务、GitLab、存储、规则文件和日志：
+`config.toml` 控制服务、GitLab、存储和规则文件：
 
 ```toml
 [server]
@@ -142,10 +141,6 @@ database_url = "sqlite://gitlab-work-runner.db"
 [rules]
 file = "rules.toml"
 
-[logging]
-file = "logs/gitlab-work-runner.log"
-max_bytes = 10485760
-max_files = 5
 ```
 
 `GITLAB_TOKEN` 是服务调用 GitLab API 使用的 token，和 Webhook 里的 `Secret token` 不是同一个东西。建议使用 Project Access Token 或专用 Bot 用户 token，scope 使用 `api`，项目角色至少 `Developer`。它需要能读取 MR diff、下载仓库 archive，并发布 MR discussion。
@@ -217,25 +212,6 @@ src/config.rs:5: //TODO aa
 手动触发不会使用自动 Review 的去重键；每条合法命令评论都会执行一次。
 
 当前实现不会额外校验评论人的 GitLab 角色；只要用户能在 MR 评论，并且评论内容包含合法的 `@id`，服务就会执行对应手动任务。如果需要限制只有 Maintainer 或指定用户可以触发，需要在服务侧增加权限校验或 allowlist。
-
-## 日志
-
-默认日志配置：
-
-```toml
-[logging]
-file = "logs/gitlab-work-runner.log"
-max_bytes = 10485760
-max_files = 5
-```
-
-可以通过 `RUST_LOG` 调整日志级别：
-
-```powershell
-$env:RUST_LOG = "info"
-```
-
-GitLab token、Webhook secret 和 AI token 不会写入日志。
 
 ## 更多文档
 

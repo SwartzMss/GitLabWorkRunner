@@ -52,7 +52,6 @@ See [docs/design.md](docs/design.md) for more design detail.
 - `[[script_tasks]]`: download the MR head snapshot and run local scripts.
 - Manual script task or AI Review triggers from MR comments, such as `@check-todo-tbd` and `@ai-review`.
 - SQLite dedupe state to avoid repeating comments for the same commit and ruleset.
-- stdout + file logging with built-in size-based rotation.
 
 ## Quick Start
 
@@ -83,7 +82,7 @@ Add a GitLab project webhook:
 http://<host>:8080/webhooks/gitlab
 ```
 
-`<host>` must be reachable from GitLab. If the service only runs on your local development machine, use a tunnel, reverse proxy, or deploy it to a host GitLab can access. `localhost` usually points to the GitLab server itself, not your workstation.
+`<host>` must be reachable from GitLab.
 
 3. Set `Secret token` to the value of `[server].webhook_secret` in `config.toml`:
 
@@ -94,7 +93,7 @@ webhook_secret = "change-me"
 
 4. Enable `Merge request events`.
 5. Enable `Comments` as well if you want manual script task or AI Review triggers from MR comments.
-6. After saving, use the `Test` action on the GitLab Webhook page to send a test event. The service logs should show the received webhook, token validation, parsed event, and processing result.
+6. After saving, use the `Test` action on the GitLab Webhook page to send a test event.
 
 See [docs/gitlab-webhook.md](docs/gitlab-webhook.md) for webhook behavior details.
 
@@ -125,7 +124,7 @@ Before running the binary, still prepare `config.toml`, `rules.toml`, and set `G
 
 ## Service Config
 
-`config.toml` controls the service, GitLab access, storage, rules file, and logs:
+`config.toml` controls the service, GitLab access, storage, and rules file:
 
 ```toml
 [server]
@@ -142,10 +141,6 @@ database_url = "sqlite://gitlab-work-runner.db"
 [rules]
 file = "rules.toml"
 
-[logging]
-file = "logs/gitlab-work-runner.log"
-max_bytes = 10485760
-max_files = 5
 ```
 
 `GITLAB_TOKEN` is the token used by the service when calling the GitLab API. It is different from the webhook `Secret token`. Prefer a Project Access Token or a dedicated bot user token with the `api` scope and at least the `Developer` project role. It must be able to read MR diffs, download repository archives, and publish MR discussions.
@@ -217,25 +212,6 @@ After enabling GitLab webhook `Comments`, add standalone commands in an MR comme
 Manual triggers do not use the automatic review dedupe key; every valid command comment runs once.
 
 The current implementation does not perform an extra GitLab role check for the comment author. If a user can comment on the MR and the comment contains a valid `@id`, the service runs the matching manual task. Add a service-side permission check or allowlist if only Maintainers or selected users should be allowed to trigger manual tasks.
-
-## Logs
-
-Default log config:
-
-```toml
-[logging]
-file = "logs/gitlab-work-runner.log"
-max_bytes = 10485760
-max_files = 5
-```
-
-Set `RUST_LOG` to control verbosity:
-
-```powershell
-$env:RUST_LOG = "info"
-```
-
-GitLab tokens, webhook secrets, and AI tokens are not logged.
 
 ## More Docs
 
