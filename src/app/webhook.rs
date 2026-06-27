@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn parses_merge_request_event() {
-        let body = include_bytes!("../tests/fixtures/gitlab_mr_event.json");
+        let body = include_bytes!("../../tests/fixtures/gitlab_mr_event.json");
         let event = parse_merge_request_event(body).unwrap().unwrap();
 
         assert_eq!(event.project_id, 123);
