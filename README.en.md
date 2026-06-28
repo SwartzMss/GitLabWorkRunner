@@ -149,7 +149,7 @@ Minimal `rules.toml` example:
 
 ```toml
 [[rules]]
-enabled = true
+auto_enabled = true
 id = "forbid-unwrap"
 title = "Avoid unwrap"
 severity = "warning"
@@ -158,7 +158,7 @@ pattern = "\\.unwrap\\(\\)"
 message = "Direct unwrap can panic at runtime. Prefer explicit error handling."
 ```
 
-`enabled` defaults to `true`; set it to `false` to exclude the rule from automatic review.
+You can define multiple `[[rules]]` entries and distinguish them by `id`. `auto_enabled` defaults to `true`; set it to `false` to exclude the rule from automatic review.
 
 AI Review example:
 
@@ -179,6 +179,8 @@ when_changed = ["**/*.rs", "**/*.toml"]
 
 Do not commit a real `rules.toml` that contains an actual `api_key`.
 
+`@ai-review` matches `id = "ai-review"` inside `[[ai_reviews]]`. `[[ai_reviews]]` is the config block type, not the trigger command.
+
 Script task example:
 
 ```toml
@@ -192,6 +194,8 @@ when_changed = ["**/*.rs"]
 ```
 
 `auto_enabled` defaults to `true`; set it to `false` to skip automatic execution while still allowing manual MR comment triggers such as `@check-todo-tbd`.
+
+`@check-todo-tbd` matches `id = "check-todo-tbd"` inside `[[script_tasks]]`.
 
 Scripts receive two arguments:
 

@@ -1,16 +1,16 @@
 [[rules]]
-enabled = true
+auto_enabled = true
 id = "forbid-unwrap"
-title = "Avoid unwrap"
+title = "避免直接 unwrap"
 severity = "warning"
 path = "**/*.rs"
 pattern = "\\.unwrap\\(\\)"
-message = "Direct unwrap can panic at runtime. Prefer explicit error handling."
+message = "直接使用 unwrap 可能导致运行时 panic，建议改成错误传播或显式处理。"
 
 [[script_tasks]]
 auto_enabled = false
 id = "check-todo-tbd"
-title = "TODO/TBD marker check"
+title = "TODO/TBD 标记检查"
 # Relative paths are resolved from the runner executable directory.
 # The checked MR source root and result file path are appended as arguments.
 command = "python examples/scripts/check_todo_tbd.py"

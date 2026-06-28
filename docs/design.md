@@ -157,7 +157,7 @@ enum DiffLineKind {
 
 ```toml
 [[rules]]
-enabled = true
+auto_enabled = true
 id = "forbid-unwrap"
 title = "避免直接 unwrap"
 severity = "warning"
@@ -265,7 +265,7 @@ src/config.rs:5: //TODO aa
 评论正文示例：
 
 ```markdown
-**[warning] 避免直接 unwrap**
+**[警告] 避免直接 unwrap**
 
 这里直接使用 unwrap 可能导致运行时 panic，建议改成错误传播或显式处理。
 
@@ -356,7 +356,7 @@ max_bytes = 10485760
 max_files = 5
 ```
 
-规则配置使用 `rules.toml`。当前支持三类配置：`[[rules]]` 正则匹配新增行、`[[ai_reviews]]` 调用 OpenAI-compatible API、`[[script_tasks]]` 下载 MR head 快照后执行外部脚本。`[[rules]]` 的 `enabled` 默认是 `true`，设置为 `false` 时不参与自动 Review。脚本任务使用同一个 `rules.toml`，但作为独立任务执行，不与行级规则共享 Finding 模型。
+规则配置使用 `rules.toml`。当前支持三类配置：`[[rules]]` 正则匹配新增行、`[[ai_reviews]]` 调用 OpenAI-compatible API、`[[script_tasks]]` 下载 MR head 快照后执行外部脚本。`[[rules]]` 的 `auto_enabled` 默认是 `true`，设置为 `false` 时不参与自动 Review。脚本任务使用同一个 `rules.toml`，但作为独立任务执行，不与行级规则共享 Finding 模型。
 
 ## 错误处理
 

@@ -46,9 +46,9 @@ fn build_body(findings: &[&Finding]) -> String {
 
 fn severity_label(severity: &Severity) -> &'static str {
     match severity {
-        Severity::Info => "info",
-        Severity::Warning => "warning",
-        Severity::Error => "error",
+        Severity::Info => "信息",
+        Severity::Warning => "警告",
+        Severity::Error => "错误",
     }
 }
 
@@ -73,7 +73,7 @@ mod tests {
 
         assert_eq!(drafts.len(), 1);
         assert_eq!(drafts[0].new_line, Some(12));
-        assert!(drafts[0].body.contains("**[warning] Avoid unwrap**"));
+        assert!(drafts[0].body.contains("**[警告] Avoid unwrap**"));
         assert!(drafts[0]
             .body
             .contains("<!-- gitlab-work-runner:rule=forbid-unwrap -->"));

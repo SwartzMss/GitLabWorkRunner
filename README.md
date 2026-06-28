@@ -149,16 +149,16 @@ file = "rules.toml"
 
 ```toml
 [[rules]]
-enabled = true
+auto_enabled = true
 id = "forbid-unwrap"
-title = "Avoid unwrap"
+title = "避免直接 unwrap"
 severity = "warning"
 path = "**/*.rs"
 pattern = "\\.unwrap\\(\\)"
-message = "Direct unwrap can panic at runtime. Prefer explicit error handling."
+message = "直接使用 unwrap 可能导致运行时 panic，建议改成错误传播或显式处理。"
 ```
 
-`enabled` 默认是 `true`；设置为 `false` 时，这条规则不会参与自动 Review。
+`[[rules]]` 可以配置多条，每条通过 `id` 区分。`auto_enabled` 默认是 `true`；设置为 `false` 时，这条规则不会参与自动 Review。
 
 AI Review 示例：
 
@@ -179,6 +179,8 @@ when_changed = ["**/*.rs", "**/*.toml"]
 
 不要把包含真实 `api_key` 的 `rules.toml` 提交到仓库。
 
+`@ai-review` 匹配的是 `[[ai_reviews]]` 里的 `id = "ai-review"`。`[[ai_reviews]]` 只是配置块类型，不是触发命令。
+
 脚本任务示例：
 
 ```toml
@@ -192,6 +194,8 @@ when_changed = ["**/*.rs"]
 ```
 
 `auto_enabled` 默认是 `true`；设置为 `false` 时不会自动执行，但仍可以通过 MR 评论 `@check-todo-tbd` 手动触发。
+
+`@check-todo-tbd` 匹配的是 `[[script_tasks]]` 里的 `id = "check-todo-tbd"`。
 
 脚本会收到两个参数：
 

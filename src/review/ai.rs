@@ -11,6 +11,8 @@ use std::{
 };
 use tracing::{info, warn};
 
+const AI_RESPONSE_PREVIEW_CHARS: usize = 1000;
+
 pub async fn run_ai_review(
     config: &AiReviewConfig,
     changes: &[GitLabChange],
@@ -67,7 +69,22 @@ pub async fn run_ai_review(
         elapsed_ms = started.elapsed().as_millis(),
         "AI review API response received"
     );
-    let body = response.error_for_status()?.text().await?;
+    let body = response.text().await?;
+    let response_body_preview = preview_log_text(&body, AI_RESPONSE_PREVIEW_CHARS);
+    info!(
+        ai_review_id = %config.id,
+        model = %config.model,
+        response_bytes = body.len(),
+        response_body_preview = %response_body_preview,
+        "AI review raw response body received"
+    );
+    if !status.is_success() {
+        return Err(AppError::AiReview(format!(
+            "AI review API returned HTTP status {}: {}",
+            status.as_u16(),
+            response_body_preview
+        )));
+    }
     let findings = parse_openai_response(&config.id, &config.title, &body)?;
     let raw_finding_count = findings.len();
     let filtered = filter_findings_to_added_lines(changes, findings)?;
@@ -139,12 +156,12 @@ fn build_review_prompt(config: &AiReviewConfig, changes: &[GitLabChange]) -> (St
     let (diff_text, truncated) = limited_diff_payload(changes, config.max_diff_bytes);
     let diff_payload_bytes = diff_text.len();
     let truncated_note = if truncated {
-        "\nThe diff payload was truncated because it exceeded the configured byte limit."
+        "\ndiff 内容因为超过配置的字节限制已被截断。"
     } else {
         ""
     };
     let prompt = format!(
-        "Review this GitLab merge request diff for actionable correctness, security, reliability, and maintainability issues. Return JSON shaped exactly as {{\"findings\":[{{\"path\":\"src/file.rs\",\"line\":123,\"severity\":\"warning\",\"title\":\"Short title\",\"message\":\"Specific actionable comment.\"}}]}}. Use only line numbers for added lines in the diff. If there are no findings, return {{\"findings\":[]}}.{truncated_note}\n\n{diff_text}",
+        "请用中文审查这个 GitLab Merge Request diff。只报告高置信度错误，例如会导致编译失败、运行时错误、数据损坏、安全漏洞或明显错误逻辑的问题。不要报告风格建议、可维护性建议、命名问题、性能微优化或不确定的问题。返回严格 JSON，格式必须是 {{\"findings\":[{{\"path\":\"src/file.rs\",\"line\":123,\"severity\":\"error\",\"title\":\"简短中文标题\",\"message\":\"具体说明为什么这是错误，以及应该如何修复。\"}}]}}。severity 必须固定为 \"error\"。只能使用 diff 新增行的行号。如果没有确定的错误，返回 {{\"findings\":[]}}。{truncated_note}\n\n{diff_text}",
     );
     (prompt, diff_payload_bytes, truncated)
 }
@@ -180,7 +197,18 @@ fn parse_openai_response(review_id: &str, title: &str, text: &str) -> AppResult<
         .first()
         .map(|choice| choice.message.content.trim())
         .ok_or_else(|| AppError::AiReview("AI review API returned no choices".into()))?;
+    info!(
+        ai_review_id = %review_id,
+        assistant_content_bytes = content.len(),
+        assistant_content_preview = %preview_log_text(content, AI_RESPONSE_PREVIEW_CHARS),
+        "AI review assistant content received"
+    );
     let parsed: AiFindingsResponse = serde_json::from_str(content)?;
+    info!(
+        ai_review_id = %review_id,
+        parsed_findings = parsed.findings.len(),
+        "AI review assistant findings parsed"
+    );
     Ok(parsed
         .findings
         .into_iter()
@@ -198,9 +226,8 @@ fn parse_openai_response(review_id: &str, title: &str, text: &str) -> AppResult<
 
 fn parse_severity(value: &str) -> Severity {
     match value.trim().to_ascii_lowercase().as_str() {
-        "info" => Severity::Info,
         "error" => Severity::Error,
-        _ => Severity::Warning,
+        _ => Severity::Error,
     }
 }
 
@@ -211,6 +238,27 @@ fn non_empty_or(value: String, fallback: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+fn preview_log_text(value: &str, max_chars: usize) -> String {
+    let mut preview = String::new();
+    let mut truncated = false;
+    for (index, ch) in value.chars().enumerate() {
+        if index >= max_chars {
+            truncated = true;
+            break;
+        }
+        match ch {
+            '\n' => preview.push_str("\\n"),
+            '\r' => preview.push_str("\\r"),
+            '\t' => preview.push_str("\\t"),
+            _ => preview.push(ch),
+        }
+    }
+    if truncated {
+        preview.push_str("...");
+    }
+    preview
 }
 
 fn filter_findings_to_added_lines(
@@ -284,6 +332,24 @@ mod tests {
     }
 
     #[test]
+    fn treats_unknown_ai_severity_as_error() {
+        let response = r#"
+{
+  "choices": [{
+    "message": {
+      "content": "{\"findings\":[{\"path\":\"src/lib.rs\",\"line\":12,\"severity\":\"warning\",\"title\":\"Bug\",\"message\":\"This is a bug.\"}]}"
+    }
+  }]
+}
+"#;
+
+        let findings = parse_openai_response("ai-review", "AI Review", response).unwrap();
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Error);
+    }
+
+    #[test]
     fn filters_findings_to_added_lines_in_current_diff() {
         let changes = vec![GitLabChange {
             old_path: "src/lib.rs".into(),
@@ -333,5 +399,12 @@ mod tests {
 
         assert!(truncated);
         assert!(std::str::from_utf8(payload.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn previews_ai_response_without_splitting_utf8() {
+        let preview = preview_log_text("中文\nabcdef", 5);
+
+        assert_eq!(preview, "中文\\nab...");
     }
 }

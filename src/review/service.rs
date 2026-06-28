@@ -655,7 +655,7 @@ impl ReviewService {
 }
 
 fn incomplete_diff_refs_body() -> String {
-    "**[warning] Review 已跳过**\n\n当前 MR 的 diff 信息不完整，无法可靠发布行级评论。请先解决冲突或刷新 MR 后重新触发检查。\n\n<!-- gitlab-work-runner:rule=incomplete-diff-refs -->".into()
+    "**[警告] Review 已跳过**\n\n当前 MR 的 diff 信息不完整，无法可靠发布行级评论。请先解决冲突或刷新 MR 后重新触发检查。\n\n<!-- gitlab-work-runner:rule=incomplete-diff-refs -->".into()
 }
 
 fn changed_paths(changes: &[GitLabChange]) -> Vec<String> {
@@ -741,7 +741,7 @@ fn build_script_result_summary(result: &ScriptTaskResult, text: &str) -> String 
         text.trim()
     };
     format!(
-        "**[warning] {}**\n\n脚本任务检测发现问题，但结果无法解析成 `path:line:message` 行级格式。\n\n```text\n{}\n```\n\n结果文件：`{}`\n运行日志：`{}`\n\n<!-- gitlab-work-runner:rule=script:{} -->",
+        "**[警告] {}**\n\n脚本任务检测发现问题，但结果无法解析成 `path:line:message` 行级格式。\n\n```text\n{}\n```\n\n结果文件：`{}`\n运行日志：`{}`\n\n<!-- gitlab-work-runner:rule=script:{} -->",
         result.title,
         content,
         result.result_path.display(),

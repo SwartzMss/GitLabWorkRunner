@@ -20,8 +20,8 @@ pub struct RulesFile {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct RuleConfig {
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
+    #[serde(default = "default_auto_enabled")]
+    pub auto_enabled: bool,
     pub id: String,
     pub title: String,
     pub severity: Severity,
@@ -112,7 +112,11 @@ impl Ruleset {
     pub fn from_toml(text: &str) -> AppResult<Self> {
         let parsed: RulesFile = toml::from_str(text)?;
         let mut rules = Vec::new();
-        for config in parsed.rules.into_iter().filter(|config| config.enabled) {
+        for config in parsed
+            .rules
+            .into_iter()
+            .filter(|config| config.auto_enabled)
+        {
             let matcher = Glob::new(&config.path)
                 .map_err(|err| AppError::Rule(format!("invalid glob {}: {err}", config.path)))?
                 .compile_matcher();
@@ -241,10 +245,6 @@ impl Ruleset {
     }
 }
 
-fn default_enabled() -> bool {
-    true
-}
-
 fn default_auto_enabled() -> bool {
     true
 }
@@ -331,7 +331,7 @@ message = "Do not unwrap."
         let rules = Ruleset::from_toml(
             r#"
 [[rules]]
-enabled = false
+auto_enabled = false
 id = "forbid-unwrap"
 title = "Avoid unwrap"
 severity = "warning"
