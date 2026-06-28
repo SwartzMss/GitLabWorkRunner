@@ -149,6 +149,7 @@ file = "rules.toml"
 
 ```toml
 [[rules]]
+enabled = true
 id = "forbid-unwrap"
 title = "Avoid unwrap"
 severity = "warning"
@@ -157,34 +158,40 @@ pattern = "\\.unwrap\\(\\)"
 message = "Direct unwrap can panic at runtime. Prefer explicit error handling."
 ```
 
+`enabled` 默认是 `true`；设置为 `false` 时，这条规则不会参与自动 Review。
+
 AI Review 示例：
 
 ```toml
 [[ai_reviews]]
-enabled = false
+auto_enabled = false
 id = "ai-review"
 title = "AI Review"
-provider = "openai-compatible"
 base_url = "https://api.openai.com/v1"
-api_key_env = "OPENAI_API_KEY"
+api_key = "<your-ai-api-key>"
 model = "gpt-4.1-mini"
-trigger = "auto_and_manual"
 timeout_seconds = 60
 max_diff_bytes = 60000
 when_changed = ["**/*.rs", "**/*.toml"]
 ```
 
+`auto_enabled` 默认是 `true`；设置为 `false` 时不会自动执行，但仍可以通过 MR 评论 `@ai-review` 手动触发。
+
+不要把包含真实 `api_key` 的 `rules.toml` 提交到仓库。
+
 脚本任务示例：
 
 ```toml
 [[script_tasks]]
-enabled = false
+auto_enabled = false
 id = "check-todo-tbd"
 title = "TODO/TBD marker check"
 command = "python examples/scripts/check_todo_tbd.py"
 timeout_seconds = 30
 when_changed = ["**/*.rs"]
 ```
+
+`auto_enabled` 默认是 `true`；设置为 `false` 时不会自动执行，但仍可以通过 MR 评论 `@check-todo-tbd` 手动触发。
 
 脚本会收到两个参数：
 

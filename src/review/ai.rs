@@ -15,18 +15,13 @@ pub async fn run_ai_review(
     config: &AiReviewConfig,
     changes: &[GitLabChange],
 ) -> AppResult<Vec<Finding>> {
-    if config.provider != "openai-compatible" {
+    let api_key = config.api_key.trim();
+    if api_key.is_empty() {
         return Err(AppError::AiReview(format!(
-            "unsupported AI review provider: {}",
-            config.provider
+            "api_key is empty for AI review {}",
+            config.id
         )));
     }
-    let api_key = std::env::var(&config.api_key_env).map_err(|_| {
-        AppError::AiReview(format!(
-            "environment variable {} is not set",
-            config.api_key_env
-        ))
-    })?;
     let (prompt, diff_payload_bytes, diff_payload_truncated) = build_review_prompt(config, changes);
     let request = OpenAiChatRequest {
         model: &config.model,
@@ -48,13 +43,12 @@ pub async fn run_ai_review(
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
     info!(
         ai_review_id = %config.id,
-        provider = %config.provider,
         model = %config.model,
         timeout_seconds = config.timeout_seconds,
         max_diff_bytes = config.max_diff_bytes,
         diff_payload_bytes,
         diff_payload_truncated,
-        "calling AI review provider"
+        "calling AI review API"
     );
     let started = Instant::now();
     let response = reqwest::Client::builder()
@@ -68,11 +62,10 @@ pub async fn run_ai_review(
     let status = response.status();
     info!(
         ai_review_id = %config.id,
-        provider = %config.provider,
         model = %config.model,
         status = status.as_u16(),
         elapsed_ms = started.elapsed().as_millis(),
-        "AI review provider response received"
+        "AI review API response received"
     );
     let body = response.error_for_status()?.text().await?;
     let findings = parse_openai_response(&config.id, &config.title, &body)?;
@@ -83,7 +76,7 @@ pub async fn run_ai_review(
         raw_findings = raw_finding_count,
         findings = filtered.len(),
         filtered_findings = raw_finding_count.saturating_sub(filtered.len()),
-        "AI review provider completed"
+        "AI review API completed"
     );
     Ok(filtered)
 }
@@ -186,7 +179,7 @@ fn parse_openai_response(review_id: &str, title: &str, text: &str) -> AppResult<
         .choices
         .first()
         .map(|choice| choice.message.content.trim())
-        .ok_or_else(|| AppError::AiReview("AI provider returned no choices".into()))?;
+        .ok_or_else(|| AppError::AiReview("AI review API returned no choices".into()))?;
     let parsed: AiFindingsResponse = serde_json::from_str(content)?;
     Ok(parsed
         .findings

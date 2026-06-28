@@ -32,8 +32,8 @@ pub struct RuleConfig {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct ScriptTaskConfig {
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
+    #[serde(default = "default_auto_enabled")]
+    pub auto_enabled: bool,
     pub id: String,
     pub title: String,
     pub command: String,
@@ -45,40 +45,19 @@ pub struct ScriptTaskConfig {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct AiReviewConfig {
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
+    #[serde(default = "default_auto_enabled")]
+    pub auto_enabled: bool,
     pub id: String,
     pub title: String,
-    pub provider: String,
     pub base_url: String,
-    pub api_key_env: String,
+    pub api_key: String,
     pub model: String,
-    #[serde(default = "default_ai_review_trigger")]
-    pub trigger: AiReviewTrigger,
     #[serde(default = "default_ai_timeout_seconds")]
     pub timeout_seconds: u64,
     #[serde(default = "default_ai_max_diff_bytes")]
     pub max_diff_bytes: usize,
     #[serde(default)]
     pub when_changed: Vec<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum AiReviewTrigger {
-    Auto,
-    Manual,
-    AutoAndManual,
-}
-
-impl AiReviewTrigger {
-    fn allows_auto(&self) -> bool {
-        matches!(self, Self::Auto | Self::AutoAndManual)
-    }
-
-    fn allows_manual(&self) -> bool {
-        matches!(self, Self::Manual | Self::AutoAndManual)
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -199,7 +178,7 @@ impl Ruleset {
         self.script_tasks
             .iter()
             .filter(|task| {
-                task.config.enabled
+                task.config.auto_enabled
                     && task.changed_matcher.as_ref().is_none_or(|matcher| {
                         changed_paths.iter().any(|path| matcher.is_match(path))
                     })
@@ -220,8 +199,7 @@ impl Ruleset {
         self.ai_reviews
             .iter()
             .filter(|review| {
-                review.config.enabled
-                    && review.config.trigger.allows_auto()
+                review.config.auto_enabled
                     && review.changed_matcher.as_ref().is_none_or(|matcher| {
                         changed_paths.iter().any(|path| matcher.is_match(path))
                     })
@@ -233,10 +211,7 @@ impl Ruleset {
     pub fn ai_reviews_by_ids(&self, requested_ids: &[String]) -> Vec<AiReviewConfig> {
         self.ai_reviews
             .iter()
-            .filter(|review| {
-                review.config.trigger.allows_manual()
-                    && requested_ids.iter().any(|id| id == &review.config.id)
-            })
+            .filter(|review| requested_ids.iter().any(|id| id == &review.config.id))
             .map(|review| review.config.clone())
             .collect()
     }
@@ -270,12 +245,12 @@ fn default_enabled() -> bool {
     true
 }
 
-fn default_script_timeout_seconds() -> u64 {
-    60
+fn default_auto_enabled() -> bool {
+    true
 }
 
-fn default_ai_review_trigger() -> AiReviewTrigger {
-    AiReviewTrigger::AutoAndManual
+fn default_script_timeout_seconds() -> u64 {
+    60
 }
 
 fn default_ai_timeout_seconds() -> u64 {
@@ -352,6 +327,28 @@ message = "Do not unwrap."
     }
 
     #[test]
+    fn ignores_disabled_line_rules() {
+        let rules = Ruleset::from_toml(
+            r#"
+[[rules]]
+enabled = false
+id = "forbid-unwrap"
+title = "Avoid unwrap"
+severity = "warning"
+path = "**/*.rs"
+pattern = "\\.unwrap\\(\\)"
+message = "Do not unwrap."
+"#,
+        )
+        .unwrap();
+        let diff = "@@ -1 +1 @@\n+value.unwrap()\n";
+        let file = parse_unified_diff("src/lib.rs", "src/lib.rs", diff).unwrap();
+
+        assert_eq!(rules.line_rule_count(), 0);
+        assert!(rules.evaluate(&file).is_empty());
+    }
+
+    #[test]
     fn hash_changes_when_rule_text_changes() {
         let first = Ruleset::from_toml(
             r#"
@@ -386,7 +383,7 @@ message = "a"
         let rules = Ruleset::from_toml(
             r#"
 [[script_tasks]]
-enabled = false
+auto_enabled = false
 id = "manual-check"
 title = "Manual check"
 command = "python check.py"
@@ -408,9 +405,8 @@ when_changed = ["src/**"]
 [[ai_reviews]]
 id = "ai-review"
 title = "AI Review"
-provider = "openai-compatible"
 base_url = "https://api.openai.com/v1"
-api_key_env = "OPENAI_API_KEY"
+api_key = "test-api-key"
 model = "gpt-4.1-mini"
 when_changed = ["src/**"]
 "#,
@@ -421,24 +417,23 @@ when_changed = ["src/**"]
 
         assert_eq!(reviews.len(), 1);
         assert_eq!(reviews[0].id, "ai-review");
-        assert_eq!(reviews[0].trigger, AiReviewTrigger::AutoAndManual);
+        assert_eq!(reviews[0].api_key, "test-api-key");
+        assert!(reviews[0].auto_enabled);
         assert_eq!(reviews[0].timeout_seconds, 60);
         assert_eq!(reviews[0].max_diff_bytes, 60_000);
     }
 
     #[test]
-    fn manual_ai_review_selection_ignores_enabled_and_when_changed() {
+    fn manual_ai_review_selection_ignores_auto_enabled_and_when_changed() {
         let rules = Ruleset::from_toml(
             r#"
 [[ai_reviews]]
-enabled = false
+auto_enabled = false
 id = "ai-review"
 title = "AI Review"
-provider = "openai-compatible"
 base_url = "https://api.openai.com/v1"
-api_key_env = "OPENAI_API_KEY"
+api_key = "test-api-key"
 model = "gpt-4.1-mini"
-trigger = "manual"
 when_changed = ["src/**"]
 "#,
         )

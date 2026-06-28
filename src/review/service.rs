@@ -49,6 +49,13 @@ impl ReviewService {
             commit_sha: &event.commit_sha,
             ruleset_hash: self.ruleset.hash(),
         };
+        info!(
+            project_id = event.project_id,
+            mr_iid = event.mr_iid,
+            commit_sha = %event.commit_sha,
+            ruleset_hash = %self.ruleset.hash(),
+            "checking processed review state"
+        );
         if self.store.has_processed(&key).await? {
             info!(
                 project_id = event.project_id,
@@ -64,6 +71,12 @@ impl ReviewService {
             });
         }
 
+        info!(
+            project_id = event.project_id,
+            mr_iid = event.mr_iid,
+            commit_sha = %event.commit_sha,
+            "fetching merge request diff before review tasks"
+        );
         let changes = self
             .gitlab
             .merge_request_changes(event.project_id, event.mr_iid)
@@ -225,6 +238,13 @@ impl ReviewService {
             selected_tasks = tasks.len(),
             selected_ai_reviews = ai_reviews.len(),
             "manual review started"
+        );
+        info!(
+            project_id = event.project_id,
+            mr_iid = event.mr_iid,
+            note_id = event.note_id,
+            commit_sha = %event.commit_sha,
+            "fetching merge request diff before manual review tasks"
         );
         let changes = self
             .gitlab

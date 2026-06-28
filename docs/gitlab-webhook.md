@@ -120,9 +120,9 @@ object_attributes.noteable_type = "MergeRequest"
 手动触发行为：
 
 - 只按 `@id` 精确匹配 `[[script_tasks]].id`。
-- 即使任务配置了 `enabled = false`，也允许手动触发。
+- 即使任务配置了 `auto_enabled = false`，也允许手动触发。
 - 手动触发忽略 `when_changed`，因为用户已经明确要求执行该任务。
-- AI Review 手动触发按 `[[ai_reviews]].id` 精确匹配，忽略 `enabled` 和 `when_changed`，但 `trigger` 必须允许 `manual`。
+- AI Review 手动触发按 `[[ai_reviews]].id` 精确匹配，忽略 `auto_enabled` 和 `when_changed`。
 - 如果同一条评论同时包含脚本任务和 AI Review 的合法命令，服务会分别执行匹配项。
 - 手动触发不使用自动 Review 的去重键；用户每发一次合法命令，服务就执行一次。
 - 如果评论里没有合法脚本任务或 AI Review 命令，或 `@id` 不存在，服务只记录日志并返回 accepted。
@@ -139,7 +139,7 @@ object_attributes.noteable_type = "MergeRequest"
 
 ```toml
 [[script_tasks]]
-enabled = false
+auto_enabled = false
 id = "check-todo-tbd"
 title = "TODO/TBD marker check"
 command = "python examples/scripts/check_todo_tbd.py"
@@ -160,7 +160,7 @@ when_changed = ["**/*.rs"]
 5. 对 MR event，如果已处理，直接跳过。
 6. 通过 GitLab API 拉取 MR changes。
 7. 对 MR event，如果 GitLab diff refs 不完整，发布一条 MR 级跳过提示并写入状态存储。
-8. 对 MR event，解析 diff，只对新增行执行规则，并自动执行匹配的 AI Review 和 `enabled = true` 的脚本任务。
+8. 对 MR event，解析 diff，只对新增行执行 `enabled = true` 的规则，并自动执行匹配的 `auto_enabled = true` AI Review 和脚本任务。
 9. 对 MR comment event，解析评论正文中的 `@id`，手动执行匹配的脚本任务和 AI Review。
 10. 发布 GitLab MR Discussion。
 11. 对 MR event 写入状态存储，避免重复评论；手动 comment event 不写入自动去重记录。

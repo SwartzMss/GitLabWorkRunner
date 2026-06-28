@@ -149,6 +149,7 @@ Minimal `rules.toml` example:
 
 ```toml
 [[rules]]
+enabled = true
 id = "forbid-unwrap"
 title = "Avoid unwrap"
 severity = "warning"
@@ -157,34 +158,40 @@ pattern = "\\.unwrap\\(\\)"
 message = "Direct unwrap can panic at runtime. Prefer explicit error handling."
 ```
 
+`enabled` defaults to `true`; set it to `false` to exclude the rule from automatic review.
+
 AI Review example:
 
 ```toml
 [[ai_reviews]]
-enabled = false
+auto_enabled = false
 id = "ai-review"
 title = "AI Review"
-provider = "openai-compatible"
 base_url = "https://api.openai.com/v1"
-api_key_env = "OPENAI_API_KEY"
+api_key = "<your-ai-api-key>"
 model = "gpt-4.1-mini"
-trigger = "auto_and_manual"
 timeout_seconds = 60
 max_diff_bytes = 60000
 when_changed = ["**/*.rs", "**/*.toml"]
 ```
 
+`auto_enabled` defaults to `true`; set it to `false` to skip automatic execution while still allowing manual MR comment triggers such as `@ai-review`.
+
+Do not commit a real `rules.toml` that contains an actual `api_key`.
+
 Script task example:
 
 ```toml
 [[script_tasks]]
-enabled = false
+auto_enabled = false
 id = "check-todo-tbd"
 title = "TODO/TBD marker check"
 command = "python examples/scripts/check_todo_tbd.py"
 timeout_seconds = 30
 when_changed = ["**/*.rs"]
 ```
+
+`auto_enabled` defaults to `true`; set it to `false` to skip automatic execution while still allowing manual MR comment triggers such as `@check-todo-tbd`.
 
 Scripts receive two arguments:
 

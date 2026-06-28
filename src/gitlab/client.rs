@@ -1,8 +1,10 @@
 use crate::error::AppResult;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
+
+const GITLAB_API_TIMEOUT_SECONDS: u64 = 30;
 
 #[derive(Clone)]
 pub struct GitLabClient {
@@ -89,16 +91,24 @@ impl GitLabClient {
             project_id,
             mr_iid,
             gitlab_base_url = %self.base_url,
-            "fetching merge request changes from gitlab"
+            "preparing to fetch merge request changes from gitlab"
         );
         let url = format!(
             "{}/api/v4/projects/{}/merge_requests/{}/changes",
             self.base_url, project_id, mr_iid
         );
+        info!(
+            project_id,
+            mr_iid,
+            request_url = %url,
+            timeout_seconds = GITLAB_API_TIMEOUT_SECONDS,
+            "fetching merge request changes from gitlab"
+        );
         let started = Instant::now();
         let response = self
             .http
             .get(url)
+            .timeout(Duration::from_secs(GITLAB_API_TIMEOUT_SECONDS))
             .header("PRIVATE-TOKEN", &self.token)
             .send()
             .await?;
@@ -130,16 +140,24 @@ impl GitLabClient {
             project_id,
             sha,
             gitlab_base_url = %self.base_url,
-            "downloading repository archive from gitlab"
+            "preparing to download repository archive from gitlab"
         );
         let url = format!(
             "{}/api/v4/projects/{}/repository/archive.zip",
             self.base_url, project_id
         );
+        info!(
+            project_id,
+            sha,
+            request_url = %url,
+            timeout_seconds = GITLAB_API_TIMEOUT_SECONDS,
+            "downloading repository archive from gitlab"
+        );
         let started = Instant::now();
         let response = self
             .http
             .get(url)
+            .timeout(Duration::from_secs(GITLAB_API_TIMEOUT_SECONDS))
             .query(&[("sha", sha)])
             .header("PRIVATE-TOKEN", &self.token)
             .send()
@@ -172,16 +190,25 @@ impl GitLabClient {
             project_id,
             mr_iid,
             has_position = request.position.is_some(),
-            "creating gitlab merge request discussion"
+            "preparing to create gitlab merge request discussion"
         );
         let url = format!(
             "{}/api/v4/projects/{}/merge_requests/{}/discussions",
             self.base_url, project_id, mr_iid
         );
+        info!(
+            project_id,
+            mr_iid,
+            request_url = %url,
+            has_position = request.position.is_some(),
+            timeout_seconds = GITLAB_API_TIMEOUT_SECONDS,
+            "creating gitlab merge request discussion"
+        );
         let started = Instant::now();
         let response = self
             .http
             .post(&url)
+            .timeout(Duration::from_secs(GITLAB_API_TIMEOUT_SECONDS))
             .header("PRIVATE-TOKEN", &self.token)
             .json(request)
             .send()
@@ -209,6 +236,7 @@ impl GitLabClient {
             let created: CreatedDiscussion = self
                 .http
                 .post(url)
+                .timeout(Duration::from_secs(GITLAB_API_TIMEOUT_SECONDS))
                 .header("PRIVATE-TOKEN", &self.token)
                 .json(&fallback)
                 .send()

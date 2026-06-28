@@ -157,6 +157,7 @@ enum DiffLineKind {
 
 ```toml
 [[rules]]
+enabled = true
 id = "forbid-unwrap"
 title = "避免直接 unwrap"
 severity = "warning"
@@ -192,8 +193,8 @@ struct Finding {
 职责：
 
 - 读取 `rules.toml` 中的 `[[script_tasks]]`。
-- 自动触发时，只选择 `enabled = true` 且匹配 `when_changed` 的任务。
-- 手动触发时，根据 MR 评论中的 `@task_id` 精确选择任务，允许执行 `enabled = false` 的任务，并忽略 `when_changed`。
+- 自动触发时，只选择 `auto_enabled = true` 且匹配 `when_changed` 的任务。
+- 手动触发时，根据 MR 评论中的 `@task_id` 精确选择任务，允许执行 `auto_enabled = false` 的任务，并忽略 `when_changed`。
 - 通过 GitLab archive API 下载 MR 当前 head commit。
 - 解压到 `work/script_tasks/<project_id>/<mr_iid>/<commit_sha>/<task_id>/source`。
 - 在 runner 可执行文件所在目录执行 `command`，相对脚本路径不绑定目标 GitLab 仓库。
@@ -207,7 +208,7 @@ struct Finding {
 
 ```toml
 [[script_tasks]]
-enabled = true
+auto_enabled = true
 id = "check-todo-tbd"
 title = "TODO/TBD marker check"
 command = "python examples/scripts/check_todo_tbd.py"
@@ -217,7 +218,7 @@ when_changed = ["**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.rs"
 
 字段说明：
 
-- `enabled`: 单条任务自动触发开关，默认 `true`；`false` 时仍可通过 MR 评论 `@id` 手动触发。
+- `auto_enabled`: 单条任务自动触发开关，默认 `true`；`false` 时仍可通过 MR 评论 `@id` 手动触发。
 - `id`: 任务唯一标识。
 - `title`: MR 评论标题。
 - `command`: 在 runner 可执行文件所在目录执行的命令；相对路径基于该目录解析。
@@ -249,7 +250,7 @@ src/config.rs:5: //TODO aa
 - GitLab Webhook 需要开启 `Comments`。
 - 只处理 MR comment event，不处理 issue、wiki、work item comment。
 - 评论正文中出现独立 token `@task_id` 时触发对应 `script_tasks.id`。
-- 评论正文中出现独立 token `@ai_review_id` 时触发对应 `ai_reviews.id`，但 `trigger` 必须允许 `manual`。
+- 评论正文中出现独立 token `@ai_review_id` 时触发对应 `ai_reviews.id`。
 - 手动触发不写入自动 review 去重记录；用户每发一次合法命令，服务都会执行一次。
 - 如果 `@task_id` 不存在，服务只记录日志，不发布额外评论。
 
@@ -355,7 +356,7 @@ max_bytes = 10485760
 max_files = 5
 ```
 
-规则配置使用 `rules.toml`。当前支持三类配置：`[[rules]]` 正则匹配新增行、`[[ai_reviews]]` 调用 OpenAI-compatible API、`[[script_tasks]]` 下载 MR head 快照后执行外部脚本。脚本任务使用同一个 `rules.toml`，但作为独立任务执行，不与行级规则共享 Finding 模型。
+规则配置使用 `rules.toml`。当前支持三类配置：`[[rules]]` 正则匹配新增行、`[[ai_reviews]]` 调用 OpenAI-compatible API、`[[script_tasks]]` 下载 MR head 快照后执行外部脚本。`[[rules]]` 的 `enabled` 默认是 `true`，设置为 `false` 时不参与自动 Review。脚本任务使用同一个 `rules.toml`，但作为独立任务执行，不与行级规则共享 Finding 模型。
 
 ## 错误处理
 
@@ -408,7 +409,7 @@ Webhook payload -> diff fixture -> rule finding -> discussion API request -> sta
 ## 后续扩展
 
 - 支持规则插件。
-- 支持更多 AI review provider。
+- 支持更多 AI Review API 适配方式。
 - 支持更完整的 MR 级汇总评论。
 - 支持 Redis / PostgreSQL。
 - 支持任务队列和并发 worker。

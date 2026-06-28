@@ -298,7 +298,6 @@ when_changed = ["src/**"]
 
 #[tokio::test]
 async fn reviews_merge_request_with_ai_review() {
-    std::env::set_var("AI_REVIEW_TEST_TOKEN", "test-token");
     let discussion_count = Arc::new(AtomicUsize::new(0));
     let discussion_count_for_handler = Arc::clone(&discussion_count);
     let ai_request_count = Arc::new(AtomicUsize::new(0));
@@ -391,9 +390,8 @@ async fn reviews_merge_request_with_ai_review() {
 [[ai_reviews]]
 id = "ai-review"
 title = "AI Review"
-provider = "openai-compatible"
 base_url = "{}"
-api_key_env = "AI_REVIEW_TEST_TOKEN"
+api_key = "test-api-key"
 model = "test-model"
 timeout_seconds = 10
 when_changed = ["src/**"]
@@ -424,7 +422,6 @@ when_changed = ["src/**"]
 
 #[tokio::test]
 async fn manual_note_runs_ai_review() {
-    std::env::set_var("AI_REVIEW_MANUAL_TEST_TOKEN", "test-token");
     let discussion_count = Arc::new(AtomicUsize::new(0));
     let discussion_count_for_handler = Arc::clone(&discussion_count);
     let ai_request_count = Arc::new(AtomicUsize::new(0));
@@ -506,14 +503,12 @@ async fn manual_note_runs_ai_review() {
     let ruleset = Ruleset::from_toml(&format!(
         r#"
 [[ai_reviews]]
-enabled = false
+auto_enabled = false
 id = "ai-review"
 title = "AI Review"
-provider = "openai-compatible"
 base_url = "{}"
-api_key_env = "AI_REVIEW_MANUAL_TEST_TOKEN"
+api_key = "manual-test-api-key"
 model = "manual-test-model"
-trigger = "manual"
 timeout_seconds = 10
 when_changed = ["does-not-match/**"]
 "#,
@@ -735,7 +730,7 @@ async fn manual_note_runs_disabled_script_task() {
     let ruleset = Ruleset::from_toml(&format!(
         r#"
 [[script_tasks]]
-enabled = false
+auto_enabled = false
 id = "manual-script"
 title = "Manual TODO marker check"
 command = "{}"
