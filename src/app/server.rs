@@ -110,7 +110,7 @@ async fn gitlab_webhook(
     let gitlab = GitLabClient::new(state.config.gitlab.base_url.clone(), gitlab_token);
     let service = ReviewService::new(gitlab, state.store.clone(), ruleset);
 
-    let result = match &event {
+    let response_summary = match &event {
         GitLabWebhookEvent::MergeRequest(event) => {
             info!(
                 project_id = event.project_id,
@@ -121,14 +121,11 @@ async fn gitlab_webhook(
                 target_branch = %event.target_branch,
                 "gitlab merge request event parsed"
             );
-            service.review_merge_request(event).await.map(|summary| {
-                (
-                    event.project_id,
-                    event.mr_iid,
-                    event.commit_sha.as_str(),
-                    summary,
-                )
-            })
+            WebhookReviewSummary {
+                project_id: event.project_id,
+                mr_iid: event.mr_iid,
+                commit_sha: event.commit_sha.clone(),
+            }
         }
         GitLabWebhookEvent::MergeRequestNote(event) => {
             info!(
@@ -139,59 +136,128 @@ async fn gitlab_webhook(
                 note_id = event.note_id,
                 "gitlab merge request note event parsed"
             );
-            service
-                .review_merge_request_note(event)
-                .await
-                .map(|summary| {
-                    (
-                        event.project_id,
-                        event.mr_iid,
-                        event.commit_sha.as_str(),
-                        summary,
-                    )
-                })
+            WebhookReviewSummary {
+                project_id: event.project_id,
+                mr_iid: event.mr_iid,
+                commit_sha: event.commit_sha.clone(),
+            }
         }
+    };
+
+    tokio::spawn(run_webhook_review(service, event, response_summary.clone()));
+    info!(
+        project_id = response_summary.project_id,
+        mr_iid = response_summary.mr_iid,
+        commit_sha = %response_summary.commit_sha,
+        "gitlab webhook review task accepted"
+    );
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "accepted": true
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Clone)]
+struct WebhookReviewSummary {
+    project_id: i64,
+    mr_iid: i64,
+    commit_sha: String,
+}
+
+async fn run_webhook_review(
+    service: ReviewService,
+    event: GitLabWebhookEvent,
+    response_summary: WebhookReviewSummary,
+) {
+    let result = match &event {
+        GitLabWebhookEvent::MergeRequest(event) => service.review_merge_request(event).await,
+        GitLabWebhookEvent::MergeRequestNote(event) => service.review_merge_request_note(event).await,
     };
 
     match result {
         Ok(summary) => {
-            let (project_id, mr_iid, commit_sha, summary) = summary;
             info!(
-                project_id,
-                mr_iid,
-                commit_sha,
+                project_id = response_summary.project_id,
+                mr_iid = response_summary.mr_iid,
+                commit_sha = %response_summary.commit_sha,
                 skipped = summary.skipped,
                 findings = summary.findings,
                 comments = summary.comments,
-                "gitlab webhook review request accepted"
+                "gitlab webhook review completed"
             );
-            (
-                StatusCode::ACCEPTED,
-                Json(json!({
-                    "skipped": summary.skipped,
-                    "findings": summary.findings,
-                    "comments": summary.comments
-                })),
-            )
-                .into_response()
         }
         Err(err) => {
-            let (project_id, mr_iid, commit_sha) = match &event {
-                GitLabWebhookEvent::MergeRequest(event) => {
-                    (event.project_id, event.mr_iid, event.commit_sha.as_str())
-                }
-                GitLabWebhookEvent::MergeRequestNote(event) => {
-                    (event.project_id, event.mr_iid, event.commit_sha.as_str())
-                }
-            };
             error!(
-                project_id,
-                mr_iid,
-                commit_sha,
+                project_id = response_summary.project_id,
+                mr_iid = response_summary.mr_iid,
+                commit_sha = %response_summary.commit_sha,
                 error = %err,
                 "gitlab webhook review failed"
             );
-            (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        app::config::{GitLabConfig, LoggingConfig, RulesConfig, ServerConfig, StorageConfig},
+        storage::StateStore,
+    };
+    use axum::http::HeaderValue;
+    use std::time::{Duration, Instant};
+    use tempfile::NamedTempFile;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn accepts_webhook_before_review_work_completes() {
+        let rules_file = NamedTempFile::new().unwrap();
+        std::fs::write(rules_file.path(), "").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gitlab_base_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+
+        let store = StateStore::connect("sqlite::memory:").await.unwrap();
+        store.migrate().await.unwrap();
+        let state = Arc::new(AppState {
+            config: AppConfig {
+                server: ServerConfig {
+                    bind: "127.0.0.1:0".into(),
+                    webhook_secret: "secret".into(),
+                },
+                gitlab: GitLabConfig {
+                    base_url: gitlab_base_url,
+                    token: "token".into(),
+                },
+                storage: StorageConfig {
+                    database_url: "sqlite::memory:".into(),
+                },
+                rules: RulesConfig {
+                    file: rules_file.path().to_string_lossy().into_owned(),
+                },
+                logging: LoggingConfig::default(),
+            },
+            store,
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Gitlab-Token", HeaderValue::from_static("secret"));
+        let body = Bytes::from_static(include_bytes!("../../tests/fixtures/gitlab_mr_event.json"));
+
+        let started = Instant::now();
+        let response = gitlab_webhook(State(state), headers, body)
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }
