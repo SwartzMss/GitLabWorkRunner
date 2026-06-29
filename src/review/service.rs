@@ -499,7 +499,7 @@ impl ReviewService {
                 new_path: draft.path.clone(),
                 new_line: Some(new_line),
             });
-            let created = self
+            let created = match self
                 .gitlab
                 .create_discussion(
                     event.project_id,
@@ -509,7 +509,21 @@ impl ReviewService {
                         position,
                     },
                 )
-                .await?;
+                .await
+            {
+                Ok(created) => created,
+                Err(err) => {
+                    warn!(
+                        project_id = event.project_id,
+                        mr_iid = event.mr_iid,
+                        path = %draft.path,
+                        new_line = ?draft.new_line,
+                        error = %err,
+                        "failed to publish review comment; continuing with remaining comments"
+                    );
+                    continue;
+                }
+            };
             info!(
                 project_id = event.project_id,
                 mr_iid = event.mr_iid,

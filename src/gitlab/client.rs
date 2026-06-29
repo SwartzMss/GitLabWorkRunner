@@ -1,7 +1,10 @@
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, Instant};
+use std::{
+    future::Future,
+    time::{Duration, Instant},
+};
 use tracing::{info, warn};
 
 const GITLAB_API_TIMEOUT_SECONDS: u64 = 30;
@@ -11,6 +14,7 @@ pub struct GitLabClient {
     base_url: String,
     token: String,
     http: reqwest::Client,
+    timeout: Duration,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -75,11 +79,25 @@ pub struct CreatedNote {
 
 impl GitLabClient {
     pub fn new(base_url: String, token: String) -> Self {
+        Self::with_timeout(
+            base_url,
+            token,
+            Duration::from_secs(GITLAB_API_TIMEOUT_SECONDS),
+        )
+    }
+
+    fn with_timeout(base_url: String, token: String, timeout: Duration) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             token,
             http: reqwest::Client::new(),
+            timeout,
         }
+    }
+
+    #[cfg(test)]
+    fn new_with_timeout_for_tests(base_url: String, token: String, timeout: Duration) -> Self {
+        Self::with_timeout(base_url, token, timeout)
     }
 
     pub async fn merge_request_changes(
@@ -101,16 +119,19 @@ impl GitLabClient {
             project_id,
             mr_iid,
             request_url = %url,
-            timeout_seconds = GITLAB_API_TIMEOUT_SECONDS,
+            timeout_ms = self.timeout.as_millis(),
             "fetching merge request changes from gitlab"
         );
         let started = Instant::now();
         let response = self
-            .http
-            .get(url)
-            .timeout(Duration::from_secs(GITLAB_API_TIMEOUT_SECONDS))
-            .header("PRIVATE-TOKEN", &self.token)
-            .send()
+            .with_timeout_guard("fetch merge request changes from gitlab", async {
+                Ok(self
+                    .http
+                    .get(url)
+                    .header("PRIVATE-TOKEN", &self.token)
+                    .send()
+                    .await?)
+            })
             .await?;
         let status = response.status();
         info!(
@@ -121,7 +142,11 @@ impl GitLabClient {
             "gitlab merge request changes response received"
         );
         let response = response.error_for_status()?;
-        let changes: MergeRequestChanges = response.json().await?;
+        let changes: MergeRequestChanges = self
+            .with_timeout_guard("read merge request changes response body", async {
+                Ok(response.json().await?)
+            })
+            .await?;
         info!(
             project_id,
             mr_iid,
@@ -150,17 +175,20 @@ impl GitLabClient {
             project_id,
             sha,
             request_url = %url,
-            timeout_seconds = GITLAB_API_TIMEOUT_SECONDS,
+            timeout_ms = self.timeout.as_millis(),
             "downloading repository archive from gitlab"
         );
         let started = Instant::now();
         let response = self
-            .http
-            .get(url)
-            .timeout(Duration::from_secs(GITLAB_API_TIMEOUT_SECONDS))
-            .query(&[("sha", sha)])
-            .header("PRIVATE-TOKEN", &self.token)
-            .send()
+            .with_timeout_guard("download repository archive from gitlab", async {
+                Ok(self
+                    .http
+                    .get(url)
+                    .query(&[("sha", sha)])
+                    .header("PRIVATE-TOKEN", &self.token)
+                    .send()
+                    .await?)
+            })
             .await?;
         let status = response.status();
         info!(
@@ -170,7 +198,11 @@ impl GitLabClient {
             elapsed_ms = started.elapsed().as_millis(),
             "gitlab repository archive response received"
         );
-        let archive = response.error_for_status()?.bytes().await?.to_vec();
+        let archive = self
+            .with_timeout_guard("read repository archive response body", async {
+                Ok(response.error_for_status()?.bytes().await?.to_vec())
+            })
+            .await?;
         info!(
             project_id,
             sha,
@@ -201,17 +233,20 @@ impl GitLabClient {
             mr_iid,
             request_url = %url,
             has_position = request.position.is_some(),
-            timeout_seconds = GITLAB_API_TIMEOUT_SECONDS,
+            timeout_ms = self.timeout.as_millis(),
             "creating gitlab merge request discussion"
         );
         let started = Instant::now();
         let response = self
-            .http
-            .post(&url)
-            .timeout(Duration::from_secs(GITLAB_API_TIMEOUT_SECONDS))
-            .header("PRIVATE-TOKEN", &self.token)
-            .json(request)
-            .send()
+            .with_timeout_guard("create gitlab merge request discussion", async {
+                Ok(self
+                    .http
+                    .post(&url)
+                    .header("PRIVATE-TOKEN", &self.token)
+                    .json(request)
+                    .send()
+                    .await?)
+            })
             .await?;
         let status = response.status();
         info!(
@@ -234,15 +269,18 @@ impl GitLabClient {
             };
             let fallback_started = Instant::now();
             let created: CreatedDiscussion = self
-                .http
-                .post(url)
-                .timeout(Duration::from_secs(GITLAB_API_TIMEOUT_SECONDS))
-                .header("PRIVATE-TOKEN", &self.token)
-                .json(&fallback)
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
+                .with_timeout_guard("create fallback gitlab merge request discussion", async {
+                    Ok(self
+                        .http
+                        .post(url)
+                        .header("PRIVATE-TOKEN", &self.token)
+                        .json(&fallback)
+                        .send()
+                        .await?
+                        .error_for_status()?
+                        .json()
+                        .await?)
+                })
                 .await?;
             info!(
                 project_id,
@@ -253,7 +291,11 @@ impl GitLabClient {
             );
             return Ok(created);
         }
-        let created: CreatedDiscussion = response.error_for_status()?.json().await?;
+        let created: CreatedDiscussion = self
+            .with_timeout_guard("read create discussion response body", async {
+                Ok(response.error_for_status()?.json().await?)
+            })
+            .await?;
         info!(
             project_id,
             mr_iid,
@@ -262,6 +304,19 @@ impl GitLabClient {
         );
         Ok(created)
     }
+
+    async fn with_timeout_guard<T, F>(&self, operation: &'static str, future: F) -> AppResult<T>
+    where
+        F: Future<Output = AppResult<T>>,
+    {
+        match tokio::time::timeout(self.timeout, future).await {
+            Ok(result) => result,
+            Err(_) => Err(AppError::GitLab(format!(
+                "{operation} timed out after {} ms",
+                self.timeout.as_millis()
+            ))),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -269,7 +324,11 @@ mod tests {
     use super::*;
     use axum::{routing::get, Json, Router};
     use serde_json::json;
-    use tokio::net::TcpListener;
+    use tokio::{
+        io::AsyncReadExt,
+        net::TcpListener,
+        time::{sleep, Duration},
+    };
 
     async fn spawn_server(app: Router) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -334,5 +393,26 @@ mod tests {
         assert_eq!(changes.diff_refs.base_sha, None);
         assert_eq!(changes.diff_refs.start_sha.as_deref(), Some("start"));
         assert_eq!(changes.diff_refs.head_sha.as_deref(), Some("head"));
+    }
+
+    #[tokio::test]
+    async fn merge_request_changes_times_out_when_gitlab_never_responds() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer).await;
+            sleep(Duration::from_secs(5)).await;
+        });
+
+        let client = GitLabClient::new_with_timeout_for_tests(
+            format!("http://{}", addr),
+            "token".into(),
+            Duration::from_millis(50),
+        );
+        let err = client.merge_request_changes(1, 2).await.unwrap_err();
+
+        assert!(err.to_string().contains("timed out"));
     }
 }

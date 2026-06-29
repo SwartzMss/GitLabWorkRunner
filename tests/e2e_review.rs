@@ -136,6 +136,85 @@ message = "Do not unwrap."
 }
 
 #[tokio::test]
+async fn continues_publishing_review_comments_after_one_comment_fails() {
+    let discussion_count = Arc::new(AtomicUsize::new(0));
+    let discussion_count_for_handler = Arc::clone(&discussion_count);
+    let app = Router::new()
+        .route(
+            "/api/v4/projects/123/merge_requests/45/changes",
+            get(|| async {
+                Json(json!({
+                    "changes": [{
+                        "old_path": "src/lib.rs",
+                        "new_path": "src/lib.rs",
+                        "new_file": false,
+                        "renamed_file": false,
+                        "deleted_file": false,
+                        "diff": "@@ -1,2 +1,2 @@\n+let first = maybe.unwrap();\n+let second = other.unwrap();\n"
+                    }],
+                    "diff_refs": {
+                        "base_sha": "base",
+                        "start_sha": "start",
+                        "head_sha": "head"
+                    }
+                }))
+            }),
+        )
+        .route(
+            "/api/v4/projects/123/merge_requests/45/discussions",
+            post(move || {
+                let discussion_count = Arc::clone(&discussion_count_for_handler);
+                async move {
+                    let attempt = discussion_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    if attempt == 1 {
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                    (
+                        StatusCode::CREATED,
+                        Json(json!({
+                            "id": "discussion-2",
+                            "notes": [{ "id": 100 }]
+                        })),
+                    )
+                        .into_response()
+                }
+            }),
+        );
+    let base_url = spawn_server(app).await;
+
+    let store = StateStore::connect("sqlite::memory:").await.unwrap();
+    store.migrate().await.unwrap();
+    let ruleset = Ruleset::from_toml(
+        r#"
+[[rules]]
+id = "forbid-unwrap"
+title = "Avoid unwrap"
+severity = "warning"
+path = "**/*.rs"
+pattern = "\\.unwrap\\(\\)"
+message = "Do not unwrap."
+"#,
+    )
+    .unwrap();
+    let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset);
+    let event = MergeRequestEvent {
+        project_id: 123,
+        mr_iid: 45,
+        commit_sha: "abc123".into(),
+        action: "update".into(),
+        source_branch: "feature/review".into(),
+        target_branch: "main".into(),
+    };
+
+    let summary = service.review_merge_request(&event).await.unwrap();
+
+    assert_eq!(summary.findings, 2);
+    assert_eq!(summary.comments, 1);
+    assert!(!summary.skipped);
+    assert_eq!(discussion_count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn skips_rule_comments_when_diff_refs_are_incomplete() {
     let discussion_count = Arc::new(AtomicUsize::new(0));
     let discussion_count_for_handler = Arc::clone(&discussion_count);

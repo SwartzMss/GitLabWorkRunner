@@ -15,7 +15,7 @@ use tracing_subscriber::{fmt::MakeWriter, layer::SubscriberExt, util::Subscriber
 #[tokio::main]
 async fn main() -> gitlab_work_runner::error::AppResult<()> {
     let config = AppConfig::from_path("config.toml")?;
-    init_tracing(&config.logging)?;
+    let _log_guard = init_tracing(&config.logging)?;
     config.gitlab_token()?;
 
     tracing::info!(
@@ -35,8 +35,11 @@ async fn main() -> gitlab_work_runner::error::AppResult<()> {
     server::serve(config, store).await
 }
 
-fn init_tracing(logging: &LoggingConfig) -> gitlab_work_runner::error::AppResult<()> {
-    let file_writer = SharedLogWriter::new(&logging.file, logging.max_bytes, logging.max_files)?;
+fn init_tracing(
+    logging: &LoggingConfig,
+) -> gitlab_work_runner::error::AppResult<tracing_appender::non_blocking::WorkerGuard> {
+    let (file_writer, guard) =
+        non_blocking_file_log_writer(&logging.file, logging.max_bytes, logging.max_files)?;
 
     tracing_subscriber::registry()
         .with(
@@ -49,7 +52,19 @@ fn init_tracing(logging: &LoggingConfig) -> gitlab_work_runner::error::AppResult
                 .with_ansi(false),
         )
         .init();
-    Ok(())
+    Ok(guard)
+}
+
+fn non_blocking_file_log_writer(
+    path: impl AsRef<Path>,
+    max_bytes: u64,
+    max_files: usize,
+) -> io::Result<(
+    tracing_appender::non_blocking::NonBlocking,
+    tracing_appender::non_blocking::WorkerGuard,
+)> {
+    let file_writer = SharedLogWriter::new(path, max_bytes, max_files)?;
+    Ok(tracing_appender::non_blocking(file_writer.into_writer()))
 }
 
 #[derive(Clone)]
@@ -64,6 +79,10 @@ impl SharedLogWriter {
                 path, max_bytes, max_files,
             )?)),
         })
+    }
+
+    fn into_writer(self) -> LockedLogWriter {
+        LockedLogWriter { file: self.file }
     }
 }
 
@@ -253,5 +272,13 @@ mod tests {
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "abcde");
         assert!(!dir.path().join("app.log.1").exists());
+    }
+
+    #[test]
+    fn creates_non_blocking_file_log_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log");
+
+        let (_writer, _guard) = non_blocking_file_log_writer(&path, 1024, 1).unwrap();
     }
 }
