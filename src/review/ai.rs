@@ -939,17 +939,22 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut buffer = [0_u8; 4096];
-            let _ = stream.read(&mut buffer).await.unwrap();
-            sleep(Duration::from_secs(2)).await;
-            let body = b"{\"choices\":[{\"message\":{\"content\":\"{\\\"findings\\\":[]}\"}}]}";
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
-                body.len()
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
-            stream.write_all(body).await.unwrap();
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 4096];
+                    let _ = stream.read(&mut buffer).await.unwrap();
+                    sleep(Duration::from_secs(2)).await;
+                    let body =
+                        b"{\"choices\":[{\"message\":{\"content\":\"{\\\"findings\\\":[]}\"}}]}";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    stream.write_all(body).await.unwrap();
+                });
+            }
         });
 
         let config = AiReviewConfig {
