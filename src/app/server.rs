@@ -174,7 +174,9 @@ async fn run_webhook_review(
 ) {
     let result = match &event {
         GitLabWebhookEvent::MergeRequest(event) => service.review_merge_request(event).await,
-        GitLabWebhookEvent::MergeRequestNote(event) => service.review_merge_request_note(event).await,
+        GitLabWebhookEvent::MergeRequestNote(event) => {
+            service.review_merge_request_note(event).await
+        }
     };
 
     match result {
