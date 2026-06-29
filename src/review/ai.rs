@@ -25,56 +25,78 @@ pub async fn run_ai_review(
         )));
     }
     let (prompt, diff_payload_bytes, diff_payload_truncated) = build_review_prompt(config, changes);
-    let request = OpenAiChatRequest {
-        model: &config.model,
-        temperature: 0.2,
-        response_format: ResponseFormat {
-            response_type: "json_object",
-        },
-        messages: vec![
-            ChatMessage {
-                role: "system",
-                content: SYSTEM_PROMPT,
-            },
-            ChatMessage {
-                role: "user",
-                content: &prompt,
-            },
-        ],
-    };
+    let request_body = serialize_review_request_body(config, &prompt)?;
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
     info!(
         ai_review_id = %config.id,
         model = %config.model,
         timeout_seconds = config.timeout_seconds,
         max_diff_bytes = config.max_diff_bytes,
+        change_count = changes.len(),
         diff_payload_bytes,
         diff_payload_truncated,
+        prompt_bytes = prompt.len(),
+        request_body_bytes = request_body.len(),
         "calling AI review API"
     );
     let started = Instant::now();
-    let response = reqwest::Client::builder()
+    info!(
+        ai_review_id = %config.id,
+        model = %config.model,
+        request_body_bytes = request_body.len(),
+        "sending AI review API request"
+    );
+    let response = match reqwest::Client::builder()
         .timeout(Duration::from_secs(config.timeout_seconds.max(1)))
         .build()?
         .post(url)
         .bearer_auth(api_key)
-        .json(&request)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(request_body)
         .send()
-        .await?;
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            warn!(
+                ai_review_id = %config.id,
+                model = %config.model,
+                elapsed_ms = started.elapsed().as_millis(),
+                error = %err,
+                "AI review API request failed before response headers"
+            );
+            return Err(err.into());
+        }
+    };
     let status = response.status();
     info!(
         ai_review_id = %config.id,
         model = %config.model,
         status = status.as_u16(),
         elapsed_ms = started.elapsed().as_millis(),
-        "AI review API response received"
+        "AI review API response headers received"
     );
-    let body = response.text().await?;
+    let body_started = Instant::now();
+    let body = match response.text().await {
+        Ok(body) => body,
+        Err(err) => {
+            warn!(
+                ai_review_id = %config.id,
+                model = %config.model,
+                status = status.as_u16(),
+                elapsed_ms = started.elapsed().as_millis(),
+                error = %err,
+                "AI review API response body read failed"
+            );
+            return Err(err.into());
+        }
+    };
     let response_body_preview = preview_log_text(&body, AI_RESPONSE_PREVIEW_CHARS);
     info!(
         ai_review_id = %config.id,
         model = %config.model,
         response_bytes = body.len(),
+        elapsed_ms = body_started.elapsed().as_millis(),
         response_body_preview = %response_body_preview,
         "AI review raw response body received"
     );
@@ -164,6 +186,27 @@ fn build_review_prompt(config: &AiReviewConfig, changes: &[GitLabChange]) -> (St
         "请用中文审查这个 GitLab Merge Request diff。只报告高置信度错误，例如会导致编译失败、运行时错误、数据损坏、安全漏洞或明显错误逻辑的问题。不要报告风格建议、可维护性建议、命名问题、性能微优化或不确定的问题。最终返回的 JSON 是唯一有效输出，格式必须是 {{\"findings\":[{{\"path\":\"src/file.rs\",\"line\":123,\"severity\":\"error\",\"title\":\"简短中文标题\",\"message\":\"具体说明为什么这是错误，以及应该如何修复。\"}}]}}。如果你在推理中发现问题，必须把问题写进最终 JSON 的 findings 数组；不要把问题只写在 reasoning_content、分析过程或其他非 content 字段里。severity 必须固定为 \"error\"。只能使用 diff 新增行的行号。如果没有确定的错误，返回 {{\"findings\":[]}}。{truncated_note}\n\n{diff_text}",
     );
     (prompt, diff_payload_bytes, truncated)
+}
+
+fn serialize_review_request_body(config: &AiReviewConfig, prompt: &str) -> AppResult<Vec<u8>> {
+    let request = OpenAiChatRequest {
+        model: &config.model,
+        temperature: 0.2,
+        response_format: ResponseFormat {
+            response_type: "json_object",
+        },
+        messages: vec![
+            ChatMessage {
+                role: "system",
+                content: SYSTEM_PROMPT,
+            },
+            ChatMessage {
+                role: "user",
+                content: prompt,
+            },
+        ],
+    };
+    Ok(serde_json::to_vec(&request)?)
 }
 
 fn limited_diff_payload(changes: &[GitLabChange], max_bytes: usize) -> (String, bool) {
@@ -305,6 +348,7 @@ fn filter_findings_to_added_lines(
 #[cfg(test)]
 mod tests {
     use crate::{gitlab::GitLabChange, rules::Severity};
+    use serde_json::Value;
 
     use super::*;
 
@@ -427,6 +471,37 @@ mod tests {
 
         assert!(prompt.contains("最终返回的 JSON"));
         assert!(prompt.contains("不要把问题只写在 reasoning_content"));
+    }
+
+    #[test]
+    fn serializes_review_request_body_with_prompt() {
+        let config = AiReviewConfig {
+            auto_enabled: true,
+            id: "ai-review".into(),
+            title: "AI Review".into(),
+            base_url: "https://ai.example.com".into(),
+            api_key: "test-key".into(),
+            model: "test-model".into(),
+            timeout_seconds: 60,
+            max_diff_bytes: 60_000,
+            when_changed: vec![],
+        };
+        let changes = vec![GitLabChange {
+            old_path: "src/lib.rs".into(),
+            new_path: "src/lib.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "@@ -1 +1 @@\n+panic!();\n".into(),
+        }];
+
+        let (prompt, _, _) = build_review_prompt(&config, &changes);
+        let body = serialize_review_request_body(&config, &prompt).unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["model"], "test-model");
+        assert_eq!(json["messages"][1]["content"], prompt);
+        assert_eq!(json["response_format"]["type"], "json_object");
     }
 
     #[test]
