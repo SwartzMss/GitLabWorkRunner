@@ -7,12 +7,14 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 use tracing::{info, warn};
 
 const AI_RESPONSE_PREVIEW_CHARS: usize = 1000;
 const AI_HTTP_ATTEMPTS: usize = 2;
+static AI_HTTP_CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
 
 pub async fn run_ai_review(
     config: &AiReviewConfig,
@@ -29,6 +31,7 @@ pub async fn run_ai_review(
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
     let request_timeout_seconds = (config.timeout_seconds.max(1).div_ceil(2)).max(1);
     let request_timeout = Duration::from_secs(request_timeout_seconds);
+    let client = shared_ai_http_client()?;
     info!(
         ai_review_id = %config.id,
         model = %config.model,
@@ -57,14 +60,7 @@ pub async fn run_ai_review(
 
         match tokio::time::timeout(
             request_timeout,
-            perform_ai_review_http_attempt(
-                config,
-                &url,
-                api_key,
-                request_body,
-                attempt,
-                request_timeout_seconds,
-            ),
+            perform_ai_review_http_attempt(client, config, &url, api_key, request_body, attempt),
         )
         .await
         {
@@ -244,17 +240,15 @@ struct AiReviewHttpResponse {
 }
 
 async fn perform_ai_review_http_attempt(
+    client: &reqwest::Client,
     config: &AiReviewConfig,
     url: &str,
     api_key: &str,
     request_body: Vec<u8>,
     attempt: usize,
-    request_timeout_seconds: u64,
 ) -> AppResult<AiReviewHttpResponse> {
     let started = Instant::now();
-    let response = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(request_timeout_seconds))
-        .build()?
+    let response = match client
         .post(url)
         .bearer_auth(api_key)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -312,6 +306,22 @@ async fn perform_ai_review_http_attempt(
     );
 
     Ok(AiReviewHttpResponse { status, body })
+}
+
+fn shared_ai_http_client() -> AppResult<&'static reqwest::Client> {
+    AI_HTTP_CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .pool_idle_timeout(Duration::from_secs(90))
+                .pool_max_idle_per_host(8)
+                .tcp_keepalive(Some(Duration::from_secs(30)))
+                .tcp_nodelay(true)
+                .build()
+                .map_err(|err| err.to_string())
+        })
+        .as_ref()
+        .map_err(|err| AppError::AiReview(format!("failed to build shared AI HTTP client: {err}")))
 }
 
 fn is_retryable_ai_error(err: &AppError) -> bool {
@@ -628,6 +638,14 @@ mod tests {
         assert_eq!(json["model"], "test-model");
         assert_eq!(json["messages"][1]["content"], prompt);
         assert_eq!(json["response_format"]["type"], "json_object");
+    }
+
+    #[test]
+    fn reuses_shared_ai_http_client() {
+        let client_one = shared_ai_http_client().unwrap() as *const reqwest::Client;
+        let client_two = shared_ai_http_client().unwrap() as *const reqwest::Client;
+
+        assert_eq!(client_one, client_two);
     }
 
     #[tokio::test]
