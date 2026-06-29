@@ -161,7 +161,7 @@ fn build_review_prompt(config: &AiReviewConfig, changes: &[GitLabChange]) -> (St
         ""
     };
     let prompt = format!(
-        "请用中文审查这个 GitLab Merge Request diff。只报告高置信度错误，例如会导致编译失败、运行时错误、数据损坏、安全漏洞或明显错误逻辑的问题。不要报告风格建议、可维护性建议、命名问题、性能微优化或不确定的问题。返回严格 JSON，格式必须是 {{\"findings\":[{{\"path\":\"src/file.rs\",\"line\":123,\"severity\":\"error\",\"title\":\"简短中文标题\",\"message\":\"具体说明为什么这是错误，以及应该如何修复。\"}}]}}。severity 必须固定为 \"error\"。只能使用 diff 新增行的行号。如果没有确定的错误，返回 {{\"findings\":[]}}。{truncated_note}\n\n{diff_text}",
+        "请用中文审查这个 GitLab Merge Request diff。只报告高置信度错误，例如会导致编译失败、运行时错误、数据损坏、安全漏洞或明显错误逻辑的问题。不要报告风格建议、可维护性建议、命名问题、性能微优化或不确定的问题。最终返回的 JSON 是唯一有效输出，格式必须是 {{\"findings\":[{{\"path\":\"src/file.rs\",\"line\":123,\"severity\":\"error\",\"title\":\"简短中文标题\",\"message\":\"具体说明为什么这是错误，以及应该如何修复。\"}}]}}。如果你在推理中发现问题，必须把问题写进最终 JSON 的 findings 数组；不要把问题只写在 reasoning_content、分析过程或其他非 content 字段里。severity 必须固定为 \"error\"。只能使用 diff 新增行的行号。如果没有确定的错误，返回 {{\"findings\":[]}}。{truncated_note}\n\n{diff_text}",
     );
     (prompt, diff_payload_bytes, truncated)
 }
@@ -399,6 +399,34 @@ mod tests {
 
         assert!(truncated);
         assert!(std::str::from_utf8(payload.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn prompt_requires_findings_in_final_json_content() {
+        let config = AiReviewConfig {
+            auto_enabled: true,
+            id: "ai-review".into(),
+            title: "AI Review".into(),
+            base_url: "https://ai.example.com".into(),
+            api_key: "test-key".into(),
+            model: "test-model".into(),
+            timeout_seconds: 60,
+            max_diff_bytes: 60_000,
+            when_changed: vec![],
+        };
+        let changes = vec![GitLabChange {
+            old_path: "src/lib.rs".into(),
+            new_path: "src/lib.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "@@ -1 +1 @@\n+panic!();\n".into(),
+        }];
+
+        let (prompt, _, _) = build_review_prompt(&config, &changes);
+
+        assert!(prompt.contains("最终返回的 JSON"));
+        assert!(prompt.contains("不要把问题只写在 reasoning_content"));
     }
 
     #[test]

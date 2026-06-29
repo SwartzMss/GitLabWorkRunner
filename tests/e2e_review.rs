@@ -696,6 +696,120 @@ when_changed = ["does-not-match/**"]
 }
 
 #[tokio::test]
+async fn manual_note_posts_ai_review_completion_when_no_findings() {
+    let discussion_count = Arc::new(AtomicUsize::new(0));
+    let discussion_count_for_handler = Arc::clone(&discussion_count);
+    let ai_request_count = Arc::new(AtomicUsize::new(0));
+    let ai_request_count_for_handler = Arc::clone(&ai_request_count);
+    let (listener, addr) = bind_test_listener().await;
+    let app = Router::new()
+        .route(
+            "/api/v4/projects/123/merge_requests/45/changes",
+            get(|| async {
+                Json(json!({
+                    "changes": [{
+                        "old_path": "src/lib.rs",
+                        "new_path": "src/lib.rs",
+                        "new_file": false,
+                        "renamed_file": false,
+                        "deleted_file": false,
+                        "diff": "@@ -1 +1 @@\n+pub fn value() {}\n"
+                    }],
+                    "diff_refs": {
+                        "base_sha": "base",
+                        "start_sha": "start",
+                        "head_sha": "manual-ai-clean-head"
+                    }
+                }))
+            }),
+        )
+        .route(
+            "/chat/completions",
+            post(move |body: Bytes| {
+                let ai_request_count = Arc::clone(&ai_request_count_for_handler);
+                async move {
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(body["model"], "manual-test-model");
+                    ai_request_count.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({
+                        "choices": [{
+                            "message": {
+                                "content": serde_json::json!({
+                                    "findings": []
+                                }).to_string()
+                            }
+                        }]
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/api/v4/projects/123/merge_requests/45/discussions",
+            post(move |body: Bytes| {
+                let discussion_count = Arc::clone(&discussion_count_for_handler);
+                async move {
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    assert!(body["body"].as_str().unwrap().contains("AI Review 完成"));
+                    assert!(body["body"]
+                        .as_str()
+                        .unwrap()
+                        .contains("未发现高置信度问题"));
+                    assert!(body["body"]
+                        .as_str()
+                        .unwrap()
+                        .contains("gitlab-work-runner:rule=ai:ai-review:clean"));
+                    assert!(body["position"].is_null());
+                    discussion_count.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::CREATED,
+                        Json(json!({
+                            "id": "discussion-clean",
+                            "notes": [{ "id": 100 }]
+                        })),
+                    )
+                }
+            }),
+        );
+    spawn_server_on(listener, app);
+    let base_url = format!("http://{}", addr);
+
+    let ruleset = Ruleset::from_toml(&format!(
+        r#"
+[[ai_reviews]]
+auto_enabled = false
+id = "ai-review"
+title = "AI Review"
+base_url = "{}"
+api_key = "manual-test-api-key"
+model = "manual-test-model"
+timeout_seconds = 10
+when_changed = ["does-not-match/**"]
+"#,
+        base_url
+    ))
+    .unwrap();
+    let store = StateStore::connect("sqlite::memory:").await.unwrap();
+    store.migrate().await.unwrap();
+    let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset);
+    let event = MergeRequestNoteEvent {
+        project_id: 123,
+        mr_iid: 45,
+        commit_sha: "event123".into(),
+        action: "create".into(),
+        note_id: 988,
+        note: "please run @ai-review".into(),
+    };
+
+    let summary = service.review_merge_request_note(&event).await.unwrap();
+
+    assert_eq!(summary.findings, 0);
+    assert_eq!(summary.comments, 1);
+    assert!(!summary.skipped);
+    assert_eq!(ai_request_count.load(Ordering::SeqCst), 1);
+    assert_eq!(discussion_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn posts_line_comment_when_script_task_finds_issue() {
     let discussion_count = Arc::new(AtomicUsize::new(0));
     let discussion_count_for_handler = Arc::clone(&discussion_count);
