@@ -2,7 +2,7 @@ use crate::{
     ai_review::run_ai_review,
     comments::{build_comment_drafts, CommentDraft},
     diff::parse_unified_diff,
-    error::AppResult,
+    error::{AppError, AppResult},
     gitlab::{CreateDiscussionRequest, DiscussionPosition, GitLabChange, GitLabClient},
     rules::{AiReviewConfig, Finding, Ruleset, Severity},
     script_tasks::{ScriptTaskContext, ScriptTaskResult, ScriptTaskRunner, ScriptTaskStatus},
@@ -10,7 +10,7 @@ use crate::{
     webhook::MergeRequestEvent,
     webhook::MergeRequestNoteEvent,
 };
-use std::{collections::BTreeSet, fs};
+use std::{collections::BTreeSet, fs, future::Future, time::Duration};
 use tracing::{info, warn};
 
 pub struct ReviewService {
@@ -391,7 +391,13 @@ impl ReviewService {
                 ai_review_id = %review.id,
                 "AI review started"
             );
-            match run_ai_review(&review, &changes.changes).await {
+            match run_ai_review_with_deadline(
+                &review.id,
+                review.timeout_seconds,
+                run_ai_review(&review, &changes.changes),
+            )
+            .await
+            {
                 Ok(findings) => {
                     let review_findings = findings.len();
                     finding_count += review_findings;
@@ -671,6 +677,23 @@ fn changed_paths(changes: &[GitLabChange]) -> Vec<String> {
     paths
 }
 
+async fn run_ai_review_with_deadline<F>(
+    review_id: &str,
+    timeout_seconds: u64,
+    future: F,
+) -> AppResult<Vec<Finding>>
+where
+    F: Future<Output = AppResult<Vec<Finding>>>,
+{
+    let timeout_seconds = timeout_seconds.max(1);
+    match tokio::time::timeout(Duration::from_secs(timeout_seconds), future).await {
+        Ok(result) => result,
+        Err(_) => Err(AppError::AiReview(format!(
+            "AI review {review_id} timed out after {timeout_seconds} seconds"
+        ))),
+    }
+}
+
 fn manual_script_task_ids(text: &str) -> Vec<String> {
     let mut ids = BTreeSet::new();
     for raw in text.split_whitespace() {
@@ -760,6 +783,8 @@ pub struct ReviewSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::{AppError, AppResult};
+    use std::future;
 
     #[test]
     fn parses_manual_script_task_ids() {
@@ -773,5 +798,21 @@ mod tests {
     fn ignores_non_standalone_manual_script_task_ids() {
         assert!(manual_script_task_ids("please@check-todo-tbd").is_empty());
         assert!(manual_script_task_ids("@").is_empty());
+    }
+
+    #[tokio::test]
+    async fn ai_review_deadline_times_out_pending_review_future() {
+        let result = run_ai_review_with_deadline(
+            "ai-review",
+            1,
+            future::pending::<AppResult<Vec<Finding>>>(),
+        )
+        .await;
+
+        let Err(AppError::AiReview(message)) = result else {
+            panic!("expected AI review timeout error");
+        };
+
+        assert!(message.contains("AI review ai-review timed out after 1 seconds"));
     }
 }
