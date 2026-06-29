@@ -396,13 +396,7 @@ impl ReviewService {
                 ai_review_id = %review.id,
                 "AI review started"
             );
-            match run_ai_review_with_deadline(
-                &review.id,
-                review.timeout_seconds,
-                run_ai_review(&review, &changes.changes),
-            )
-            .await
-            {
+            match run_ai_review_with_optional_clean_second_pass(&review, changes).await {
                 Ok(findings) => {
                     let review_findings = findings.len();
                     summary.successful_reviews += 1;
@@ -745,6 +739,32 @@ where
             "AI review {review_id} timed out after {timeout_seconds} seconds"
         ))),
     }
+}
+
+async fn run_ai_review_with_optional_clean_second_pass(
+    review: &AiReviewConfig,
+    changes: &crate::gitlab::MergeRequestChanges,
+) -> AppResult<Vec<Finding>> {
+    let findings = run_ai_review_with_deadline(
+        &review.id,
+        review.timeout_seconds,
+        run_ai_review(review, &changes.changes),
+    )
+    .await?;
+    if !review.second_pass_on_clean || !findings.is_empty() {
+        return Ok(findings);
+    }
+
+    info!(
+        ai_review_id = %review.id,
+        "AI review first pass was clean; running second confirmation pass"
+    );
+    run_ai_review_with_deadline(
+        &review.id,
+        review.timeout_seconds,
+        run_ai_review(review, &changes.changes),
+    )
+    .await
 }
 
 fn manual_script_task_ids(text: &str) -> Vec<String> {

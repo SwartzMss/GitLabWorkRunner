@@ -54,8 +54,18 @@ pub struct AiReviewConfig {
     pub model: String,
     #[serde(default = "default_ai_timeout_seconds")]
     pub timeout_seconds: u64,
+    #[serde(default)]
+    pub request_timeout_seconds: Option<u64>,
     #[serde(default = "default_ai_max_diff_bytes")]
     pub max_diff_bytes: usize,
+    #[serde(default)]
+    pub second_pass_on_clean: bool,
+    #[serde(default)]
+    pub batch_review: bool,
+    #[serde(default = "default_ai_max_batch_diff_bytes")]
+    pub max_batch_diff_bytes: usize,
+    #[serde(default = "default_ai_max_batches")]
+    pub max_batches: usize,
     #[serde(default)]
     pub when_changed: Vec<String>,
 }
@@ -261,6 +271,14 @@ fn default_ai_max_diff_bytes() -> usize {
     60_000
 }
 
+fn default_ai_max_batch_diff_bytes() -> usize {
+    30_000
+}
+
+fn default_ai_max_batches() -> usize {
+    6
+}
+
 fn build_optional_glob_set(patterns: &[String], owner: &str) -> AppResult<Option<GlobSet>> {
     if patterns.is_empty() {
         return Ok(None);
@@ -420,7 +438,41 @@ when_changed = ["src/**"]
         assert_eq!(reviews[0].api_key, "test-api-key");
         assert!(reviews[0].auto_enabled);
         assert_eq!(reviews[0].timeout_seconds, 60);
+        assert_eq!(reviews[0].request_timeout_seconds, None);
         assert_eq!(reviews[0].max_diff_bytes, 60_000);
+        assert!(!reviews[0].second_pass_on_clean);
+        assert!(!reviews[0].batch_review);
+        assert_eq!(reviews[0].max_batch_diff_bytes, 30_000);
+        assert_eq!(reviews[0].max_batches, 6);
+    }
+
+    #[test]
+    fn parses_ai_review_request_timeout_seconds() {
+        let rules = Ruleset::from_toml(
+            r#"
+[[ai_reviews]]
+id = "ai-review"
+title = "AI Review"
+base_url = "https://api.openai.com/v1"
+api_key = "test-api-key"
+model = "gpt-4.1-mini"
+timeout_seconds = 180
+request_timeout_seconds = 90
+batch_review = true
+max_batch_diff_bytes = 30000
+max_batches = 6
+"#,
+        )
+        .unwrap();
+
+        let reviews = rules.ai_reviews_for_changes(&["src/lib.rs".into()]);
+
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].timeout_seconds, 180);
+        assert_eq!(reviews[0].request_timeout_seconds, Some(90));
+        assert!(reviews[0].batch_review);
+        assert_eq!(reviews[0].max_batch_diff_bytes, 30_000);
+        assert_eq!(reviews[0].max_batches, 6);
     }
 
     #[test]

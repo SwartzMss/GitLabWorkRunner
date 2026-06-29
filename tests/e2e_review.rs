@@ -508,6 +508,217 @@ when_changed = ["src/**"]
 }
 
 #[tokio::test]
+async fn runs_second_ai_review_pass_when_first_pass_is_clean() {
+    let discussion_count = Arc::new(AtomicUsize::new(0));
+    let discussion_count_for_handler = Arc::clone(&discussion_count);
+    let ai_request_count = Arc::new(AtomicUsize::new(0));
+    let ai_request_count_for_handler = Arc::clone(&ai_request_count);
+    let (listener, addr) = bind_test_listener().await;
+    let app = Router::new()
+        .route(
+            "/api/v4/projects/123/merge_requests/45/changes",
+            get(|| async {
+                Json(json!({
+                    "changes": [{
+                        "old_path": "src/lib.rs",
+                        "new_path": "src/lib.rs",
+                        "new_file": false,
+                        "renamed_file": false,
+                        "deleted_file": false,
+                        "diff": "@@ -1 +1 @@\n+let value = maybe.unwrap();\n"
+                    }],
+                    "diff_refs": {
+                        "base_sha": "base",
+                        "start_sha": "start",
+                        "head_sha": "second-pass-head"
+                    }
+                }))
+            }),
+        )
+        .route(
+            "/chat/completions",
+            post(move || {
+                let ai_request_count = Arc::clone(&ai_request_count_for_handler);
+                async move {
+                    let attempt = ai_request_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    let findings = if attempt == 1 {
+                        json!([])
+                    } else {
+                        json!([{
+                            "path": "src/lib.rs",
+                            "line": 1,
+                            "severity": "warning",
+                            "title": "Avoid unwrap",
+                            "message": "Handle the None case instead of unwrapping."
+                        }])
+                    };
+                    Json(json!({
+                        "choices": [{
+                            "message": {
+                                "content": serde_json::json!({
+                                    "findings": findings
+                                }).to_string()
+                            }
+                        }]
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/api/v4/projects/123/merge_requests/45/discussions",
+            post(move |body: Bytes| {
+                let discussion_count = Arc::clone(&discussion_count_for_handler);
+                async move {
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    assert!(body["body"].as_str().unwrap().contains("Avoid unwrap"));
+                    assert!(body["body"]
+                        .as_str()
+                        .unwrap()
+                        .contains("gitlab-work-runner:rule=ai:ai-review"));
+                    discussion_count.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::CREATED,
+                        Json(json!({
+                            "id": "discussion-1",
+                            "notes": [{ "id": 99 }]
+                        })),
+                    )
+                }
+            }),
+        );
+    spawn_server_on(listener, app);
+    let base_url = format!("http://{}", addr);
+
+    let ruleset = Ruleset::from_toml(&format!(
+        r#"
+[[ai_reviews]]
+id = "ai-review"
+title = "AI Review"
+base_url = "{}"
+api_key = "test-api-key"
+model = "test-model"
+timeout_seconds = 10
+second_pass_on_clean = true
+when_changed = ["src/**"]
+"#,
+        base_url
+    ))
+    .unwrap();
+    let store = StateStore::connect("sqlite::memory:").await.unwrap();
+    store.migrate().await.unwrap();
+    let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset);
+    let event = MergeRequestEvent {
+        project_id: 123,
+        mr_iid: 45,
+        commit_sha: "event123".into(),
+        action: "update".into(),
+        source_branch: "feature/review".into(),
+        target_branch: "main".into(),
+    };
+
+    let summary = service.review_merge_request(&event).await.unwrap();
+
+    assert_eq!(summary.findings, 1);
+    assert_eq!(summary.comments, 1);
+    assert!(!summary.skipped);
+    assert_eq!(ai_request_count.load(Ordering::SeqCst), 2);
+    assert_eq!(discussion_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn ai_review_batches_large_merge_request_by_file() {
+    let ai_request_count = Arc::new(AtomicUsize::new(0));
+    let ai_request_count_for_handler = Arc::clone(&ai_request_count);
+    let (listener, addr) = bind_test_listener().await;
+    let app = Router::new().route(
+        "/chat/completions",
+        post(move |body: Bytes| {
+            let ai_request_count = Arc::clone(&ai_request_count_for_handler);
+            async move {
+                ai_request_count.fetch_add(1, Ordering::SeqCst);
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                let prompt = body["messages"][1]["content"].as_str().unwrap();
+                let path = if prompt.contains("File: src/a.rs") {
+                    "src/a.rs"
+                } else if prompt.contains("File: src/b.rs") {
+                    "src/b.rs"
+                } else if prompt.contains("File: src/c.rs") {
+                    "src/c.rs"
+                } else {
+                    panic!("batch prompt did not contain expected file path: {prompt}");
+                };
+                Json(json!({
+                    "choices": [{
+                        "message": {
+                            "content": serde_json::json!({
+                                "findings": [{
+                                    "path": path,
+                                    "line": 1,
+                                    "severity": "error",
+                                    "title": "Batch finding",
+                                    "message": "Found in batch."
+                                }]
+                            }).to_string()
+                        }
+                    }]
+                }))
+            }
+        }),
+    );
+    spawn_server_on(listener, app);
+
+    let config = AiReviewConfig {
+        auto_enabled: true,
+        id: "ai-review".into(),
+        title: "AI Review".into(),
+        base_url: format!("http://{}", addr),
+        api_key: "test-api-key".into(),
+        model: "test-model".into(),
+        timeout_seconds: 10,
+        request_timeout_seconds: None,
+        max_diff_bytes: 60_000,
+        second_pass_on_clean: false,
+        batch_review: true,
+        max_batch_diff_bytes: 160,
+        max_batches: 2,
+        when_changed: vec![],
+    };
+    let changes = vec![
+        GitLabChange {
+            old_path: "src/a.rs".into(),
+            new_path: "src/a.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "@@ -1 +1 @@\n+let a = 1;\n".into(),
+        },
+        GitLabChange {
+            old_path: "src/b.rs".into(),
+            new_path: "src/b.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "@@ -1 +1 @@\n+let b = 2;\n".into(),
+        },
+        GitLabChange {
+            old_path: "src/c.rs".into(),
+            new_path: "src/c.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "@@ -1 +1 @@\n+let c = 3;\n".into(),
+        },
+    ];
+
+    let findings = run_ai_review(&config, &changes).await.unwrap();
+
+    assert_eq!(ai_request_count.load(Ordering::SeqCst), 2);
+    assert_eq!(findings.len(), 2);
+    assert_eq!(findings[0].path, "src/a.rs");
+    assert_eq!(findings[1].path, "src/b.rs");
+}
+
+#[tokio::test]
 async fn ai_review_timeout_does_not_block_merge_request_review() {
     let discussion_count = Arc::new(AtomicUsize::new(0));
     let discussion_count_for_handler = Arc::clone(&discussion_count);
@@ -638,7 +849,12 @@ async fn ai_review_timeout_covers_incomplete_response_body() {
         api_key: "test-api-key".into(),
         model: "test-model".into(),
         timeout_seconds: 1,
+        request_timeout_seconds: None,
         max_diff_bytes: 60_000,
+        second_pass_on_clean: false,
+        batch_review: false,
+        max_batch_diff_bytes: 30_000,
+        max_batches: 6,
         when_changed: vec![],
     };
     let changes = vec![GitLabChange {

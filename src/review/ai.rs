@@ -21,6 +21,18 @@ pub async fn run_ai_review(
     config: &AiReviewConfig,
     changes: &[GitLabChange],
 ) -> AppResult<Vec<Finding>> {
+    if config.batch_review {
+        return run_batched_ai_review(config, changes).await;
+    }
+    run_ai_review_single(config, changes, config.max_diff_bytes, None).await
+}
+
+async fn run_ai_review_single(
+    config: &AiReviewConfig,
+    changes: &[GitLabChange],
+    max_diff_bytes: usize,
+    batch: Option<(usize, usize)>,
+) -> AppResult<Vec<Finding>> {
     let api_key = config.api_key.trim();
     if api_key.is_empty() {
         return Err(AppError::AiReview(format!(
@@ -28,21 +40,26 @@ pub async fn run_ai_review(
             config.id
         )));
     }
-    let (prompt, diff_payload_bytes, diff_payload_truncated) = build_review_prompt(config, changes);
+    let (prompt, diff_payload_bytes, diff_payload_truncated) =
+        build_review_prompt_with_limit(config, changes, max_diff_bytes);
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
-    let request_timeout_seconds = (config.timeout_seconds.max(1).div_ceil(2)).max(1);
+    let request_timeout_seconds = effective_request_timeout_seconds(config);
     let request_timeout = Duration::from_secs(request_timeout_seconds);
+    let request_guard_timeout = request_timeout + Duration::from_secs(5);
     let client = shared_ai_http_client()?;
     info!(
         ai_review_id = %config.id,
         model = %config.model,
         timeout_seconds = config.timeout_seconds,
         request_timeout_seconds,
+        request_guard_timeout_seconds = request_guard_timeout.as_secs(),
         max_diff_bytes = config.max_diff_bytes,
         change_count = changes.len(),
         diff_payload_bytes,
         diff_payload_truncated,
         prompt_bytes = prompt.len(),
+        batch_index = batch.map(|(index, _)| index),
+        batch_count = batch.map(|(_, count)| count),
         "calling AI review API"
     );
     let mut last_error = None;
@@ -55,12 +72,15 @@ pub async fn run_ai_review(
             model = %config.model,
             attempt,
             request_timeout_seconds,
+            request_guard_timeout_seconds = request_guard_timeout.as_secs(),
             request_body_bytes,
+            batch_index = batch.map(|(index, _)| index),
+            batch_count = batch.map(|(_, count)| count),
             "sending AI review API request"
         );
 
         match tokio::time::timeout(
-            request_timeout,
+            request_guard_timeout,
             perform_ai_review_http_attempt(
                 client,
                 config,
@@ -141,7 +161,7 @@ pub async fn run_ai_review(
                         model = %config.model,
                         attempt,
                         elapsed_ms = attempt_started.elapsed().as_millis(),
-                        timeout_seconds = request_timeout.as_secs(),
+                        timeout_seconds = request_guard_timeout.as_secs(),
                         "AI review API request timed out, retrying"
                     );
                     last_error = Some(err);
@@ -157,6 +177,40 @@ pub async fn run_ai_review(
             config.id
         ))
     }))
+}
+
+async fn run_batched_ai_review(
+    config: &AiReviewConfig,
+    changes: &[GitLabChange],
+) -> AppResult<Vec<Finding>> {
+    let batches = split_ai_review_batches(
+        changes,
+        config.max_batch_diff_bytes.max(1),
+        config.max_batches.max(1),
+    );
+    info!(
+        ai_review_id = %config.id,
+        model = %config.model,
+        batch_count = batches.len(),
+        max_batch_diff_bytes = config.max_batch_diff_bytes,
+        max_batches = config.max_batches,
+        "AI review batching enabled"
+    );
+
+    let mut all_findings = Vec::new();
+    let batch_count = batches.len();
+    for (index, batch) in batches.iter().enumerate() {
+        let batch_index = index + 1;
+        let mut findings = run_ai_review_single(
+            config,
+            batch,
+            config.max_batch_diff_bytes.max(1),
+            Some((batch_index, batch_count)),
+        )
+        .await?;
+        all_findings.append(&mut findings);
+    }
+    Ok(all_findings)
 }
 
 const SYSTEM_PROMPT: &str = "You are a concise code reviewer. Review only added lines in the provided GitLab merge request diff. Return strict JSON only, with a top-level findings array. Do not include markdown.";
@@ -213,8 +267,17 @@ struct AiFinding {
     message: String,
 }
 
+#[cfg(test)]
 fn build_review_prompt(config: &AiReviewConfig, changes: &[GitLabChange]) -> (String, usize, bool) {
-    let (diff_text, truncated) = limited_diff_payload(changes, config.max_diff_bytes);
+    build_review_prompt_with_limit(config, changes, config.max_diff_bytes)
+}
+
+fn build_review_prompt_with_limit(
+    _config: &AiReviewConfig,
+    changes: &[GitLabChange],
+    max_diff_bytes: usize,
+) -> (String, usize, bool) {
+    let (diff_text, truncated) = limited_diff_payload(changes, max_diff_bytes);
     let diff_payload_bytes = diff_text.len();
     let truncated_note = if truncated {
         "\ndiff 内容因为超过配置的字节限制已被截断。"
@@ -416,6 +479,13 @@ fn shared_ai_http_client() -> AppResult<&'static ureq::Agent> {
         .map_err(|err| AppError::AiReview(format!("failed to build shared AI HTTP client: {err}")))
 }
 
+fn effective_request_timeout_seconds(config: &AiReviewConfig) -> u64 {
+    config
+        .request_timeout_seconds
+        .unwrap_or_else(|| config.timeout_seconds.max(1).div_ceil(2))
+        .max(1)
+}
+
 fn ureq_response_from_result(
     result: Result<ureq::Response, ureq::Error>,
 ) -> AppResult<ureq::Response> {
@@ -445,15 +515,7 @@ fn is_retryable_ai_error(err: &AppError) -> bool {
 fn limited_diff_payload(changes: &[GitLabChange], max_bytes: usize) -> (String, bool) {
     let mut output = String::new();
     for change in changes {
-        output.push_str(&format!(
-            "File: {}\nOld path: {}\nNew file: {}\nRenamed: {}\nDeleted: {}\n```diff\n{}\n```\n\n",
-            change.new_path,
-            change.old_path,
-            change.new_file,
-            change.renamed_file,
-            change.deleted_file,
-            change.diff
-        ));
+        output.push_str(&change_diff_payload(change));
     }
     let limit = max_bytes.max(1);
     if output.len() <= limit {
@@ -464,6 +526,49 @@ fn limited_diff_payload(changes: &[GitLabChange], max_bytes: usize) -> (String, 
         end -= 1;
     }
     (output[..end].to_string(), true)
+}
+
+fn split_ai_review_batches(
+    changes: &[GitLabChange],
+    max_batch_diff_bytes: usize,
+    max_batches: usize,
+) -> Vec<Vec<GitLabChange>> {
+    let max_batch_diff_bytes = max_batch_diff_bytes.max(1);
+    let max_batches = max_batches.max(1);
+    let mut batches = Vec::new();
+    let mut current = Vec::new();
+    let mut current_bytes = 0_usize;
+
+    for change in changes {
+        let change_bytes = change_diff_payload(change).len();
+        if !current.is_empty() && current_bytes + change_bytes > max_batch_diff_bytes {
+            batches.push(current);
+            if batches.len() >= max_batches {
+                return batches;
+            }
+            current = Vec::new();
+            current_bytes = 0;
+        }
+        current.push(change.clone());
+        current_bytes += change_bytes;
+    }
+
+    if !current.is_empty() && batches.len() < max_batches {
+        batches.push(current);
+    }
+    batches
+}
+
+fn change_diff_payload(change: &GitLabChange) -> String {
+    format!(
+        "File: {}\nOld path: {}\nNew file: {}\nRenamed: {}\nDeleted: {}\n```diff\n{}\n```\n\n",
+        change.new_path,
+        change.old_path,
+        change.new_file,
+        change.renamed_file,
+        change.deleted_file,
+        change.diff
+    )
 }
 
 fn parse_openai_response(review_id: &str, title: &str, text: &str) -> AppResult<Vec<Finding>> {
@@ -700,7 +805,12 @@ mod tests {
             api_key: "test-key".into(),
             model: "test-model".into(),
             timeout_seconds: 60,
+            request_timeout_seconds: None,
             max_diff_bytes: 60_000,
+            second_pass_on_clean: false,
+            batch_review: false,
+            max_batch_diff_bytes: 30_000,
+            max_batches: 6,
             when_changed: vec![],
         };
         let changes = vec![GitLabChange {
@@ -728,7 +838,12 @@ mod tests {
             api_key: "test-key".into(),
             model: "test-model".into(),
             timeout_seconds: 60,
+            request_timeout_seconds: None,
             max_diff_bytes: 60_000,
+            second_pass_on_clean: false,
+            batch_review: false,
+            max_batch_diff_bytes: 30_000,
+            max_batches: 6,
             when_changed: vec![],
         };
         let changes = vec![GitLabChange {
@@ -796,7 +911,12 @@ mod tests {
             api_key: "test-key".into(),
             model: "test-model".into(),
             timeout_seconds: 2,
+            request_timeout_seconds: None,
             max_diff_bytes: 60_000,
+            second_pass_on_clean: false,
+            batch_review: false,
+            max_batch_diff_bytes: 30_000,
+            max_batches: 6,
             when_changed: vec![],
         };
         let changes = vec![GitLabChange {
@@ -812,6 +932,54 @@ mod tests {
 
         assert!(findings.is_empty());
         assert_eq!(attempt_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn uses_configured_ai_review_request_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0_u8; 4096];
+            let _ = stream.read(&mut buffer).await.unwrap();
+            sleep(Duration::from_secs(2)).await;
+            let body = b"{\"choices\":[{\"message\":{\"content\":\"{\\\"findings\\\":[]}\"}}]}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+        });
+
+        let config = AiReviewConfig {
+            auto_enabled: true,
+            id: "ai-review".into(),
+            title: "AI Review".into(),
+            base_url: format!("http://{}", addr),
+            api_key: "test-key".into(),
+            model: "test-model".into(),
+            timeout_seconds: 2,
+            request_timeout_seconds: Some(3),
+            max_diff_bytes: 60_000,
+            second_pass_on_clean: false,
+            batch_review: false,
+            max_batch_diff_bytes: 30_000,
+            max_batches: 6,
+            when_changed: vec![],
+        };
+        let changes = vec![GitLabChange {
+            old_path: "src/lib.rs".into(),
+            new_path: "src/lib.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "@@ -1 +1 @@\n+panic!();\n".into(),
+        }];
+
+        let findings = run_ai_review(&config, &changes).await.unwrap();
+
+        assert!(findings.is_empty());
     }
 
     #[test]
