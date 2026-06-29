@@ -170,20 +170,21 @@ title = "AI Review"
 base_url = "https://api.openai.com/v1"
 api_key = "<your-ai-api-key>"
 model = "gpt-4.1-mini"
-timeout_seconds = 60
-request_timeout_seconds = 30
+timeout_seconds = 900
+request_timeout_seconds = 180
 max_diff_bytes = 60000
 second_pass_on_clean = false
-batch_review = false
-max_batch_diff_bytes = 30000
-max_batches = 6
-when_changed = ["**/*.rs", "**/*.toml"]
+batch_review = true
+max_batch_diff_bytes = 15000
+max_batches = 10
+when_changed = ["**/*.rs", "**/*.toml", "**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp"]
 ```
 
 `auto_enabled` 默认是 `true`；设置为 `false` 时不会自动执行，但仍可以通过 MR 评论 `@ai-review` 手动触发。
 `request_timeout_seconds` 是单次 AI API 请求的超时；不配置时默认使用 `timeout_seconds / 2`，用于保留一次失败重试机会。
 `second_pass_on_clean` 默认是 `false`；设置为 `true` 时，第一次 AI Review 没有发现问题会再执行一次确认。
 `batch_review` 默认是 `false`；设置为 `true` 时，会按完整文件 diff 分批调用 AI Review。`max_batch_diff_bytes` 控制单批 diff 字节上限，`max_batches` 控制最多请求批次数。
+上面的示例是面向较大 MR 的推荐配置；代码缺省值仍保持保守，不写 `batch_review` 时不会自动分批，也不会增加额外 AI 请求。
 
 不要把包含真实 `api_key` 的 `rules.toml` 提交到仓库。
 
