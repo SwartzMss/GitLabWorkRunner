@@ -7,8 +7,11 @@ use axum::{
     Json, Router,
 };
 use gitlab_work_runner::{
+    ai_review::run_ai_review,
+    gitlab::GitLabChange,
     gitlab::GitLabClient,
     review::ReviewService,
+    rules::AiReviewConfig,
     rules::Ruleset,
     storage::StateStore,
     webhook::{MergeRequestEvent, MergeRequestNoteEvent},
@@ -21,8 +24,13 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
+    time::Duration,
 };
-use tokio::net::TcpListener;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+    time::sleep,
+};
 use zip::{write::SimpleFileOptions, ZipWriter};
 
 async fn spawn_server(app: Router) -> String {
@@ -418,6 +426,154 @@ when_changed = ["src/**"]
     assert!(!summary.skipped);
     assert_eq!(ai_request_count.load(Ordering::SeqCst), 1);
     assert_eq!(discussion_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn ai_review_timeout_does_not_block_merge_request_review() {
+    let discussion_count = Arc::new(AtomicUsize::new(0));
+    let discussion_count_for_handler = Arc::clone(&discussion_count);
+    let ai_request_count = Arc::new(AtomicUsize::new(0));
+    let ai_request_count_for_handler = Arc::clone(&ai_request_count);
+    let (listener, addr) = bind_test_listener().await;
+    let app = Router::new()
+        .route(
+            "/api/v4/projects/123/merge_requests/45/changes",
+            get(|| async {
+                Json(json!({
+                    "changes": [{
+                        "old_path": "src/lib.rs",
+                        "new_path": "src/lib.rs",
+                        "new_file": false,
+                        "renamed_file": false,
+                        "deleted_file": false,
+                        "diff": "@@ -1 +1 @@\n+let value = maybe.unwrap();\n"
+                    }],
+                    "diff_refs": {
+                        "base_sha": "base",
+                        "start_sha": "start",
+                        "head_sha": "slow-ai-head"
+                    }
+                }))
+            }),
+        )
+        .route(
+            "/chat/completions",
+            post(move || {
+                let ai_request_count = Arc::clone(&ai_request_count_for_handler);
+                async move {
+                    ai_request_count.fetch_add(1, Ordering::SeqCst);
+                    sleep(Duration::from_secs(2)).await;
+                    Json(json!({
+                        "choices": [{
+                            "message": {
+                                "content": serde_json::json!({
+                                    "findings": [{
+                                        "path": "src/lib.rs",
+                                        "line": 1,
+                                        "severity": "error",
+                                        "title": "Late finding",
+                                        "message": "This response should arrive too late."
+                                    }]
+                                }).to_string()
+                            }
+                        }]
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/api/v4/projects/123/merge_requests/45/discussions",
+            post(move || {
+                let discussion_count = Arc::clone(&discussion_count_for_handler);
+                async move {
+                    discussion_count.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::CREATED,
+                        Json(json!({
+                            "id": "discussion-1",
+                            "notes": [{ "id": 99 }]
+                        })),
+                    )
+                }
+            }),
+        );
+    spawn_server_on(listener, app);
+    let base_url = format!("http://{}", addr);
+
+    let ruleset = Ruleset::from_toml(&format!(
+        r#"
+[[ai_reviews]]
+id = "ai-review"
+title = "AI Review"
+base_url = "{}"
+api_key = "test-api-key"
+model = "test-model"
+timeout_seconds = 1
+when_changed = ["src/**"]
+"#,
+        base_url
+    ))
+    .unwrap();
+    let store = StateStore::connect("sqlite::memory:").await.unwrap();
+    store.migrate().await.unwrap();
+    let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset);
+    let event = MergeRequestEvent {
+        project_id: 123,
+        mr_iid: 45,
+        commit_sha: "event123".into(),
+        action: "update".into(),
+        source_branch: "feature/review".into(),
+        target_branch: "main".into(),
+    };
+
+    let summary = service.review_merge_request(&event).await.unwrap();
+
+    assert_eq!(summary.findings, 0);
+    assert_eq!(summary.comments, 0);
+    assert!(!summary.skipped);
+    assert_eq!(ai_request_count.load(Ordering::SeqCst), 1);
+    assert_eq!(discussion_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn ai_review_timeout_covers_incomplete_response_body() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buffer = [0_u8; 4096];
+        let _ = stream.read(&mut buffer).await.unwrap();
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 1000\r\n\r\n{\"choices\":[",
+            )
+            .await
+            .unwrap();
+        sleep(Duration::from_secs(2)).await;
+    });
+    let config = AiReviewConfig {
+        id: "ai-review".into(),
+        title: "AI Review".into(),
+        auto_enabled: true,
+        base_url: format!("http://{}", addr),
+        api_key: "test-api-key".into(),
+        model: "test-model".into(),
+        timeout_seconds: 1,
+        max_diff_bytes: 60_000,
+        when_changed: vec![],
+    };
+    let changes = vec![GitLabChange {
+        old_path: "src/lib.rs".into(),
+        new_path: "src/lib.rs".into(),
+        new_file: false,
+        renamed_file: false,
+        deleted_file: false,
+        diff: "@@ -1 +1 @@\n+let value = maybe.unwrap();\n".into(),
+    }];
+
+    let result = run_ai_review(&config, &changes).await;
+
+    assert!(result.is_err());
 }
 
 #[tokio::test]
