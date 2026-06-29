@@ -12,6 +12,7 @@ use std::{
 use tracing::{info, warn};
 
 const AI_RESPONSE_PREVIEW_CHARS: usize = 1000;
+const AI_HTTP_ATTEMPTS: usize = 2;
 
 pub async fn run_ai_review(
     config: &AiReviewConfig,
@@ -25,99 +26,127 @@ pub async fn run_ai_review(
         )));
     }
     let (prompt, diff_payload_bytes, diff_payload_truncated) = build_review_prompt(config, changes);
-    let request_body = serialize_review_request_body(config, &prompt)?;
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
+    let request_timeout_seconds = (config.timeout_seconds.max(1).div_ceil(2)).max(1);
+    let request_timeout = Duration::from_secs(request_timeout_seconds);
     info!(
         ai_review_id = %config.id,
         model = %config.model,
         timeout_seconds = config.timeout_seconds,
+        request_timeout_seconds,
         max_diff_bytes = config.max_diff_bytes,
         change_count = changes.len(),
         diff_payload_bytes,
         diff_payload_truncated,
         prompt_bytes = prompt.len(),
-        request_body_bytes = request_body.len(),
         "calling AI review API"
     );
-    let started = Instant::now();
-    info!(
-        ai_review_id = %config.id,
-        model = %config.model,
-        request_body_bytes = request_body.len(),
-        "sending AI review API request"
-    );
-    let response = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(config.timeout_seconds.max(1)))
-        .build()?
-        .post(url)
-        .bearer_auth(api_key)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(request_body)
-        .send()
+    let mut last_error = None;
+    for attempt in 1..=AI_HTTP_ATTEMPTS {
+        let request_body = serialize_review_request_body(config, &prompt)?;
+        let attempt_started = Instant::now();
+        let request_body_bytes = request_body.len();
+        info!(
+            ai_review_id = %config.id,
+            model = %config.model,
+            attempt,
+            request_timeout_seconds,
+            request_body_bytes,
+            "sending AI review API request"
+        );
+
+        match tokio::time::timeout(
+            request_timeout,
+            perform_ai_review_http_attempt(
+                config,
+                &url,
+                api_key,
+                request_body,
+                attempt,
+                request_timeout_seconds,
+            ),
+        )
         .await
-    {
-        Ok(response) => response,
-        Err(err) => {
-            warn!(
-                ai_review_id = %config.id,
-                model = %config.model,
-                elapsed_ms = started.elapsed().as_millis(),
-                error = %err,
-                "AI review API request failed before response headers"
-            );
-            return Err(err.into());
+        {
+            Ok(Ok(response)) => {
+                let AiReviewHttpResponse { status, body } = response;
+                let response_body_preview = preview_log_text(&body, AI_RESPONSE_PREVIEW_CHARS);
+                info!(
+                    ai_review_id = %config.id,
+                    model = %config.model,
+                    attempt,
+                    status = status.as_u16(),
+                    elapsed_ms = attempt_started.elapsed().as_millis(),
+                    response_bytes = body.len(),
+                    response_body_preview = %response_body_preview,
+                    "AI review raw response body received"
+                );
+                if !status.is_success() {
+                    return Err(AppError::AiReview(format!(
+                        "AI review API returned HTTP status {}: {}",
+                        status.as_u16(),
+                        response_body_preview
+                    )));
+                }
+                let findings = parse_openai_response(&config.id, &config.title, &body)?;
+                let raw_finding_count = findings.len();
+                let filtered = filter_findings_to_added_lines(changes, findings)?;
+                info!(
+                    ai_review_id = %config.id,
+                    model = %config.model,
+                    attempt,
+                    raw_findings = raw_finding_count,
+                    findings = filtered.len(),
+                    filtered_findings = raw_finding_count.saturating_sub(filtered.len()),
+                    elapsed_ms = attempt_started.elapsed().as_millis(),
+                    "AI review API completed"
+                );
+                return Ok(filtered);
+            }
+            Ok(Err(err)) => {
+                let retryable = attempt < AI_HTTP_ATTEMPTS && is_retryable_ai_error(&err);
+                if retryable {
+                    warn!(
+                        ai_review_id = %config.id,
+                        model = %config.model,
+                        attempt,
+                        elapsed_ms = attempt_started.elapsed().as_millis(),
+                        error = %err,
+                        "AI review API request failed, retrying"
+                    );
+                    last_error = Some(err);
+                    continue;
+                }
+                return Err(err);
+            }
+            Err(_) => {
+                let err = AppError::AiReview(format!(
+                    "AI review {} timed out after {} seconds",
+                    config.id,
+                    request_timeout.as_secs()
+                ));
+                if attempt < AI_HTTP_ATTEMPTS {
+                    warn!(
+                        ai_review_id = %config.id,
+                        model = %config.model,
+                        attempt,
+                        elapsed_ms = attempt_started.elapsed().as_millis(),
+                        timeout_seconds = request_timeout.as_secs(),
+                        "AI review API request timed out, retrying"
+                    );
+                    last_error = Some(err);
+                    continue;
+                }
+                return Err(err);
+            }
         }
-    };
-    let status = response.status();
-    info!(
-        ai_review_id = %config.id,
-        model = %config.model,
-        status = status.as_u16(),
-        elapsed_ms = started.elapsed().as_millis(),
-        "AI review API response headers received"
-    );
-    let body_started = Instant::now();
-    let body = match response.text().await {
-        Ok(body) => body,
-        Err(err) => {
-            warn!(
-                ai_review_id = %config.id,
-                model = %config.model,
-                status = status.as_u16(),
-                elapsed_ms = started.elapsed().as_millis(),
-                error = %err,
-                "AI review API response body read failed"
-            );
-            return Err(err.into());
-        }
-    };
-    let response_body_preview = preview_log_text(&body, AI_RESPONSE_PREVIEW_CHARS);
-    info!(
-        ai_review_id = %config.id,
-        model = %config.model,
-        response_bytes = body.len(),
-        elapsed_ms = body_started.elapsed().as_millis(),
-        response_body_preview = %response_body_preview,
-        "AI review raw response body received"
-    );
-    if !status.is_success() {
-        return Err(AppError::AiReview(format!(
-            "AI review API returned HTTP status {}: {}",
-            status.as_u16(),
-            response_body_preview
-        )));
     }
-    let findings = parse_openai_response(&config.id, &config.title, &body)?;
-    let raw_finding_count = findings.len();
-    let filtered = filter_findings_to_added_lines(changes, findings)?;
-    info!(
-        ai_review_id = %config.id,
-        raw_findings = raw_finding_count,
-        findings = filtered.len(),
-        filtered_findings = raw_finding_count.saturating_sub(filtered.len()),
-        "AI review API completed"
-    );
-    Ok(filtered)
+    Err(last_error.unwrap_or_else(|| {
+        AppError::AiReview(format!(
+            "AI review {} failed without an explicit error",
+            config.id
+        ))
+    }))
 }
 
 const SYSTEM_PROMPT: &str = "You are a concise code reviewer. Review only added lines in the provided GitLab merge request diff. Return strict JSON only, with a top-level findings array. Do not include markdown.";
@@ -207,6 +236,91 @@ fn serialize_review_request_body(config: &AiReviewConfig, prompt: &str) -> AppRe
         ],
     };
     Ok(serde_json::to_vec(&request)?)
+}
+
+struct AiReviewHttpResponse {
+    status: reqwest::StatusCode,
+    body: String,
+}
+
+async fn perform_ai_review_http_attempt(
+    config: &AiReviewConfig,
+    url: &str,
+    api_key: &str,
+    request_body: Vec<u8>,
+    attempt: usize,
+    request_timeout_seconds: u64,
+) -> AppResult<AiReviewHttpResponse> {
+    let started = Instant::now();
+    let response = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(request_timeout_seconds))
+        .build()?
+        .post(url)
+        .bearer_auth(api_key)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(request_body)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            warn!(
+                ai_review_id = %config.id,
+                model = %config.model,
+                attempt,
+                elapsed_ms = started.elapsed().as_millis(),
+                error = %err,
+                "AI review API request failed before response headers"
+            );
+            return Err(err.into());
+        }
+    };
+
+    let status = response.status();
+    info!(
+        ai_review_id = %config.id,
+        model = %config.model,
+        attempt,
+        status = status.as_u16(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "AI review API response headers received"
+    );
+
+    let body_started = Instant::now();
+    let body = match response.text().await {
+        Ok(body) => body,
+        Err(err) => {
+            warn!(
+                ai_review_id = %config.id,
+                model = %config.model,
+                attempt,
+                status = status.as_u16(),
+                elapsed_ms = started.elapsed().as_millis(),
+                error = %err,
+                "AI review API response body read failed"
+            );
+            return Err(err.into());
+        }
+    };
+    info!(
+        ai_review_id = %config.id,
+        model = %config.model,
+        attempt,
+        response_bytes = body.len(),
+        elapsed_ms = body_started.elapsed().as_millis(),
+        "AI review API response body received"
+    );
+
+    Ok(AiReviewHttpResponse { status, body })
+}
+
+fn is_retryable_ai_error(err: &AppError) -> bool {
+    match err {
+        AppError::Reqwest(err) => {
+            err.is_timeout() || err.is_connect() || err.is_request() || err.is_body()
+        }
+        _ => false,
+    }
 }
 
 fn limited_diff_payload(changes: &[GitLabChange], max_bytes: usize) -> (String, bool) {
@@ -349,6 +463,18 @@ fn filter_findings_to_added_lines(
 mod tests {
     use crate::{gitlab::GitLabChange, rules::Severity};
     use serde_json::Value;
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        time::sleep,
+    };
 
     use super::*;
 
@@ -502,6 +628,63 @@ mod tests {
         assert_eq!(json["model"], "test-model");
         assert_eq!(json["messages"][1]["content"], prompt);
         assert_eq!(json["response_format"]["type"], "json_object");
+    }
+
+    #[tokio::test]
+    async fn retries_ai_review_http_timeout_once_before_succeeding() {
+        let attempt_count = Arc::new(AtomicUsize::new(0));
+        let attempt_count_for_server = Arc::clone(&attempt_count);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let attempt_count = Arc::clone(&attempt_count_for_server);
+                tokio::spawn(async move {
+                    let attempt = attempt_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    let mut buffer = [0_u8; 4096];
+                    let _ = stream.read(&mut buffer).await.unwrap();
+                    if attempt == 1 {
+                        sleep(Duration::from_secs(2)).await;
+                        return;
+                    }
+
+                    let body =
+                        b"{\"choices\":[{\"message\":{\"content\":\"{\\\"findings\\\":[]}\"}}]}";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    stream.write_all(body).await.unwrap();
+                });
+            }
+        });
+
+        let config = AiReviewConfig {
+            auto_enabled: true,
+            id: "ai-review".into(),
+            title: "AI Review".into(),
+            base_url: format!("http://{}", addr),
+            api_key: "test-key".into(),
+            model: "test-model".into(),
+            timeout_seconds: 2,
+            max_diff_bytes: 60_000,
+            when_changed: vec![],
+        };
+        let changes = vec![GitLabChange {
+            old_path: "src/lib.rs".into(),
+            new_path: "src/lib.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "@@ -1 +1 @@\n+panic!();\n".into(),
+        }];
+
+        let findings = run_ai_review(&config, &changes).await.unwrap();
+
+        assert!(findings.is_empty());
+        assert_eq!(attempt_count.load(Ordering::SeqCst), 2);
     }
 
     #[test]
