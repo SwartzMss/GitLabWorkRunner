@@ -10,7 +10,7 @@ use std::{
     sync::OnceLock,
     time::{Duration, Instant},
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const AI_RESPONSE_PREVIEW_CHARS: usize = 1000;
 const AI_HTTP_ATTEMPTS: usize = 2;
@@ -82,8 +82,14 @@ pub async fn run_ai_review(
                     status,
                     elapsed_ms = attempt_started.elapsed().as_millis(),
                     response_bytes = body.len(),
-                    response_body_preview = %response_body_preview,
                     "AI review raw response body received"
+                );
+                debug!(
+                    ai_review_id = %config.id,
+                    model = %config.model,
+                    attempt,
+                    response_body_preview = %response_body_preview,
+                    "AI review raw response body preview"
                 );
                 if !(200..300).contains(&status) {
                     return Err(AppError::AiReview(format!(
@@ -260,7 +266,7 @@ async fn perform_ai_review_http_attempt(
     let model = config.model.clone();
     let url = url.to_string();
     let api_key = api_key.to_string();
-    tokio::task::spawn_blocking(move || {
+    let response = tokio::task::spawn_blocking(move || {
         let started = Instant::now();
         let response = match ureq_response_from_result(
             client
@@ -329,7 +335,16 @@ async fn perform_ai_review_http_attempt(
             "AI review {} blocking HTTP task failed: {err}",
             config.id
         ))
-    })?
+    })??;
+    info!(
+        ai_review_id = %config.id,
+        model = %config.model,
+        attempt,
+        status = response.status,
+        response_bytes = response.body.len(),
+        "AI review blocking HTTP task completed"
+    );
+    Ok(response)
 }
 
 fn shared_ai_http_client() -> AppResult<&'static ureq::Agent> {

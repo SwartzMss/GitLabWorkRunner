@@ -35,24 +35,38 @@ async fn main() -> gitlab_work_runner::error::AppResult<()> {
     server::serve(config, store).await
 }
 
-fn init_tracing(
-    logging: &LoggingConfig,
-) -> gitlab_work_runner::error::AppResult<tracing_appender::non_blocking::WorkerGuard> {
-    let (file_writer, guard) =
+fn init_tracing(logging: &LoggingConfig) -> gitlab_work_runner::error::AppResult<TracingGuards> {
+    let (stdout_writer, stdout_guard) = non_blocking_stdout_log_writer();
+    let (file_writer, file_guard) =
         non_blocking_file_log_writer(&logging.file, logging.max_bytes, logging.max_files)?;
 
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_writer(stdout_writer))
         .with(
             tracing_subscriber::fmt::layer()
                 .with_writer(file_writer)
                 .with_ansi(false),
         )
         .init();
-    Ok(guard)
+    Ok(TracingGuards {
+        _stdout_guard: stdout_guard,
+        _file_guard: file_guard,
+    })
+}
+
+struct TracingGuards {
+    _stdout_guard: tracing_appender::non_blocking::WorkerGuard,
+    _file_guard: tracing_appender::non_blocking::WorkerGuard,
+}
+
+fn non_blocking_stdout_log_writer() -> (
+    tracing_appender::non_blocking::NonBlocking,
+    tracing_appender::non_blocking::WorkerGuard,
+) {
+    tracing_appender::non_blocking(io::stdout())
 }
 
 fn non_blocking_file_log_writer(
@@ -280,5 +294,10 @@ mod tests {
         let path = dir.path().join("app.log");
 
         let (_writer, _guard) = non_blocking_file_log_writer(&path, 1024, 1).unwrap();
+    }
+
+    #[test]
+    fn creates_non_blocking_stdout_log_writer() {
+        let (_writer, _guard) = non_blocking_stdout_log_writer();
     }
 }
