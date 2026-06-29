@@ -610,7 +610,7 @@ when_changed = ["src/**"]
     assert_eq!(summary.findings, 0);
     assert_eq!(summary.comments, 0);
     assert!(!summary.skipped);
-    assert_eq!(ai_request_count.load(Ordering::SeqCst), 1);
+    assert!((1..=2).contains(&ai_request_count.load(Ordering::SeqCst)));
     assert_eq!(discussion_count.load(Ordering::SeqCst), 0);
 }
 

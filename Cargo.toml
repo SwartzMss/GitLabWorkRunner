@@ -1,6 +1,6 @@
 [package]
 name = "gitlab-work-runner"
-version = "1.0.7"
+version = "1.0.8"
 edition = "2021"
 rust-version = "1.86"
 license = "MIT"
@@ -22,6 +22,7 @@ tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ureq = { version = "2", features = ["json"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]

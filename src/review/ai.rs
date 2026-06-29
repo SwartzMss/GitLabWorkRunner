@@ -14,7 +14,7 @@ use tracing::{info, warn};
 
 const AI_RESPONSE_PREVIEW_CHARS: usize = 1000;
 const AI_HTTP_ATTEMPTS: usize = 2;
-static AI_HTTP_CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+static AI_HTTP_CLIENT: OnceLock<Result<ureq::Agent, String>> = OnceLock::new();
 
 pub async fn run_ai_review(
     config: &AiReviewConfig,
@@ -60,7 +60,15 @@ pub async fn run_ai_review(
 
         match tokio::time::timeout(
             request_timeout,
-            perform_ai_review_http_attempt(client, config, &url, api_key, request_body, attempt),
+            perform_ai_review_http_attempt(
+                client,
+                config,
+                &url,
+                api_key,
+                request_body,
+                attempt,
+                request_timeout,
+            ),
         )
         .await
         {
@@ -71,17 +79,16 @@ pub async fn run_ai_review(
                     ai_review_id = %config.id,
                     model = %config.model,
                     attempt,
-                    status = status.as_u16(),
+                    status,
                     elapsed_ms = attempt_started.elapsed().as_millis(),
                     response_bytes = body.len(),
                     response_body_preview = %response_body_preview,
                     "AI review raw response body received"
                 );
-                if !status.is_success() {
+                if !(200..300).contains(&status) {
                     return Err(AppError::AiReview(format!(
                         "AI review API returned HTTP status {}: {}",
-                        status.as_u16(),
-                        response_body_preview
+                        status, response_body_preview
                     )));
                 }
                 let findings = parse_openai_response(&config.id, &config.title, &body)?;
@@ -235,99 +242,130 @@ fn serialize_review_request_body(config: &AiReviewConfig, prompt: &str) -> AppRe
 }
 
 struct AiReviewHttpResponse {
-    status: reqwest::StatusCode,
+    status: u16,
     body: String,
 }
 
 async fn perform_ai_review_http_attempt(
-    client: &reqwest::Client,
+    client: &ureq::Agent,
     config: &AiReviewConfig,
     url: &str,
     api_key: &str,
     request_body: Vec<u8>,
     attempt: usize,
+    request_timeout: Duration,
 ) -> AppResult<AiReviewHttpResponse> {
-    let started = Instant::now();
-    let response = match client
-        .post(url)
-        .bearer_auth(api_key)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(request_body)
-        .send()
-        .await
-    {
-        Ok(response) => response,
-        Err(err) => {
-            warn!(
-                ai_review_id = %config.id,
-                model = %config.model,
-                attempt,
-                elapsed_ms = started.elapsed().as_millis(),
-                error = %err,
-                "AI review API request failed before response headers"
-            );
-            return Err(err.into());
-        }
-    };
+    let client = client.clone();
+    let review_id = config.id.clone();
+    let model = config.model.clone();
+    let url = url.to_string();
+    let api_key = api_key.to_string();
+    tokio::task::spawn_blocking(move || {
+        let started = Instant::now();
+        let response = match ureq_response_from_result(
+            client
+                .post(&url)
+                .set("authorization", &format!("Bearer {api_key}"))
+                .set("content-type", "application/json")
+                .timeout(request_timeout)
+                .send_bytes(&request_body),
+        ) {
+            Ok(response) => response,
+            Err(err) => {
+                warn!(
+                    ai_review_id = %review_id,
+                    model = %model,
+                    attempt,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    error = %err,
+                    "AI review blocking API request failed before response headers"
+                );
+                return Err(err);
+            }
+        };
 
-    let status = response.status();
-    info!(
-        ai_review_id = %config.id,
-        model = %config.model,
-        attempt,
-        status = status.as_u16(),
-        elapsed_ms = started.elapsed().as_millis(),
-        "AI review API response headers received"
-    );
+        let status = response.status();
+        info!(
+            ai_review_id = %review_id,
+            model = %model,
+            attempt,
+            status,
+            elapsed_ms = started.elapsed().as_millis(),
+            "AI review blocking API response headers received"
+        );
 
-    let body_started = Instant::now();
-    let body = match response.text().await {
-        Ok(body) => body,
-        Err(err) => {
-            warn!(
-                ai_review_id = %config.id,
-                model = %config.model,
-                attempt,
-                status = status.as_u16(),
-                elapsed_ms = started.elapsed().as_millis(),
-                error = %err,
-                "AI review API response body read failed"
-            );
-            return Err(err.into());
-        }
-    };
-    info!(
-        ai_review_id = %config.id,
-        model = %config.model,
-        attempt,
-        response_bytes = body.len(),
-        elapsed_ms = body_started.elapsed().as_millis(),
-        "AI review API response body received"
-    );
+        let body_started = Instant::now();
+        let body = match response.into_string() {
+            Ok(body) => body,
+            Err(err) => {
+                warn!(
+                    ai_review_id = %review_id,
+                    model = %model,
+                    attempt,
+                    status,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    error = %err,
+                    "AI review blocking API response body read failed"
+                );
+                return Err(AppError::AiReview(format!(
+                    "AI review blocking API response body read failed: {err}"
+                )));
+            }
+        };
+        info!(
+            ai_review_id = %review_id,
+            model = %model,
+            attempt,
+            response_bytes = body.len(),
+            elapsed_ms = body_started.elapsed().as_millis(),
+            "AI review blocking API response body received"
+        );
 
-    Ok(AiReviewHttpResponse { status, body })
+        Ok(AiReviewHttpResponse { status, body })
+    })
+    .await
+    .map_err(|err| {
+        AppError::AiReview(format!(
+            "AI review {} blocking HTTP task failed: {err}",
+            config.id
+        ))
+    })?
 }
 
-fn shared_ai_http_client() -> AppResult<&'static reqwest::Client> {
+fn shared_ai_http_client() -> AppResult<&'static ureq::Agent> {
     AI_HTTP_CLIENT
         .get_or_init(|| {
-            reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(10))
-                .pool_idle_timeout(Duration::from_secs(90))
-                .pool_max_idle_per_host(8)
-                .tcp_keepalive(Some(Duration::from_secs(30)))
-                .tcp_nodelay(true)
-                .build()
-                .map_err(|err| err.to_string())
+            Ok(ureq::AgentBuilder::new()
+                .timeout_connect(Duration::from_secs(10))
+                .timeout_read(Duration::from_secs(120))
+                .timeout_write(Duration::from_secs(120))
+                .build())
         })
         .as_ref()
         .map_err(|err| AppError::AiReview(format!("failed to build shared AI HTTP client: {err}")))
+}
+
+fn ureq_response_from_result(
+    result: Result<ureq::Response, ureq::Error>,
+) -> AppResult<ureq::Response> {
+    match result {
+        Ok(response) => Ok(response),
+        Err(ureq::Error::Status(_, response)) => Ok(response),
+        Err(err) => Err(AppError::AiReview(format!(
+            "AI review blocking API request failed before response headers: {err}"
+        ))),
+    }
 }
 
 fn is_retryable_ai_error(err: &AppError) -> bool {
     match err {
         AppError::Reqwest(err) => {
             err.is_timeout() || err.is_connect() || err.is_request() || err.is_body()
+        }
+        AppError::AiReview(message) => {
+            message.contains("blocking API request failed")
+                || message.contains("blocking API response body read failed")
+                || message.contains("blocking HTTP task failed")
         }
         _ => false,
     }
@@ -642,8 +680,8 @@ mod tests {
 
     #[test]
     fn reuses_shared_ai_http_client() {
-        let client_one = shared_ai_http_client().unwrap() as *const reqwest::Client;
-        let client_two = shared_ai_http_client().unwrap() as *const reqwest::Client;
+        let client_one = shared_ai_http_client().unwrap() as *const ureq::Agent;
+        let client_two = shared_ai_http_client().unwrap() as *const ureq::Agent;
 
         assert_eq!(client_one, client_two);
     }
