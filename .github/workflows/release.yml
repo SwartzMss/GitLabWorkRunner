@@ -68,7 +68,7 @@ jobs:
 
   linux:
     name: Ubuntu x86_64 release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     steps:
       - name: Checkout
@@ -95,6 +95,12 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release --locked
+
+      - name: Show Linux binary glibc requirements
+        run: |
+          ldd --version
+          ldd target/release/gitlab-work-runner
+          readelf -V target/release/gitlab-work-runner | grep -E "Name: (GLIBC|GCC)_" | sort -u
 
       - name: Package release
         run: |
