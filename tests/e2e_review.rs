@@ -1273,6 +1273,8 @@ async fn ai_review_timeout_covers_incomplete_response_body() {
 async fn manual_note_runs_ai_review() {
     let discussion_count = Arc::new(AtomicUsize::new(0));
     let discussion_count_for_handler = Arc::clone(&discussion_count);
+    let emoji_count = Arc::new(AtomicUsize::new(0));
+    let emoji_count_for_handler = Arc::clone(&emoji_count);
     let ai_request_count = Arc::new(AtomicUsize::new(0));
     let ai_request_count_for_handler = Arc::clone(&ai_request_count);
     let (listener, addr) = bind_test_listener().await;
@@ -1295,6 +1297,23 @@ async fn manual_note_runs_ai_review() {
                         "head_sha": "manual-ai-head"
                     }
                 }))
+            }),
+        )
+        .route(
+            "/api/v4/projects/123/merge_requests/45/notes/987/award_emoji",
+            post(move |Query(query): Query<HashMap<String, String>>| {
+                let emoji_count = Arc::clone(&emoji_count_for_handler);
+                async move {
+                    assert_eq!(query.get("name").map(String::as_str), Some("eyes"));
+                    emoji_count.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::CREATED,
+                        Json(json!({
+                            "id": 1,
+                            "name": "eyes"
+                        })),
+                    )
+                }
             }),
         )
         .route(
@@ -1386,6 +1405,7 @@ when_changed = ["does-not-match/**"]
     assert!(!summary.skipped);
     assert_eq!(ai_request_count.load(Ordering::SeqCst), 1);
     assert_eq!(discussion_count.load(Ordering::SeqCst), 1);
+    assert_eq!(emoji_count.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

@@ -26,6 +26,7 @@ pub struct ReviewService {
     gitlab: GitLabClient,
     store: StateStore,
     ruleset: Ruleset,
+    review_run_id: Option<String>,
 }
 
 impl ReviewService {
@@ -34,7 +35,13 @@ impl ReviewService {
             gitlab,
             store,
             ruleset,
+            review_run_id: None,
         }
+    }
+
+    pub fn with_review_run_id(mut self, review_run_id: String) -> Self {
+        self.review_run_id = Some(review_run_id);
+        self
     }
 
     pub async fn review_merge_request(
@@ -248,6 +255,19 @@ impl ReviewService {
             selected_ai_reviews = ai_reviews.len(),
             "manual review started"
         );
+        if let Err(err) = self
+            .gitlab
+            .award_merge_request_note_emoji(event.project_id, event.mr_iid, event.note_id, "eyes")
+            .await
+        {
+            warn!(
+                project_id = event.project_id,
+                mr_iid = event.mr_iid,
+                note_id = event.note_id,
+                error = %err,
+                "failed to award manual review request emoji; continuing review"
+            );
+        }
         info!(
             project_id = event.project_id,
             mr_iid = event.mr_iid,
@@ -804,8 +824,13 @@ impl ReviewService {
             .gitlab
             .repository_archive(event.project_id, archive_sha)
             .await?;
-        let work_dir =
-            ai_review_context_work_dir(event.project_id, event.mr_iid, archive_sha, &review.id)?;
+        let work_dir = ai_review_context_work_dir(
+            event.project_id,
+            event.mr_iid,
+            archive_sha,
+            &review.id,
+            self.review_run_id.as_deref(),
+        )?;
         if work_dir.exists() {
             fs::remove_dir_all(&work_dir)?;
         }
@@ -851,13 +876,17 @@ fn ai_review_context_work_dir(
     mr_iid: i64,
     commit_sha: &str,
     review_id: &str,
+    review_run_id: Option<&str>,
 ) -> AppResult<PathBuf> {
-    let base = Path::new("work")
+    let mut base = Path::new("work")
         .join("ai_review_context")
         .join(project_id.to_string())
         .join(mr_iid.to_string())
         .join(sanitize_work_path_segment(commit_sha))
         .join(sanitize_work_path_segment(review_id));
+    if let Some(review_run_id) = review_run_id {
+        base = base.join(sanitize_work_path_segment(review_run_id));
+    }
     Ok(if base.is_absolute() {
         base
     } else {
@@ -996,6 +1025,14 @@ mod tests {
     fn ignores_non_standalone_manual_script_task_ids() {
         assert!(manual_script_task_ids("please@check-todo-tbd").is_empty());
         assert!(manual_script_task_ids("@").is_empty());
+    }
+
+    #[test]
+    fn ai_review_context_work_dir_includes_review_run_id() {
+        let path = ai_review_context_work_dir(1, 2, "abc123", "ai-review", Some("run/1")).unwrap();
+        let normalized = path.to_string_lossy().replace('\\', "/");
+
+        assert!(normalized.contains("/abc123/ai-review/run_1"));
     }
 
     #[tokio::test]

@@ -16,9 +16,18 @@ use axum::{
     Json, Router,
 };
 use serde_json::json;
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::SocketAddr,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tower_http::trace::TraceLayer;
-use tracing::{error, info, warn};
+use tracing::{error, info, info_span, warn, Instrument};
+
+static REVIEW_RUN_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 struct AppState {
@@ -61,30 +70,50 @@ async fn gitlab_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    info!(bytes = body.len(), "gitlab webhook received");
+    let review_run_id = new_review_run_id();
+    info!(
+        review_run_id = %review_run_id,
+        bytes = body.len(),
+        "gitlab webhook received"
+    );
     let token = headers
         .get("X-Gitlab-Token")
         .and_then(|value| value.to_str().ok());
     if let Err(err) = validate_token(&state.config.server.webhook_secret, token) {
-        warn!(error = %err, "gitlab webhook rejected");
+        warn!(
+            review_run_id = %review_run_id,
+            error = %err,
+            "gitlab webhook rejected"
+        );
         return (StatusCode::UNAUTHORIZED, err.to_string()).into_response();
     }
 
     let event = match parse_gitlab_webhook_event(&body) {
         Ok(Some(event)) => event,
         Ok(None) => {
-            info!("gitlab webhook ignored because it is not a supported event");
+            info!(
+                review_run_id = %review_run_id,
+                "gitlab webhook ignored because it is not a supported event"
+            );
             return StatusCode::ACCEPTED.into_response();
         }
         Err(err) => {
-            warn!(error = %err, "gitlab webhook payload could not be parsed");
+            warn!(
+                review_run_id = %review_run_id,
+                error = %err,
+                "gitlab webhook payload could not be parsed"
+            );
             return (StatusCode::BAD_REQUEST, err.to_string()).into_response();
         }
     };
     let gitlab_token = match state.config.gitlab_token() {
         Ok(token) => token,
         Err(err) => {
-            error!(error = %err, "gitlab token configuration failed");
+            error!(
+                review_run_id = %review_run_id,
+                error = %err,
+                "gitlab token configuration failed"
+            );
             return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
         }
     };
@@ -92,6 +121,7 @@ async fn gitlab_webhook(
         Ok(ruleset) => ruleset,
         Err(err) => {
             error!(
+                review_run_id = %review_run_id,
                 error = %err,
                 rules_file = %state.config.rules.file,
                 "ruleset loading failed"
@@ -100,6 +130,7 @@ async fn gitlab_webhook(
         }
     };
     info!(
+        review_run_id = %review_run_id,
         rules_file = %state.config.rules.file,
         ruleset_hash = %ruleset.hash(),
         line_rules = ruleset.line_rule_count(),
@@ -108,11 +139,13 @@ async fn gitlab_webhook(
         "ruleset loaded"
     );
     let gitlab = GitLabClient::new(state.config.gitlab.base_url.clone(), gitlab_token);
-    let service = ReviewService::new(gitlab, state.store.clone(), ruleset);
+    let service = ReviewService::new(gitlab, state.store.clone(), ruleset)
+        .with_review_run_id(review_run_id.clone());
 
     let response_summary = match &event {
         GitLabWebhookEvent::MergeRequest(event) => {
             info!(
+                review_run_id = %review_run_id,
                 project_id = event.project_id,
                 mr_iid = event.mr_iid,
                 commit_sha = %event.commit_sha,
@@ -122,6 +155,7 @@ async fn gitlab_webhook(
                 "gitlab merge request event parsed"
             );
             WebhookReviewSummary {
+                review_run_id: review_run_id.clone(),
                 project_id: event.project_id,
                 mr_iid: event.mr_iid,
                 commit_sha: event.commit_sha.clone(),
@@ -129,6 +163,7 @@ async fn gitlab_webhook(
         }
         GitLabWebhookEvent::MergeRequestNote(event) => {
             info!(
+                review_run_id = %review_run_id,
                 project_id = event.project_id,
                 mr_iid = event.mr_iid,
                 commit_sha = %event.commit_sha,
@@ -137,6 +172,7 @@ async fn gitlab_webhook(
                 "gitlab merge request note event parsed"
             );
             WebhookReviewSummary {
+                review_run_id: review_run_id.clone(),
                 project_id: event.project_id,
                 mr_iid: event.mr_iid,
                 commit_sha: event.commit_sha.clone(),
@@ -144,8 +180,12 @@ async fn gitlab_webhook(
         }
     };
 
-    tokio::spawn(run_webhook_review(service, event, response_summary.clone()));
+    let review_span = info_span!("review_run", review_run_id = %review_run_id);
+    tokio::spawn(
+        run_webhook_review(service, event, response_summary.clone()).instrument(review_span),
+    );
     info!(
+        review_run_id = %review_run_id,
         project_id = response_summary.project_id,
         mr_iid = response_summary.mr_iid,
         commit_sha = %response_summary.commit_sha,
@@ -154,7 +194,8 @@ async fn gitlab_webhook(
     (
         StatusCode::ACCEPTED,
         Json(json!({
-            "accepted": true
+            "accepted": true,
+            "review_run_id": review_run_id
         })),
     )
         .into_response()
@@ -162,6 +203,7 @@ async fn gitlab_webhook(
 
 #[derive(Clone)]
 struct WebhookReviewSummary {
+    review_run_id: String,
     project_id: i64,
     mr_iid: i64,
     commit_sha: String,
@@ -182,6 +224,7 @@ async fn run_webhook_review(
     match result {
         Ok(summary) => {
             info!(
+                review_run_id = %response_summary.review_run_id,
                 project_id = response_summary.project_id,
                 mr_iid = response_summary.mr_iid,
                 commit_sha = %response_summary.commit_sha,
@@ -193,6 +236,7 @@ async fn run_webhook_review(
         }
         Err(err) => {
             error!(
+                review_run_id = %response_summary.review_run_id,
                 project_id = response_summary.project_id,
                 mr_iid = response_summary.mr_iid,
                 commit_sha = %response_summary.commit_sha,
@@ -203,6 +247,15 @@ async fn run_webhook_review(
     }
 }
 
+fn new_review_run_id() -> String {
+    let sequence = REVIEW_RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    format!("rr-{millis}-{sequence}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,6 +263,7 @@ mod tests {
         app::config::{GitLabConfig, LoggingConfig, RulesConfig, ServerConfig, StorageConfig},
         storage::StateStore,
     };
+    use axum::body::to_bytes;
     use axum::http::HeaderValue;
     use std::time::{Duration, Instant};
     use tempfile::NamedTempFile;
@@ -260,6 +314,10 @@ mod tests {
             .into_response();
 
         assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["accepted"], true);
+        assert!(!body["review_run_id"].as_str().unwrap().is_empty());
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

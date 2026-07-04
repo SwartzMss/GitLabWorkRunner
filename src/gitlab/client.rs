@@ -4,7 +4,7 @@ use std::{
     io::Read,
     time::{Duration, Instant},
 };
-use tracing::{info, warn};
+use tracing::{info, warn, Span};
 
 const GITLAB_API_TIMEOUT_SECONDS: u64 = 30;
 
@@ -330,11 +330,81 @@ impl GitLabClient {
         Ok(created)
     }
 
+    pub async fn award_merge_request_note_emoji(
+        &self,
+        project_id: i64,
+        mr_iid: i64,
+        note_id: i64,
+        name: &str,
+    ) -> AppResult<()> {
+        info!(
+            project_id,
+            mr_iid,
+            note_id,
+            emoji_name = %name,
+            "preparing to award gitlab merge request note emoji"
+        );
+        let url = format!(
+            "{}/api/v4/projects/{}/merge_requests/{}/notes/{}/award_emoji",
+            self.base_url, project_id, mr_iid, note_id
+        );
+        info!(
+            project_id,
+            mr_iid,
+            note_id,
+            emoji_name = %name,
+            request_url = %url,
+            timeout_ms = self.timeout.as_millis(),
+            "awarding gitlab merge request note emoji"
+        );
+        let started = Instant::now();
+        let http = self.http.clone();
+        let token = self.token.clone();
+        let timeout = self.timeout;
+        let name = name.to_string();
+        let request_name = name.clone();
+        let response = self
+            .with_timeout_guard("award gitlab merge request note emoji", move || {
+                let response = http
+                    .post(&url)
+                    .query("name", &request_name)
+                    .timeout(timeout)
+                    .set("PRIVATE-TOKEN", &token)
+                    .call();
+                let response = response_from_ureq_result(response)?;
+                let status = response.status();
+                if status == 409 {
+                    return Ok(status);
+                }
+                let _ = ensure_gitlab_success_response(
+                    response,
+                    "award gitlab merge request note emoji",
+                )?;
+                Ok(status)
+            })
+            .await?;
+        info!(
+            project_id,
+            mr_iid,
+            note_id,
+            emoji_name = %name,
+            status = response,
+            elapsed_ms = started.elapsed().as_millis(),
+            "gitlab merge request note emoji awarded"
+        );
+        Ok(())
+    }
+
     async fn with_timeout_guard<T, F>(&self, operation: &'static str, task: F) -> AppResult<T>
     where
         T: Send + 'static,
         F: FnOnce() -> AppResult<T> + Send + 'static,
     {
+        let span = Span::current();
+        let task = move || {
+            let _entered = span.enter();
+            task()
+        };
         match tokio::time::timeout(self.timeout, tokio::task::spawn_blocking(task)).await {
             Ok(Ok(result)) => result,
             Ok(Err(err)) => Err(AppError::GitLab(format!(
