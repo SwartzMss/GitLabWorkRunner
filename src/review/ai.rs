@@ -94,149 +94,152 @@ async fn run_ai_review_single(
         "calling AI review API"
     );
     let mut last_error = None;
-    for attempt in 1..=AI_HTTP_ATTEMPTS {
-        let mut messages = initial_chat_messages(config, &prompt);
-        let request_body = serialize_review_request_body(config, &messages, use_tool_calls)?;
-        let attempt_started = Instant::now();
-        let request_body_bytes = request_body.len();
-        info!(
-            ai_review_id = %config.id,
-            model = %config.model,
-            attempt,
-            request_timeout_seconds,
-            request_guard_timeout_seconds = request_guard_timeout.as_secs(),
-            request_body_bytes,
-            use_tool_calls,
-            batch_index = batch.map(|(index, _)| index),
-            batch_count = batch.map(|(_, count)| count),
-            "sending AI review API request"
-        );
-
-        match tokio::time::timeout(
-            request_guard_timeout,
-            perform_ai_review_http_attempt(
-                client,
-                config,
-                &url,
-                api_key,
-                request_body,
+    'request_mode: loop {
+        for attempt in 1..=AI_HTTP_ATTEMPTS {
+            let mut messages = initial_chat_messages(config, &prompt);
+            let request_body = serialize_review_request_body(config, &messages, use_tool_calls)?;
+            let attempt_started = Instant::now();
+            let request_body_bytes = request_body.len();
+            info!(
+                ai_review_id = %config.id,
+                model = %config.model,
                 attempt,
-                request_timeout,
-            ),
-        )
-        .await
-        {
-            Ok(Ok(response)) => {
-                let AiReviewHttpResponse { status, body } = response;
-                let response_body_preview = preview_log_text(&body, AI_RESPONSE_PREVIEW_CHARS);
-                info!(
-                    ai_review_id = %config.id,
-                    model = %config.model,
+                request_timeout_seconds,
+                request_guard_timeout_seconds = request_guard_timeout.as_secs(),
+                request_body_bytes,
+                use_tool_calls,
+                batch_index = batch.map(|(index, _)| index),
+                batch_count = batch.map(|(_, count)| count),
+                "sending AI review API request"
+            );
+
+            match tokio::time::timeout(
+                request_guard_timeout,
+                perform_ai_review_http_attempt(
+                    client,
+                    config,
+                    &url,
+                    api_key,
+                    request_body,
                     attempt,
-                    status,
-                    elapsed_ms = attempt_started.elapsed().as_millis(),
-                    response_bytes = body.len(),
-                    "AI review raw response body received"
-                );
-                debug!(
-                    ai_review_id = %config.id,
-                    model = %config.model,
-                    attempt,
-                    response_body_preview = %response_body_preview,
-                    "AI review raw response body preview"
-                );
-                if !(200..300).contains(&status) {
-                    if use_tool_calls && is_tool_call_rejection(status, &response_body_preview) {
+                    request_timeout,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(response)) => {
+                    let AiReviewHttpResponse { status, body } = response;
+                    let response_body_preview = preview_log_text(&body, AI_RESPONSE_PREVIEW_CHARS);
+                    info!(
+                        ai_review_id = %config.id,
+                        model = %config.model,
+                        attempt,
+                        status,
+                        elapsed_ms = attempt_started.elapsed().as_millis(),
+                        response_bytes = body.len(),
+                        "AI review raw response body received"
+                    );
+                    debug!(
+                        ai_review_id = %config.id,
+                        model = %config.model,
+                        attempt,
+                        response_body_preview = %response_body_preview,
+                        "AI review raw response body preview"
+                    );
+                    if !(200..300).contains(&status) {
+                        if use_tool_calls && is_tool_call_rejection(status, &response_body_preview)
+                        {
+                            warn!(
+                                ai_review_id = %config.id,
+                                model = %config.model,
+                                attempt,
+                                status,
+                                "AI review API rejected tool calls, falling back to JSON content"
+                            );
+                            use_tool_calls = false;
+                            last_error = Some(AppError::AiReview(format!(
+                                "AI review API rejected tool calls: {response_body_preview}"
+                            )));
+                            continue 'request_mode;
+                        }
+                        return Err(AppError::AiReview(format!(
+                            "AI review API returned HTTP status {}: {}",
+                            status, response_body_preview
+                        )));
+                    }
+                    let findings = complete_ai_review_response(AiReviewCompletion {
+                        client,
+                        config,
+                        url: &url,
+                        api_key,
+                        messages: &mut messages,
+                        use_tool_calls,
+                        tool_context: &tool_context,
+                        first_body: &body,
+                        attempt,
+                        request_timeout,
+                        request_guard_timeout,
+                    })
+                    .await?;
+                    let raw_finding_count = findings.len();
+                    let filtered = filter_findings_to_added_lines(changes, findings)?;
+                    info!(
+                        ai_review_id = %config.id,
+                        model = %config.model,
+                        attempt,
+                        raw_findings = raw_finding_count,
+                        findings = filtered.len(),
+                        filtered_findings = raw_finding_count.saturating_sub(filtered.len()),
+                        elapsed_ms = attempt_started.elapsed().as_millis(),
+                        "AI review API completed"
+                    );
+                    return Ok(filtered);
+                }
+                Ok(Err(err)) => {
+                    let retryable = attempt < AI_HTTP_ATTEMPTS && is_retryable_ai_error(&err);
+                    if retryable {
                         warn!(
                             ai_review_id = %config.id,
                             model = %config.model,
                             attempt,
-                            status,
-                            "AI review API rejected tool calls, falling back to JSON content"
+                            elapsed_ms = attempt_started.elapsed().as_millis(),
+                            error = %err,
+                            "AI review API request failed, retrying"
                         );
-                        use_tool_calls = false;
-                        last_error = Some(AppError::AiReview(format!(
-                            "AI review API rejected tool calls: {response_body_preview}"
-                        )));
+                        last_error = Some(err);
                         continue;
                     }
-                    return Err(AppError::AiReview(format!(
-                        "AI review API returned HTTP status {}: {}",
-                        status, response_body_preview
-                    )));
+                    return Err(err);
                 }
-                let findings = complete_ai_review_response(AiReviewCompletion {
-                    client,
-                    config,
-                    url: &url,
-                    api_key,
-                    messages: &mut messages,
-                    use_tool_calls,
-                    tool_context: &tool_context,
-                    first_body: &body,
-                    attempt,
-                    request_timeout,
-                    request_guard_timeout,
-                })
-                .await?;
-                let raw_finding_count = findings.len();
-                let filtered = filter_findings_to_added_lines(changes, findings)?;
-                info!(
-                    ai_review_id = %config.id,
-                    model = %config.model,
-                    attempt,
-                    raw_findings = raw_finding_count,
-                    findings = filtered.len(),
-                    filtered_findings = raw_finding_count.saturating_sub(filtered.len()),
-                    elapsed_ms = attempt_started.elapsed().as_millis(),
-                    "AI review API completed"
-                );
-                return Ok(filtered);
-            }
-            Ok(Err(err)) => {
-                let retryable = attempt < AI_HTTP_ATTEMPTS && is_retryable_ai_error(&err);
-                if retryable {
-                    warn!(
-                        ai_review_id = %config.id,
-                        model = %config.model,
-                        attempt,
-                        elapsed_ms = attempt_started.elapsed().as_millis(),
-                        error = %err,
-                        "AI review API request failed, retrying"
-                    );
-                    last_error = Some(err);
-                    continue;
+                Err(_) => {
+                    let err = AppError::AiReview(format!(
+                        "AI review {} timed out after {} seconds",
+                        config.id,
+                        request_timeout.as_secs()
+                    ));
+                    if attempt < AI_HTTP_ATTEMPTS {
+                        warn!(
+                            ai_review_id = %config.id,
+                            model = %config.model,
+                            attempt,
+                            elapsed_ms = attempt_started.elapsed().as_millis(),
+                            timeout_seconds = request_guard_timeout.as_secs(),
+                            "AI review API request timed out, retrying"
+                        );
+                        last_error = Some(err);
+                        continue;
+                    }
+                    return Err(err);
                 }
-                return Err(err);
-            }
-            Err(_) => {
-                let err = AppError::AiReview(format!(
-                    "AI review {} timed out after {} seconds",
-                    config.id,
-                    request_timeout.as_secs()
-                ));
-                if attempt < AI_HTTP_ATTEMPTS {
-                    warn!(
-                        ai_review_id = %config.id,
-                        model = %config.model,
-                        attempt,
-                        elapsed_ms = attempt_started.elapsed().as_millis(),
-                        timeout_seconds = request_guard_timeout.as_secs(),
-                        "AI review API request timed out, retrying"
-                    );
-                    last_error = Some(err);
-                    continue;
-                }
-                return Err(err);
             }
         }
+        return Err(last_error.unwrap_or_else(|| {
+            AppError::AiReview(format!(
+                "AI review {} failed without an explicit error",
+                config.id
+            ))
+        }));
     }
-    Err(last_error.unwrap_or_else(|| {
-        AppError::AiReview(format!(
-            "AI review {} failed without an explicit error",
-            config.id
-        ))
-    }))
 }
 
 async fn run_batched_ai_review(

@@ -797,6 +797,90 @@ async fn ai_review_falls_back_to_json_content_when_tools_are_rejected() {
 }
 
 #[tokio::test]
+async fn ai_review_falls_back_to_json_content_after_retryable_tool_request_failure() {
+    let ai_request_count = Arc::new(AtomicUsize::new(0));
+    let ai_request_count_for_handler = Arc::clone(&ai_request_count);
+    let (listener, addr) = bind_test_listener().await;
+    let app = Router::new().route(
+        "/chat/completions",
+        post(move |body: Bytes| {
+            let ai_request_count = Arc::clone(&ai_request_count_for_handler);
+            async move {
+                let request_index = ai_request_count.fetch_add(1, Ordering::SeqCst) + 1;
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                if request_index == 1 {
+                    assert!(body.get("tools").is_some());
+                    sleep(Duration::from_secs(2)).await;
+                    return (
+                        StatusCode::OK,
+                        Json(json!({
+                            "choices": [{
+                                "message": {
+                                    "content": "{\"findings\":[]}"
+                                }
+                            }]
+                        })),
+                    );
+                }
+                if request_index == 2 {
+                    assert!(body.get("tools").is_some());
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": {
+                                "message": "unknown field: tools"
+                            }
+                        })),
+                    );
+                }
+
+                assert!(body.get("tools").is_none());
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "choices": [{
+                            "message": {
+                                "content": serde_json::json!({
+                                    "findings": [{
+                                        "path": "src/lib.rs",
+                                        "line": 1,
+                                        "severity": "error",
+                                        "title": "Fallback after retry",
+                                        "message": "Parsed from content fallback after retry."
+                                    }]
+                                }).to_string()
+                            }
+                        }]
+                    })),
+                )
+            }
+        }),
+    );
+    spawn_server_on(listener, app);
+
+    let config = AiReviewConfig {
+        base_url: format!("http://{}", addr),
+        timeout_seconds: 2,
+        request_timeout_seconds: Some(1),
+        ..test_ai_review_config(format!("http://{}", addr))
+    };
+    let changes = vec![GitLabChange {
+        old_path: "src/lib.rs".into(),
+        new_path: "src/lib.rs".into(),
+        new_file: false,
+        renamed_file: false,
+        deleted_file: false,
+        diff: "@@ -1 +1 @@\n+panic!();\n".into(),
+    }];
+
+    let findings = run_ai_review(&config, &changes).await.unwrap();
+
+    assert_eq!(ai_request_count.load(Ordering::SeqCst), 3);
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].title, "Fallback after retry");
+}
+
+#[tokio::test]
 async fn ai_review_uses_builtin_read_file_context_tool() {
     let ai_request_count = Arc::new(AtomicUsize::new(0));
     let ai_request_count_for_handler = Arc::clone(&ai_request_count);
