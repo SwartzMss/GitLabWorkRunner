@@ -383,7 +383,7 @@ fn append_timeout_note(path: &Path, timeout: Duration) -> io::Result<()> {
     )
 }
 
-fn extract_zip_archive(bytes: &[u8], destination: &Path) -> AppResult<usize> {
+pub(crate) fn extract_zip_archive(bytes: &[u8], destination: &Path) -> AppResult<usize> {
     let reader = Cursor::new(bytes);
     let mut archive =
         ZipArchive::new(reader).map_err(|err| AppError::ScriptTask(err.to_string()))?;

@@ -1,16 +1,25 @@
 use crate::{
-    ai_review::run_ai_review,
+    ai_review::run_ai_review_with_context,
     comments::{build_comment_drafts, CommentDraft},
     diff::parse_unified_diff,
     error::{AppError, AppResult},
     gitlab::{CreateDiscussionRequest, DiscussionPosition, GitLabChange, GitLabClient},
     rules::{AiReviewConfig, Finding, Ruleset, Severity},
-    script_tasks::{ScriptTaskContext, ScriptTaskResult, ScriptTaskRunner, ScriptTaskStatus},
+    script_tasks::{
+        extract_zip_archive, ScriptTaskContext, ScriptTaskResult, ScriptTaskRunner,
+        ScriptTaskStatus,
+    },
     storage::{ReviewKey, StateStore, StoredComment},
     webhook::MergeRequestEvent,
     webhook::MergeRequestNoteEvent,
 };
-use std::{collections::BTreeSet, fs, future::Future, time::Duration};
+use std::{
+    collections::BTreeSet,
+    fs,
+    future::Future,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 use tracing::{info, warn};
 
 pub struct ReviewService {
@@ -396,7 +405,10 @@ impl ReviewService {
                 ai_review_id = %review.id,
                 "AI review started"
             );
-            match run_ai_review_with_optional_clean_second_pass(&review, changes).await {
+            match self
+                .run_ai_review_with_optional_clean_second_pass(&review, changes, event)
+                .await
+            {
                 Ok(findings) => {
                     let review_findings = findings.len();
                     summary.successful_reviews += 1;
@@ -741,30 +753,134 @@ where
     }
 }
 
-async fn run_ai_review_with_optional_clean_second_pass(
-    review: &AiReviewConfig,
-    changes: &crate::gitlab::MergeRequestChanges,
-) -> AppResult<Vec<Finding>> {
-    let findings = run_ai_review_with_deadline(
-        &review.id,
-        review.timeout_seconds,
-        run_ai_review(review, &changes.changes),
-    )
-    .await?;
-    if !review.second_pass_on_clean || !findings.is_empty() {
-        return Ok(findings);
+impl ReviewService {
+    async fn run_ai_review_with_optional_clean_second_pass(
+        &self,
+        review: &AiReviewConfig,
+        changes: &crate::gitlab::MergeRequestChanges,
+        event: &MergeRequestEvent,
+    ) -> AppResult<Vec<Finding>> {
+        let context = self
+            .prepare_ai_review_context(review, changes, event)
+            .await?;
+        let source_dir = context.as_ref().map(|context| context.source_dir.as_path());
+        let findings = run_ai_review_with_deadline(
+            &review.id,
+            review.timeout_seconds,
+            run_ai_review_with_context(review, &changes.changes, source_dir),
+        )
+        .await?;
+        if !review.second_pass_on_clean || !findings.is_empty() {
+            return Ok(findings);
+        }
+
+        info!(
+            ai_review_id = %review.id,
+            "AI review first pass was clean; running second confirmation pass"
+        );
+        run_ai_review_with_deadline(
+            &review.id,
+            review.timeout_seconds,
+            run_ai_review_with_context(review, &changes.changes, source_dir),
+        )
+        .await
     }
 
-    info!(
-        ai_review_id = %review.id,
-        "AI review first pass was clean; running second confirmation pass"
-    );
-    run_ai_review_with_deadline(
-        &review.id,
-        review.timeout_seconds,
-        run_ai_review(review, &changes.changes),
-    )
-    .await
+    async fn prepare_ai_review_context(
+        &self,
+        review: &AiReviewConfig,
+        changes: &crate::gitlab::MergeRequestChanges,
+        event: &MergeRequestEvent,
+    ) -> AppResult<Option<AiReviewContextWorkDir>> {
+        if !review.context_tools.any_enabled() || review.max_tool_calls == 0 {
+            return Ok(None);
+        }
+        let archive_sha = changes
+            .diff_refs
+            .head_sha
+            .as_deref()
+            .unwrap_or(&event.commit_sha);
+        let archive = self
+            .gitlab
+            .repository_archive(event.project_id, archive_sha)
+            .await?;
+        let work_dir =
+            ai_review_context_work_dir(event.project_id, event.mr_iid, archive_sha, &review.id)?;
+        if work_dir.exists() {
+            fs::remove_dir_all(&work_dir)?;
+        }
+        let source_dir = work_dir.join("source");
+        fs::create_dir_all(&source_dir)?;
+        let extracted_files = extract_zip_archive(&archive, &source_dir)?;
+        info!(
+            project_id = event.project_id,
+            mr_iid = event.mr_iid,
+            commit_sha = archive_sha,
+            ai_review_id = %review.id,
+            archive_bytes = archive.len(),
+            extracted_files,
+            source_dir = %source_dir.display(),
+            "AI review context archive extracted"
+        );
+        Ok(Some(AiReviewContextWorkDir {
+            work_dir,
+            source_dir,
+        }))
+    }
+}
+
+struct AiReviewContextWorkDir {
+    work_dir: PathBuf,
+    source_dir: PathBuf,
+}
+
+impl Drop for AiReviewContextWorkDir {
+    fn drop(&mut self) {
+        if let Err(err) = fs::remove_dir_all(&self.work_dir) {
+            warn!(
+                work_dir = %self.work_dir.display(),
+                error = %err,
+                "failed to remove AI review context work directory"
+            );
+        }
+    }
+}
+
+fn ai_review_context_work_dir(
+    project_id: i64,
+    mr_iid: i64,
+    commit_sha: &str,
+    review_id: &str,
+) -> AppResult<PathBuf> {
+    let base = Path::new("work")
+        .join("ai_review_context")
+        .join(project_id.to_string())
+        .join(mr_iid.to_string())
+        .join(sanitize_work_path_segment(commit_sha))
+        .join(sanitize_work_path_segment(review_id));
+    Ok(if base.is_absolute() {
+        base
+    } else {
+        std::env::current_dir()?.join(base)
+    })
+}
+
+fn sanitize_work_path_segment(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "_".into()
+    } else {
+        sanitized
+    }
 }
 
 fn manual_script_task_ids(text: &str) -> Vec<String> {

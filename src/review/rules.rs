@@ -11,6 +11,8 @@ use std::{fs, path::Path};
 #[derive(Clone, Debug, Deserialize)]
 pub struct RulesFile {
     #[serde(default)]
+    pub ai_review: AiReviewPromptConfig,
+    #[serde(default)]
     pub rules: Vec<RuleConfig>,
     #[serde(default)]
     pub script_tasks: Vec<ScriptTaskConfig>,
@@ -67,7 +69,59 @@ pub struct AiReviewConfig {
     #[serde(default = "default_ai_max_batches")]
     pub max_batches: usize,
     #[serde(default)]
+    pub system_prompt: Option<String>,
+    #[serde(default)]
+    pub extra_instructions: String,
+    #[serde(default = "default_ai_max_tool_calls")]
+    pub max_tool_calls: usize,
+    #[serde(default = "default_ai_max_tool_result_bytes")]
+    pub max_tool_result_bytes: usize,
+    #[serde(default)]
+    pub context_tools: AiReviewContextTools,
+    #[serde(default)]
     pub when_changed: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct AiReviewPromptConfig {
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    #[serde(default)]
+    pub extra_instructions: String,
+    #[serde(default = "default_ai_max_tool_calls")]
+    pub max_tool_calls: usize,
+    #[serde(default = "default_ai_max_tool_result_bytes")]
+    pub max_tool_result_bytes: usize,
+    #[serde(default)]
+    pub context_tools: AiReviewContextTools,
+}
+
+impl Default for AiReviewPromptConfig {
+    fn default() -> Self {
+        Self {
+            system_prompt: None,
+            extra_instructions: String::new(),
+            max_tool_calls: default_ai_max_tool_calls(),
+            max_tool_result_bytes: default_ai_max_tool_result_bytes(),
+            context_tools: AiReviewContextTools::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct AiReviewContextTools {
+    #[serde(default)]
+    pub read_file: bool,
+    #[serde(default)]
+    pub search_code: bool,
+    #[serde(default)]
+    pub list_files: bool,
+}
+
+impl AiReviewContextTools {
+    pub fn any_enabled(&self) -> bool {
+        self.read_file || self.search_code || self.list_files
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -151,7 +205,12 @@ impl Ruleset {
             });
         }
         let mut ai_reviews = Vec::new();
-        for config in parsed.ai_reviews {
+        for mut config in parsed.ai_reviews {
+            config.system_prompt = parsed.ai_review.system_prompt.clone();
+            config.extra_instructions = parsed.ai_review.extra_instructions.clone();
+            config.max_tool_calls = parsed.ai_review.max_tool_calls;
+            config.max_tool_result_bytes = parsed.ai_review.max_tool_result_bytes;
+            config.context_tools = parsed.ai_review.context_tools.clone();
             let changed_matcher =
                 build_optional_glob_set(&config.when_changed, &format!("AI review {}", config.id))?;
             ai_reviews.push(CompiledAiReview {
@@ -277,6 +336,14 @@ fn default_ai_max_batch_diff_bytes() -> usize {
 
 fn default_ai_max_batches() -> usize {
     6
+}
+
+fn default_ai_max_tool_calls() -> usize {
+    30
+}
+
+fn default_ai_max_tool_result_bytes() -> usize {
+    60_000
 }
 
 fn build_optional_glob_set(patterns: &[String], owner: &str) -> AppResult<Option<GlobSet>> {
@@ -444,12 +511,27 @@ when_changed = ["src/**"]
         assert!(!reviews[0].batch_review);
         assert_eq!(reviews[0].max_batch_diff_bytes, 30_000);
         assert_eq!(reviews[0].max_batches, 6);
+        assert_eq!(reviews[0].system_prompt, None);
+        assert!(reviews[0].extra_instructions.is_empty());
+        assert_eq!(reviews[0].max_tool_calls, 30);
+        assert_eq!(reviews[0].max_tool_result_bytes, 60_000);
+        assert_eq!(reviews[0].context_tools, AiReviewContextTools::default());
     }
 
     #[test]
     fn parses_ai_review_request_timeout_seconds() {
         let rules = Ruleset::from_toml(
             r#"
+[ai_review]
+system_prompt = "Custom system prompt"
+extra_instructions = "Focus on C++ lifetime bugs."
+max_tool_calls = 4
+max_tool_result_bytes = 12000
+
+[ai_review.context_tools]
+read_file = true
+search_code = true
+
 [[ai_reviews]]
 id = "ai-review"
 title = "AI Review"
@@ -473,6 +555,16 @@ max_batches = 6
         assert!(reviews[0].batch_review);
         assert_eq!(reviews[0].max_batch_diff_bytes, 30_000);
         assert_eq!(reviews[0].max_batches, 6);
+        assert_eq!(
+            reviews[0].system_prompt.as_deref(),
+            Some("Custom system prompt")
+        );
+        assert_eq!(reviews[0].extra_instructions, "Focus on C++ lifetime bugs.");
+        assert_eq!(reviews[0].max_tool_calls, 4);
+        assert_eq!(reviews[0].max_tool_result_bytes, 12_000);
+        assert!(reviews[0].context_tools.read_file);
+        assert!(reviews[0].context_tools.search_code);
+        assert!(!reviews[0].context_tools.list_files);
     }
 
     #[test]

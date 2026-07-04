@@ -11,8 +11,8 @@ use gitlab_work_runner::{
     gitlab::GitLabChange,
     gitlab::GitLabClient,
     review::ReviewService,
-    rules::AiReviewConfig,
     rules::Ruleset,
+    rules::{AiReviewConfig, AiReviewContextTools},
     storage::StateStore,
     webhook::{MergeRequestEvent, MergeRequestNoteEvent},
 };
@@ -507,6 +507,30 @@ when_changed = ["src/**"]
     assert_eq!(discussion_count.load(Ordering::SeqCst), 1);
 }
 
+fn test_ai_review_config(base_url: String) -> AiReviewConfig {
+    AiReviewConfig {
+        auto_enabled: true,
+        id: "ai-review".into(),
+        title: "AI Review".into(),
+        base_url,
+        api_key: "test-api-key".into(),
+        model: "test-model".into(),
+        timeout_seconds: 10,
+        request_timeout_seconds: None,
+        max_diff_bytes: 60_000,
+        second_pass_on_clean: false,
+        batch_review: false,
+        max_batch_diff_bytes: 30_000,
+        max_batches: 6,
+        system_prompt: None,
+        extra_instructions: String::new(),
+        max_tool_calls: 8,
+        max_tool_result_bytes: 60_000,
+        context_tools: AiReviewContextTools::default(),
+        when_changed: vec![],
+    }
+}
+
 #[tokio::test]
 async fn runs_second_ai_review_pass_when_first_pass_is_clean() {
     let discussion_count = Arc::new(AtomicUsize::new(0));
@@ -668,20 +692,11 @@ async fn ai_review_batches_large_merge_request_by_file() {
     spawn_server_on(listener, app);
 
     let config = AiReviewConfig {
-        auto_enabled: true,
-        id: "ai-review".into(),
-        title: "AI Review".into(),
         base_url: format!("http://{}", addr),
-        api_key: "test-api-key".into(),
-        model: "test-model".into(),
-        timeout_seconds: 10,
-        request_timeout_seconds: None,
-        max_diff_bytes: 60_000,
-        second_pass_on_clean: false,
         batch_review: true,
         max_batch_diff_bytes: 160,
         max_batches: 2,
-        when_changed: vec![],
+        ..test_ai_review_config(format!("http://{}", addr))
     };
     let changes = vec![
         GitLabChange {
@@ -716,6 +731,400 @@ async fn ai_review_batches_large_merge_request_by_file() {
     assert_eq!(findings.len(), 2);
     assert_eq!(findings[0].path, "src/a.rs");
     assert_eq!(findings[1].path, "src/b.rs");
+}
+
+#[tokio::test]
+async fn ai_review_falls_back_to_json_content_when_tools_are_rejected() {
+    let ai_request_count = Arc::new(AtomicUsize::new(0));
+    let ai_request_count_for_handler = Arc::clone(&ai_request_count);
+    let (listener, addr) = bind_test_listener().await;
+    let app = Router::new().route(
+        "/chat/completions",
+        post(move |body: Bytes| {
+            let ai_request_count = Arc::clone(&ai_request_count_for_handler);
+            async move {
+                ai_request_count.fetch_add(1, Ordering::SeqCst);
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                if body.get("tools").is_some() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": {
+                                "message": "unknown field: tools"
+                            }
+                        })),
+                    );
+                }
+
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "choices": [{
+                            "message": {
+                                "content": serde_json::json!({
+                                    "findings": [{
+                                        "path": "src/lib.rs",
+                                        "line": 1,
+                                        "severity": "error",
+                                        "title": "Fallback finding",
+                                        "message": "Parsed from content fallback."
+                                    }]
+                                }).to_string()
+                            }
+                        }]
+                    })),
+                )
+            }
+        }),
+    );
+    spawn_server_on(listener, app);
+
+    let config = test_ai_review_config(format!("http://{}", addr));
+    let changes = vec![GitLabChange {
+        old_path: "src/lib.rs".into(),
+        new_path: "src/lib.rs".into(),
+        new_file: false,
+        renamed_file: false,
+        deleted_file: false,
+        diff: "@@ -1 +1 @@\n+panic!();\n".into(),
+    }];
+
+    let findings = run_ai_review(&config, &changes).await.unwrap();
+
+    assert_eq!(ai_request_count.load(Ordering::SeqCst), 2);
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].title, "Fallback finding");
+}
+
+#[tokio::test]
+async fn ai_review_falls_back_to_json_content_after_retryable_tool_request_failure() {
+    let ai_request_count = Arc::new(AtomicUsize::new(0));
+    let ai_request_count_for_handler = Arc::clone(&ai_request_count);
+    let (listener, addr) = bind_test_listener().await;
+    let app = Router::new().route(
+        "/chat/completions",
+        post(move |body: Bytes| {
+            let ai_request_count = Arc::clone(&ai_request_count_for_handler);
+            async move {
+                let request_index = ai_request_count.fetch_add(1, Ordering::SeqCst) + 1;
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                if request_index == 1 {
+                    assert!(body.get("tools").is_some());
+                    sleep(Duration::from_secs(2)).await;
+                    return (
+                        StatusCode::OK,
+                        Json(json!({
+                            "choices": [{
+                                "message": {
+                                    "content": "{\"findings\":[]}"
+                                }
+                            }]
+                        })),
+                    );
+                }
+                if request_index == 2 {
+                    assert!(body.get("tools").is_some());
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": {
+                                "message": "unknown field: tools"
+                            }
+                        })),
+                    );
+                }
+
+                assert!(body.get("tools").is_none());
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "choices": [{
+                            "message": {
+                                "content": serde_json::json!({
+                                    "findings": [{
+                                        "path": "src/lib.rs",
+                                        "line": 1,
+                                        "severity": "error",
+                                        "title": "Fallback after retry",
+                                        "message": "Parsed from content fallback after retry."
+                                    }]
+                                }).to_string()
+                            }
+                        }]
+                    })),
+                )
+            }
+        }),
+    );
+    spawn_server_on(listener, app);
+
+    let config = AiReviewConfig {
+        base_url: format!("http://{}", addr),
+        timeout_seconds: 2,
+        request_timeout_seconds: Some(1),
+        ..test_ai_review_config(format!("http://{}", addr))
+    };
+    let changes = vec![GitLabChange {
+        old_path: "src/lib.rs".into(),
+        new_path: "src/lib.rs".into(),
+        new_file: false,
+        renamed_file: false,
+        deleted_file: false,
+        diff: "@@ -1 +1 @@\n+panic!();\n".into(),
+    }];
+
+    let findings = run_ai_review(&config, &changes).await.unwrap();
+
+    assert_eq!(ai_request_count.load(Ordering::SeqCst), 3);
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].title, "Fallback after retry");
+}
+
+#[tokio::test]
+async fn ai_review_synthesizes_matching_ids_for_empty_context_tool_calls() {
+    let ai_request_count = Arc::new(AtomicUsize::new(0));
+    let ai_request_count_for_handler = Arc::clone(&ai_request_count);
+    let (listener, addr) = bind_test_listener().await;
+    let app = Router::new().route(
+        "/chat/completions",
+        post(move |body: Bytes| {
+            let ai_request_count = Arc::clone(&ai_request_count_for_handler);
+            async move {
+                let request_index = ai_request_count.fetch_add(1, Ordering::SeqCst) + 1;
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                if request_index == 1 {
+                    return Json(json!({
+                        "choices": [{
+                            "message": {
+                                "tool_calls": [{
+                                    "id": "",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "search_code",
+                                        "arguments": "{\"query\":\"panic\"}"
+                                    }
+                                }]
+                            }
+                        }]
+                    }));
+                }
+
+                let messages = body["messages"].as_array().unwrap();
+                let assistant = messages
+                    .iter()
+                    .find(|message| message["role"] == "assistant")
+                    .unwrap();
+                let tool = messages
+                    .iter()
+                    .find(|message| message["role"] == "tool")
+                    .unwrap();
+                let assistant_tool_call_id = assistant["tool_calls"][0]["id"].as_str().unwrap();
+                assert!(!assistant_tool_call_id.is_empty());
+                assert_eq!(tool["tool_call_id"], assistant_tool_call_id);
+
+                Json(json!({
+                    "choices": [{
+                        "message": {
+                            "tool_calls": [{
+                                "id": "submit_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "submit_review_findings",
+                                    "arguments": "{\"findings\":[]}"
+                                }
+                            }]
+                        }
+                    }]
+                }))
+            }
+        }),
+    );
+    spawn_server_on(listener, app);
+
+    let config = AiReviewConfig {
+        base_url: format!("http://{}", addr),
+        context_tools: AiReviewContextTools {
+            read_file: false,
+            search_code: true,
+            list_files: false,
+        },
+        ..test_ai_review_config(format!("http://{}", addr))
+    };
+    let changes = vec![GitLabChange {
+        old_path: "src/lib.rs".into(),
+        new_path: "src/lib.rs".into(),
+        new_file: false,
+        renamed_file: false,
+        deleted_file: false,
+        diff: "@@ -1 +1 @@\n+panic!();\n".into(),
+    }];
+
+    let findings = run_ai_review(&config, &changes).await.unwrap();
+
+    assert!(findings.is_empty());
+    assert_eq!(ai_request_count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn ai_review_uses_builtin_read_file_context_tool() {
+    let ai_request_count = Arc::new(AtomicUsize::new(0));
+    let ai_request_count_for_handler = Arc::clone(&ai_request_count);
+    let discussion_count = Arc::new(AtomicUsize::new(0));
+    let discussion_count_for_handler = Arc::clone(&discussion_count);
+    let archive = Arc::new(test_archive());
+    let archive_for_handler = Arc::clone(&archive);
+    let (listener, addr) = bind_test_listener().await;
+    let app = Router::new()
+        .route(
+            "/api/v4/projects/123/merge_requests/45/changes",
+            get(|| async {
+                Json(json!({
+                    "changes": [{
+                        "old_path": "src/lib.rs",
+                        "new_path": "src/lib.rs",
+                        "new_file": false,
+                        "renamed_file": false,
+                        "deleted_file": false,
+                        "diff": "@@ -1 +1 @@\n+pub fn value() {}\n"
+                    }],
+                    "diff_refs": {
+                        "base_sha": "base",
+                        "start_sha": "start",
+                        "head_sha": "context-head"
+                    }
+                }))
+            }),
+        )
+        .route(
+            "/api/v4/projects/123/repository/archive.zip",
+            get(move |_query: Query<HashMap<String, String>>| {
+                let archive = Arc::clone(&archive_for_handler);
+                async move { archive.as_ref().clone().into_response() }
+            }),
+        )
+        .route(
+            "/chat/completions",
+            post(move |body: Bytes| {
+                let ai_request_count = Arc::clone(&ai_request_count_for_handler);
+                async move {
+                    let attempt = ai_request_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    if attempt == 1 {
+                        let tool_names: Vec<_> = body["tools"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|tool| tool["function"]["name"].as_str().unwrap())
+                            .collect();
+                        assert!(tool_names.contains(&"read_file"));
+                        return Json(json!({
+                            "choices": [{
+                                "message": {
+                                    "content": "",
+                                    "tool_calls": [{
+                                        "id": "call-read-file",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "read_file",
+                                            "arguments": "{\"path\":\"src/lib.rs\"}"
+                                        }
+                                    }]
+                                }
+                            }]
+                        }));
+                    }
+
+                    let tool_message = body["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|message| message["role"] == "tool")
+                        .expect("tool result message");
+                    assert!(tool_message["content"]
+                        .as_str()
+                        .unwrap()
+                        .contains("pub fn value()"));
+                    Json(json!({
+                        "choices": [{
+                            "message": {
+                                "content": "",
+                                "tool_calls": [{
+                                    "id": "call-submit",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "submit_review_findings",
+                                        "arguments": serde_json::json!({
+                                            "findings": [{
+                                                "path": "src/lib.rs",
+                                                "line": 1,
+                                                "severity": "error",
+                                                "title": "Context finding",
+                                                "message": "Finding produced after reading context."
+                                            }]
+                                        }).to_string()
+                                    }
+                                }]
+                            }
+                        }]
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/api/v4/projects/123/merge_requests/45/discussions",
+            post(move || {
+                let discussion_count = Arc::clone(&discussion_count_for_handler);
+                async move {
+                    discussion_count.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::CREATED,
+                        Json(json!({
+                            "id": "discussion-1",
+                            "notes": [{ "id": 99 }]
+                        })),
+                    )
+                }
+            }),
+        );
+    spawn_server_on(listener, app);
+    let base_url = format!("http://{}", addr);
+    let ruleset = Ruleset::from_toml(&format!(
+        r#"
+[ai_review]
+max_tool_calls = 4
+
+[ai_review.context_tools]
+read_file = true
+
+[[ai_reviews]]
+id = "ai-review"
+title = "AI Review"
+base_url = "{}"
+api_key = "test-api-key"
+model = "test-model"
+when_changed = ["src/**"]
+"#,
+        base_url
+    ))
+    .unwrap();
+    let store = StateStore::connect("sqlite::memory:").await.unwrap();
+    store.migrate().await.unwrap();
+    let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset);
+    let event = MergeRequestEvent {
+        project_id: 123,
+        mr_iid: 45,
+        commit_sha: "event123".into(),
+        action: "update".into(),
+        source_branch: "feature/review".into(),
+        target_branch: "main".into(),
+    };
+
+    let summary = service.review_merge_request(&event).await.unwrap();
+
+    assert_eq!(ai_request_count.load(Ordering::SeqCst), 2);
+    assert_eq!(discussion_count.load(Ordering::SeqCst), 1);
+    assert_eq!(summary.findings, 1);
+    assert_eq!(summary.comments, 1);
 }
 
 #[tokio::test]
@@ -842,20 +1251,9 @@ async fn ai_review_timeout_covers_incomplete_response_body() {
         sleep(Duration::from_secs(2)).await;
     });
     let config = AiReviewConfig {
-        id: "ai-review".into(),
-        title: "AI Review".into(),
-        auto_enabled: true,
         base_url: format!("http://{}", addr),
-        api_key: "test-api-key".into(),
-        model: "test-model".into(),
         timeout_seconds: 1,
-        request_timeout_seconds: None,
-        max_diff_bytes: 60_000,
-        second_pass_on_clean: false,
-        batch_review: false,
-        max_batch_diff_bytes: 30_000,
-        max_batches: 6,
-        when_changed: vec![],
+        ..test_ai_review_config(format!("http://{}", addr))
     };
     let changes = vec![GitLabChange {
         old_path: "src/lib.rs".into(),

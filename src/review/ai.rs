@@ -4,27 +4,48 @@ use crate::{
     gitlab::GitLabChange,
     rules::{AiReviewConfig, Finding, Severity},
 };
-use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
-    sync::OnceLock,
-    thread,
+    path::Path,
     time::{Duration, Instant},
 };
 use tracing::{debug, info, warn};
 
+use super::{
+    ai_http::{
+        is_retryable_ai_error, perform_ai_review_http_attempt, shared_ai_http_client,
+        AiReviewHttpResponse,
+    },
+    ai_prompt::{build_review_prompt_with_limit, change_diff_payload, initial_chat_messages},
+    ai_schema::{
+        AiFindingsResponse, ChatMessage, OpenAiChatRequest, OpenAiChatResponse, OpenAiMessage,
+        OpenAiToolCall, ResponseFormat,
+    },
+    ai_tools::{
+        enabled_context_tools, is_context_tool_call, non_empty_tool_call_id, review_findings_tool,
+        AiReviewToolContext,
+    },
+};
+
 const AI_RESPONSE_PREVIEW_CHARS: usize = 1000;
 const AI_HTTP_ATTEMPTS: usize = 2;
-static AI_HTTP_CLIENT: OnceLock<Result<ureq::Agent, String>> = OnceLock::new();
 
 pub async fn run_ai_review(
     config: &AiReviewConfig,
     changes: &[GitLabChange],
 ) -> AppResult<Vec<Finding>> {
+    run_ai_review_with_context(config, changes, None).await
+}
+
+pub async fn run_ai_review_with_context(
+    config: &AiReviewConfig,
+    changes: &[GitLabChange],
+    source_dir: Option<&Path>,
+) -> AppResult<Vec<Finding>> {
     if config.batch_review {
-        return run_batched_ai_review(config, changes).await;
+        return run_batched_ai_review(config, changes, source_dir).await;
     }
-    run_ai_review_single(config, changes, config.max_diff_bytes, None).await
+    run_ai_review_single(config, changes, config.max_diff_bytes, None, source_dir).await
 }
 
 async fn run_ai_review_single(
@@ -32,6 +53,7 @@ async fn run_ai_review_single(
     changes: &[GitLabChange],
     max_diff_bytes: usize,
     batch: Option<(usize, usize)>,
+    source_dir: Option<&Path>,
 ) -> AppResult<Vec<Finding>> {
     let api_key = config.api_key.trim();
     if api_key.is_empty() {
@@ -47,6 +69,10 @@ async fn run_ai_review_single(
     let request_timeout = Duration::from_secs(request_timeout_seconds);
     let request_guard_timeout = request_timeout + Duration::from_secs(5);
     let client = shared_ai_http_client()?;
+    let mut use_tool_calls = true;
+    let tool_context = AiReviewToolContext::new(config, source_dir);
+    let context_tools_enabled = tool_context.enabled();
+    let context_tool_names = tool_context.enabled_tool_names();
     info!(
         ai_review_id = %config.id,
         model = %config.model,
@@ -58,130 +84,168 @@ async fn run_ai_review_single(
         diff_payload_bytes,
         diff_payload_truncated,
         prompt_bytes = prompt.len(),
+        context_tools_enabled,
+        context_tool_names = %context_tool_names,
+        context_source_available = tool_context.source_available(),
+        max_tool_calls = config.max_tool_calls,
+        max_tool_result_bytes = config.max_tool_result_bytes,
         batch_index = batch.map(|(index, _)| index),
         batch_count = batch.map(|(_, count)| count),
         "calling AI review API"
     );
     let mut last_error = None;
-    for attempt in 1..=AI_HTTP_ATTEMPTS {
-        let request_body = serialize_review_request_body(config, &prompt)?;
-        let attempt_started = Instant::now();
-        let request_body_bytes = request_body.len();
-        info!(
-            ai_review_id = %config.id,
-            model = %config.model,
-            attempt,
-            request_timeout_seconds,
-            request_guard_timeout_seconds = request_guard_timeout.as_secs(),
-            request_body_bytes,
-            batch_index = batch.map(|(index, _)| index),
-            batch_count = batch.map(|(_, count)| count),
-            "sending AI review API request"
-        );
-
-        match tokio::time::timeout(
-            request_guard_timeout,
-            perform_ai_review_http_attempt(
-                client,
-                config,
-                &url,
-                api_key,
-                request_body,
+    'request_mode: loop {
+        for attempt in 1..=AI_HTTP_ATTEMPTS {
+            let mut messages = initial_chat_messages(config, &prompt);
+            let request_body = serialize_review_request_body(config, &messages, use_tool_calls)?;
+            let attempt_started = Instant::now();
+            let request_body_bytes = request_body.len();
+            info!(
+                ai_review_id = %config.id,
+                model = %config.model,
                 attempt,
-                request_timeout,
-            ),
-        )
-        .await
-        {
-            Ok(Ok(response)) => {
-                let AiReviewHttpResponse { status, body } = response;
-                let response_body_preview = preview_log_text(&body, AI_RESPONSE_PREVIEW_CHARS);
-                info!(
-                    ai_review_id = %config.id,
-                    model = %config.model,
+                request_timeout_seconds,
+                request_guard_timeout_seconds = request_guard_timeout.as_secs(),
+                request_body_bytes,
+                use_tool_calls,
+                batch_index = batch.map(|(index, _)| index),
+                batch_count = batch.map(|(_, count)| count),
+                "sending AI review API request"
+            );
+
+            match tokio::time::timeout(
+                request_guard_timeout,
+                perform_ai_review_http_attempt(
+                    client,
+                    config,
+                    &url,
+                    api_key,
+                    request_body,
                     attempt,
-                    status,
-                    elapsed_ms = attempt_started.elapsed().as_millis(),
-                    response_bytes = body.len(),
-                    "AI review raw response body received"
-                );
-                debug!(
-                    ai_review_id = %config.id,
-                    model = %config.model,
-                    attempt,
-                    response_body_preview = %response_body_preview,
-                    "AI review raw response body preview"
-                );
-                if !(200..300).contains(&status) {
-                    return Err(AppError::AiReview(format!(
-                        "AI review API returned HTTP status {}: {}",
-                        status, response_body_preview
-                    )));
-                }
-                let findings = parse_openai_response(&config.id, &config.title, &body)?;
-                let raw_finding_count = findings.len();
-                let filtered = filter_findings_to_added_lines(changes, findings)?;
-                info!(
-                    ai_review_id = %config.id,
-                    model = %config.model,
-                    attempt,
-                    raw_findings = raw_finding_count,
-                    findings = filtered.len(),
-                    filtered_findings = raw_finding_count.saturating_sub(filtered.len()),
-                    elapsed_ms = attempt_started.elapsed().as_millis(),
-                    "AI review API completed"
-                );
-                return Ok(filtered);
-            }
-            Ok(Err(err)) => {
-                let retryable = attempt < AI_HTTP_ATTEMPTS && is_retryable_ai_error(&err);
-                if retryable {
-                    warn!(
+                    request_timeout,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(response)) => {
+                    let AiReviewHttpResponse { status, body } = response;
+                    let response_body_preview = preview_log_text(&body, AI_RESPONSE_PREVIEW_CHARS);
+                    info!(
                         ai_review_id = %config.id,
                         model = %config.model,
                         attempt,
+                        status,
                         elapsed_ms = attempt_started.elapsed().as_millis(),
-                        error = %err,
-                        "AI review API request failed, retrying"
+                        response_bytes = body.len(),
+                        "AI review raw response body received"
                     );
-                    last_error = Some(err);
-                    continue;
-                }
-                return Err(err);
-            }
-            Err(_) => {
-                let err = AppError::AiReview(format!(
-                    "AI review {} timed out after {} seconds",
-                    config.id,
-                    request_timeout.as_secs()
-                ));
-                if attempt < AI_HTTP_ATTEMPTS {
-                    warn!(
+                    debug!(
                         ai_review_id = %config.id,
                         model = %config.model,
                         attempt,
-                        elapsed_ms = attempt_started.elapsed().as_millis(),
-                        timeout_seconds = request_guard_timeout.as_secs(),
-                        "AI review API request timed out, retrying"
+                        response_body_preview = %response_body_preview,
+                        "AI review raw response body preview"
                     );
-                    last_error = Some(err);
-                    continue;
+                    if !(200..300).contains(&status) {
+                        if use_tool_calls && is_tool_call_rejection(status, &response_body_preview)
+                        {
+                            warn!(
+                                ai_review_id = %config.id,
+                                model = %config.model,
+                                attempt,
+                                status,
+                                "AI review API rejected tool calls, falling back to JSON content"
+                            );
+                            use_tool_calls = false;
+                            last_error = Some(AppError::AiReview(format!(
+                                "AI review API rejected tool calls: {response_body_preview}"
+                            )));
+                            continue 'request_mode;
+                        }
+                        return Err(AppError::AiReview(format!(
+                            "AI review API returned HTTP status {}: {}",
+                            status, response_body_preview
+                        )));
+                    }
+                    let findings = complete_ai_review_response(AiReviewCompletion {
+                        client,
+                        config,
+                        url: &url,
+                        api_key,
+                        messages: &mut messages,
+                        use_tool_calls,
+                        tool_context: &tool_context,
+                        first_body: &body,
+                        attempt,
+                        request_timeout,
+                        request_guard_timeout,
+                    })
+                    .await?;
+                    let raw_finding_count = findings.len();
+                    let filtered = filter_findings_to_added_lines(changes, findings)?;
+                    info!(
+                        ai_review_id = %config.id,
+                        model = %config.model,
+                        attempt,
+                        raw_findings = raw_finding_count,
+                        findings = filtered.len(),
+                        filtered_findings = raw_finding_count.saturating_sub(filtered.len()),
+                        elapsed_ms = attempt_started.elapsed().as_millis(),
+                        "AI review API completed"
+                    );
+                    return Ok(filtered);
                 }
-                return Err(err);
+                Ok(Err(err)) => {
+                    let retryable = attempt < AI_HTTP_ATTEMPTS && is_retryable_ai_error(&err);
+                    if retryable {
+                        warn!(
+                            ai_review_id = %config.id,
+                            model = %config.model,
+                            attempt,
+                            elapsed_ms = attempt_started.elapsed().as_millis(),
+                            error = %err,
+                            "AI review API request failed, retrying"
+                        );
+                        last_error = Some(err);
+                        continue;
+                    }
+                    return Err(err);
+                }
+                Err(_) => {
+                    let err = AppError::AiReview(format!(
+                        "AI review {} timed out after {} seconds",
+                        config.id,
+                        request_timeout.as_secs()
+                    ));
+                    if attempt < AI_HTTP_ATTEMPTS {
+                        warn!(
+                            ai_review_id = %config.id,
+                            model = %config.model,
+                            attempt,
+                            elapsed_ms = attempt_started.elapsed().as_millis(),
+                            timeout_seconds = request_guard_timeout.as_secs(),
+                            "AI review API request timed out, retrying"
+                        );
+                        last_error = Some(err);
+                        continue;
+                    }
+                    return Err(err);
+                }
             }
         }
+        return Err(last_error.unwrap_or_else(|| {
+            AppError::AiReview(format!(
+                "AI review {} failed without an explicit error",
+                config.id
+            ))
+        }));
     }
-    Err(last_error.unwrap_or_else(|| {
-        AppError::AiReview(format!(
-            "AI review {} failed without an explicit error",
-            config.id
-        ))
-    }))
 }
 
 async fn run_batched_ai_review(
     config: &AiReviewConfig,
     changes: &[GitLabChange],
+    source_dir: Option<&Path>,
 ) -> AppResult<Vec<Finding>> {
     let batches = split_ai_review_batches(
         changes,
@@ -206,6 +270,7 @@ async fn run_batched_ai_review(
             batch,
             config.max_batch_diff_bytes.max(1),
             Some((batch_index, batch_count)),
+            source_dir,
         )
         .await?;
         all_findings.append(&mut findings);
@@ -213,270 +278,244 @@ async fn run_batched_ai_review(
     Ok(all_findings)
 }
 
-const SYSTEM_PROMPT: &str = "You are a concise code reviewer. Review only added lines in the provided GitLab merge request diff. Return strict JSON only, with a top-level findings array. Do not include markdown.";
-
-#[derive(Serialize)]
-struct OpenAiChatRequest<'a> {
-    model: &'a str,
-    temperature: f32,
-    response_format: ResponseFormat<'a>,
-    messages: Vec<ChatMessage<'a>>,
-}
-
-#[derive(Serialize)]
-struct ResponseFormat<'a> {
-    #[serde(rename = "type")]
-    response_type: &'a str,
-}
-
-#[derive(Serialize)]
-struct ChatMessage<'a> {
-    role: &'a str,
-    content: &'a str,
-}
-
-#[derive(Deserialize)]
-struct OpenAiChatResponse {
-    choices: Vec<OpenAiChoice>,
-}
-
-#[derive(Deserialize)]
-struct OpenAiChoice {
-    message: OpenAiMessage,
-}
-
-#[derive(Deserialize)]
-struct OpenAiMessage {
-    content: String,
-}
-
-#[derive(Deserialize)]
-struct AiFindingsResponse {
-    #[serde(default)]
-    findings: Vec<AiFinding>,
-}
-
-#[derive(Deserialize)]
-struct AiFinding {
-    path: String,
-    line: u32,
-    #[serde(default)]
-    severity: String,
-    #[serde(default)]
-    title: String,
-    message: String,
-}
-
-#[cfg(test)]
-fn build_review_prompt(config: &AiReviewConfig, changes: &[GitLabChange]) -> (String, usize, bool) {
-    build_review_prompt_with_limit(config, changes, config.max_diff_bytes)
-}
-
-fn build_review_prompt_with_limit(
-    _config: &AiReviewConfig,
-    changes: &[GitLabChange],
-    max_diff_bytes: usize,
-) -> (String, usize, bool) {
-    let (diff_text, truncated) = limited_diff_payload(changes, max_diff_bytes);
-    let diff_payload_bytes = diff_text.len();
-    let truncated_note = if truncated {
-        "\ndiff 内容因为超过配置的字节限制已被截断。"
+fn serialize_review_request_body(
+    config: &AiReviewConfig,
+    messages: &[ChatMessage],
+    use_tool_calls: bool,
+) -> AppResult<Vec<u8>> {
+    let (response_format, tools, tool_choice) = if use_tool_calls {
+        let mut tools = enabled_context_tools(config);
+        tools.push(review_findings_tool());
+        (None, Some(tools), None)
     } else {
-        ""
+        (
+            Some(ResponseFormat {
+                response_type: "json_object",
+            }),
+            None,
+            None,
+        )
     };
-    let prompt = format!(
-        "请用中文审查这个 GitLab Merge Request diff。只报告高置信度错误，例如会导致编译失败、运行时错误、数据损坏、安全漏洞或明显错误逻辑的问题。不要报告风格建议、可维护性建议、命名问题、性能微优化或不确定的问题。最终返回的 JSON 是唯一有效输出，格式必须是 {{\"findings\":[{{\"path\":\"src/file.rs\",\"line\":123,\"severity\":\"error\",\"title\":\"简短中文标题\",\"message\":\"具体说明为什么这是错误，以及应该如何修复。\"}}]}}。如果你在推理中发现问题，必须把问题写进最终 JSON 的 findings 数组；不要把问题只写在 reasoning_content、分析过程或其他非 content 字段里。severity 必须固定为 \"error\"。只能使用 diff 新增行的行号。如果没有确定的错误，返回 {{\"findings\":[]}}。{truncated_note}\n\n{diff_text}",
-    );
-    (prompt, diff_payload_bytes, truncated)
-}
-
-fn serialize_review_request_body(config: &AiReviewConfig, prompt: &str) -> AppResult<Vec<u8>> {
     let request = OpenAiChatRequest {
         model: &config.model,
         temperature: 0.2,
-        response_format: ResponseFormat {
-            response_type: "json_object",
-        },
-        messages: vec![
-            ChatMessage {
-                role: "system",
-                content: SYSTEM_PROMPT,
-            },
-            ChatMessage {
-                role: "user",
-                content: prompt,
-            },
-        ],
+        response_format,
+        tools,
+        tool_choice,
+        messages,
     };
     Ok(serde_json::to_vec(&request)?)
 }
 
-struct AiReviewHttpResponse {
-    status: u16,
-    body: String,
+fn is_tool_call_rejection(status: u16, body: &str) -> bool {
+    if status != 400 && status != 422 {
+        return false;
+    }
+    let normalized = body.to_ascii_lowercase();
+    normalized.contains("tool")
+        || normalized.contains("tools")
+        || normalized.contains("tool_choice")
+        || normalized.contains("function")
 }
 
-async fn perform_ai_review_http_attempt(
-    client: &ureq::Agent,
-    config: &AiReviewConfig,
-    url: &str,
-    api_key: &str,
-    request_body: Vec<u8>,
+struct AiReviewCompletion<'a> {
+    client: &'a ureq::Agent,
+    config: &'a AiReviewConfig,
+    url: &'a str,
+    api_key: &'a str,
+    messages: &'a mut Vec<ChatMessage>,
+    use_tool_calls: bool,
+    tool_context: &'a AiReviewToolContext,
+    first_body: &'a str,
     attempt: usize,
     request_timeout: Duration,
-) -> AppResult<AiReviewHttpResponse> {
-    let client = client.clone();
-    let review_id = config.id.clone();
-    let model = config.model.clone();
-    let worker_review_id = review_id.clone();
-    let worker_model = model.clone();
-    let url = url.to_string();
-    let api_key = api_key.to_string();
-    let (sender, receiver) = tokio::sync::oneshot::channel();
-    thread::Builder::new()
-        .name(format!("ai-review-http-{attempt}"))
-        .spawn(move || {
-            let result = perform_ai_review_http_attempt_blocking(AiReviewHttpAttempt {
+    request_guard_timeout: Duration,
+}
+
+async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResult<Vec<Finding>> {
+    let AiReviewCompletion {
+        client,
+        config,
+        url,
+        api_key,
+        messages,
+        use_tool_calls,
+        tool_context,
+        first_body,
+        attempt,
+        request_timeout,
+        request_guard_timeout,
+    } = context;
+    let mut body = first_body.to_string();
+    let mut tool_calls_used = 0_usize;
+    let mut tool_call_limit_notice_sent = false;
+    loop {
+        let response: OpenAiChatResponse = serde_json::from_str(&body)?;
+        let message = response
+            .choices
+            .first()
+            .map(|choice| &choice.message)
+            .ok_or_else(|| AppError::AiReview("AI review API returned no choices".into()))?;
+        if has_submit_review_findings(message) || !use_tool_calls {
+            return parse_openai_message(&config.id, &config.title, message);
+        }
+
+        let context_tool_calls: Vec<OpenAiToolCall> = message
+            .tool_calls
+            .iter()
+            .filter(|tool_call| is_context_tool_call(tool_call))
+            .cloned()
+            .collect();
+        if context_tool_calls.is_empty() {
+            return parse_openai_message(&config.id, &config.title, message);
+        }
+        let tool_call_names = context_tool_calls
+            .iter()
+            .map(|tool_call| tool_call.function.name.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        info!(
+            ai_review_id = %config.id,
+            model = %config.model,
+            attempt,
+            requested_tool_calls = context_tool_calls.len(),
+            tool_call_names = %tool_call_names,
+            tool_calls_used,
+            max_tool_calls = config.max_tool_calls,
+            "AI review context tool calls requested"
+        );
+        let remaining_tool_calls = config.max_tool_calls.saturating_sub(tool_calls_used);
+        if remaining_tool_calls == 0 && tool_call_limit_notice_sent {
+            warn!(
+                ai_review_id = %config.id,
+                model = %config.model,
+                requested_tool_calls = context_tool_calls.len(),
+                tool_calls_used,
+                max_tool_calls = config.max_tool_calls,
+                "AI review context tool call limit already reported"
+            );
+            return Err(AppError::AiReview(format!(
+                "AI review {} exhausted context tool calls before submitting findings",
+                config.id
+            )));
+        }
+        if context_tool_calls.len() > remaining_tool_calls {
+            warn!(
+                ai_review_id = %config.id,
+                model = %config.model,
+                requested_tool_calls = context_tool_calls.len(),
+                remaining_tool_calls,
+                tool_calls_used,
+                max_tool_calls = config.max_tool_calls,
+                "AI review context tool call limit reached"
+            );
+        }
+        let context_tool_calls = synthesize_context_tool_call_ids(context_tool_calls);
+
+        messages.push(ChatMessage {
+            role: "assistant".into(),
+            content: message.content.clone(),
+            tool_call_id: None,
+            tool_calls: Some(context_tool_calls.clone()),
+        });
+        for (tool_call_index, tool_call) in context_tool_calls.into_iter().enumerate() {
+            let tool_call_id = non_empty_tool_call_id(&tool_call);
+            let result = if tool_call_index < remaining_tool_calls {
+                let result = tool_context.call(&tool_call);
+                tool_calls_used += 1;
+                info!(
+                    ai_review_id = %config.id,
+                    model = %config.model,
+                    tool_name = %tool_call.function.name,
+                    tool_call_id = %tool_call_id,
+                    result_bytes = result.len(),
+                    tool_calls_used,
+                    max_tool_calls = config.max_tool_calls,
+                    "AI review context tool result returned"
+                );
+                result
+            } else {
+                tool_call_limit_notice_sent = true;
+                warn!(
+                    ai_review_id = %config.id,
+                    model = %config.model,
+                    tool_name = %tool_call.function.name,
+                    tool_call_id = %tool_call_id,
+                    tool_calls_used,
+                    max_tool_calls = config.max_tool_calls,
+                    "AI review context tool call skipped because limit was reached"
+                );
+                context_tool_call_limit_result(config)
+            };
+            messages.push(ChatMessage {
+                role: "tool".into(),
+                content: Some(result),
+                tool_call_id: Some(tool_call_id),
+                tool_calls: None,
+            });
+        }
+
+        let request_body = serialize_review_request_body(config, messages, true)?;
+        let response = tokio::time::timeout(
+            request_guard_timeout,
+            perform_ai_review_http_attempt(
                 client,
-                review_id: worker_review_id.clone(),
-                model: worker_model.clone(),
+                config,
                 url,
                 api_key,
                 request_body,
                 attempt,
                 request_timeout,
-            });
-            let result_sent = sender.send(result).is_ok();
-            info!(
-                ai_review_id = %worker_review_id,
-                model = %worker_model,
-                attempt,
-                result_sent,
-                "AI review blocking HTTP worker result sent"
-            );
-        })
-        .map_err(|err| {
+            ),
+        )
+        .await
+        .map_err(|_| {
             AppError::AiReview(format!(
-                "AI review {} failed to spawn blocking HTTP worker: {err}",
-                config.id
+                "AI review {} timed out after {} seconds",
+                config.id,
+                request_timeout.as_secs()
             ))
-        })?;
-
-    let response = receiver.await.map_err(|err| {
-        AppError::AiReview(format!(
-            "AI review {} blocking HTTP worker dropped result channel: {err}",
-            config.id
-        ))
-    })??;
-    info!(
-        ai_review_id = %review_id,
-        model = %model,
-        attempt,
-        status = response.status,
-        response_bytes = response.body.len(),
-        "AI review blocking HTTP task completed"
-    );
-    Ok(response)
-}
-
-struct AiReviewHttpAttempt {
-    client: ureq::Agent,
-    review_id: String,
-    model: String,
-    url: String,
-    api_key: String,
-    request_body: Vec<u8>,
-    attempt: usize,
-    request_timeout: Duration,
-}
-
-fn perform_ai_review_http_attempt_blocking(
-    attempt_context: AiReviewHttpAttempt,
-) -> AppResult<AiReviewHttpResponse> {
-    let AiReviewHttpAttempt {
-        client,
-        review_id,
-        model,
-        url,
-        api_key,
-        request_body,
-        attempt,
-        request_timeout,
-    } = attempt_context;
-    let started = Instant::now();
-    let response = match ureq_response_from_result(
-        client
-            .post(&url)
-            .set("authorization", &format!("Bearer {api_key}"))
-            .set("content-type", "application/json")
-            .timeout(request_timeout)
-            .send_bytes(&request_body),
-    ) {
-        Ok(response) => response,
-        Err(err) => {
-            warn!(
-                ai_review_id = %review_id,
-                model = %model,
-                attempt,
-                elapsed_ms = started.elapsed().as_millis(),
-                error = %err,
-                "AI review blocking API request failed before response headers"
-            );
-            return Err(err);
-        }
-    };
-
-    let status = response.status();
-    info!(
-        ai_review_id = %review_id,
-        model = %model,
-        attempt,
-        status,
-        elapsed_ms = started.elapsed().as_millis(),
-        "AI review blocking API response headers received"
-    );
-
-    let body_started = Instant::now();
-    let body = match response.into_string() {
-        Ok(body) => body,
-        Err(err) => {
-            warn!(
-                ai_review_id = %review_id,
-                model = %model,
-                attempt,
-                status,
-                elapsed_ms = started.elapsed().as_millis(),
-                error = %err,
-                "AI review blocking API response body read failed"
-            );
+        })??;
+        if !(200..300).contains(&response.status) {
             return Err(AppError::AiReview(format!(
-                "AI review blocking API response body read failed: {err}"
+                "AI review API returned HTTP status {}: {}",
+                response.status,
+                preview_log_text(&response.body, AI_RESPONSE_PREVIEW_CHARS)
             )));
         }
-    };
-    info!(
-        ai_review_id = %review_id,
-        model = %model,
-        attempt,
-        response_bytes = body.len(),
-        elapsed_ms = body_started.elapsed().as_millis(),
-        "AI review blocking API response body received"
-    );
-
-    Ok(AiReviewHttpResponse { status, body })
+        body = response.body;
+    }
 }
 
-fn shared_ai_http_client() -> AppResult<&'static ureq::Agent> {
-    AI_HTTP_CLIENT
-        .get_or_init(|| {
-            Ok(ureq::AgentBuilder::new()
-                .timeout_connect(Duration::from_secs(10))
-                .timeout_read(Duration::from_secs(120))
-                .timeout_write(Duration::from_secs(120))
-                .build())
+fn synthesize_context_tool_call_ids(tool_calls: Vec<OpenAiToolCall>) -> Vec<OpenAiToolCall> {
+    tool_calls
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut tool_call)| {
+            if tool_call.id.trim().is_empty() {
+                tool_call.id = format!("call_{}_{}", tool_call.function.name, index + 1);
+            }
+            tool_call
         })
-        .as_ref()
-        .map_err(|err| AppError::AiReview(format!("failed to build shared AI HTTP client: {err}")))
+        .collect()
+}
+
+fn context_tool_call_limit_result(config: &AiReviewConfig) -> String {
+    serde_json::json!({
+        "ok": false,
+        "error": format!(
+            "AI review context tool call limit reached for '{}'. Stop calling context tools and submit final findings with submit_review_findings using the context already available.",
+            config.id
+        )
+    })
+    .to_string()
+}
+
+fn has_submit_review_findings(message: &OpenAiMessage) -> bool {
+    message
+        .tool_calls
+        .iter()
+        .any(|tool_call| tool_call.function.name == "submit_review_findings")
 }
 
 fn effective_request_timeout_seconds(config: &AiReviewConfig) -> u64 {
@@ -484,48 +523,6 @@ fn effective_request_timeout_seconds(config: &AiReviewConfig) -> u64 {
         .request_timeout_seconds
         .unwrap_or_else(|| config.timeout_seconds.max(1).div_ceil(2))
         .max(1)
-}
-
-fn ureq_response_from_result(
-    result: Result<ureq::Response, ureq::Error>,
-) -> AppResult<ureq::Response> {
-    match result {
-        Ok(response) => Ok(response),
-        Err(ureq::Error::Status(_, response)) => Ok(response),
-        Err(err) => Err(AppError::AiReview(format!(
-            "AI review blocking API request failed before response headers: {err}"
-        ))),
-    }
-}
-
-fn is_retryable_ai_error(err: &AppError) -> bool {
-    match err {
-        AppError::Reqwest(err) => {
-            err.is_timeout() || err.is_connect() || err.is_request() || err.is_body()
-        }
-        AppError::AiReview(message) => {
-            message.contains("blocking API request failed")
-                || message.contains("blocking API response body read failed")
-                || message.contains("blocking HTTP task failed")
-        }
-        _ => false,
-    }
-}
-
-fn limited_diff_payload(changes: &[GitLabChange], max_bytes: usize) -> (String, bool) {
-    let mut output = String::new();
-    for change in changes {
-        output.push_str(&change_diff_payload(change));
-    }
-    let limit = max_bytes.max(1);
-    if output.len() <= limit {
-        return (output, false);
-    }
-    let mut end = limit;
-    while !output.is_char_boundary(end) {
-        end -= 1;
-    }
-    (output[..end].to_string(), true)
 }
 
 fn split_ai_review_batches(
@@ -559,32 +556,37 @@ fn split_ai_review_batches(
     batches
 }
 
-fn change_diff_payload(change: &GitLabChange) -> String {
-    format!(
-        "File: {}\nOld path: {}\nNew file: {}\nRenamed: {}\nDeleted: {}\n```diff\n{}\n```\n\n",
-        change.new_path,
-        change.old_path,
-        change.new_file,
-        change.renamed_file,
-        change.deleted_file,
-        change.diff
-    )
-}
-
+#[cfg(test)]
 fn parse_openai_response(review_id: &str, title: &str, text: &str) -> AppResult<Vec<Finding>> {
     let response: OpenAiChatResponse = serde_json::from_str(text)?;
-    let content = response
+    let message = response
         .choices
         .first()
-        .map(|choice| choice.message.content.trim())
+        .map(|choice| &choice.message)
         .ok_or_else(|| AppError::AiReview("AI review API returned no choices".into()))?;
+    parse_openai_message(review_id, title, message)
+}
+
+fn parse_openai_message(
+    review_id: &str,
+    title: &str,
+    message: &OpenAiMessage,
+) -> AppResult<Vec<Finding>> {
+    let content = tool_call_arguments(message).or_else(|_| {
+        message
+            .content
+            .as_deref()
+            .map(str::trim)
+            .filter(|content| !content.is_empty())
+            .ok_or_else(|| AppError::AiReview("AI review API returned no content".into()))
+    })?;
     info!(
         ai_review_id = %review_id,
         assistant_content_bytes = content.len(),
         assistant_content_preview = %preview_log_text(content, AI_RESPONSE_PREVIEW_CHARS),
         "AI review assistant content received"
     );
-    let parsed: AiFindingsResponse = serde_json::from_str(content)?;
+    let parsed = parse_ai_findings_response(content)?;
     info!(
         ai_review_id = %review_id,
         parsed_findings = parsed.findings.len(),
@@ -603,6 +605,63 @@ fn parse_openai_response(review_id: &str, title: &str, text: &str) -> AppResult<
             message: finding.message.trim().to_string(),
         })
         .collect())
+}
+
+fn parse_ai_findings_response(content: &str) -> AppResult<AiFindingsResponse> {
+    match serde_json::from_str(content) {
+        Ok(parsed) => Ok(parsed),
+        Err(strict_error) => {
+            let Some(json_content) = extract_first_json_object(content) else {
+                return Err(strict_error.into());
+            };
+            serde_json::from_str(json_content).map_err(Into::into)
+        }
+    }
+}
+
+fn extract_first_json_object(content: &str) -> Option<&str> {
+    let start = content.find('{')?;
+    let mut depth = 0_usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, ch) in content[start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    let end = start + offset + ch.len_utf8();
+                    return Some(&content[start..end]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn tool_call_arguments(message: &OpenAiMessage) -> AppResult<&str> {
+    message
+        .tool_calls
+        .iter()
+        .find(|tool_call| tool_call.function.name == "submit_review_findings")
+        .map(|tool_call| tool_call.function.arguments.as_str())
+        .ok_or_else(|| {
+            AppError::AiReview("AI review API returned no submit_review_findings tool call".into())
+        })
 }
 
 fn parse_severity(value: &str) -> Severity {
@@ -685,7 +744,15 @@ fn filter_findings_to_added_lines(
 
 #[cfg(test)]
 mod tests {
-    use crate::{gitlab::GitLabChange, rules::Severity};
+    use crate::{
+        gitlab::GitLabChange,
+        review::{
+            ai_prompt::{build_review_prompt, limited_diff_payload},
+            ai_tools::{list_files_tool, read_file_tool, search_code_tool},
+        },
+        rules::AiReviewContextTools,
+        rules::Severity,
+    };
     use serde_json::Value;
     use std::{
         sync::{
@@ -696,11 +763,66 @@ mod tests {
     };
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpListener,
+        net::{TcpListener, TcpStream},
         time::sleep,
     };
 
     use super::*;
+
+    fn test_ai_review_config() -> AiReviewConfig {
+        AiReviewConfig {
+            auto_enabled: true,
+            id: "ai-review".into(),
+            title: "AI Review".into(),
+            base_url: "https://ai.example.com".into(),
+            api_key: "test-key".into(),
+            model: "test-model".into(),
+            timeout_seconds: 60,
+            request_timeout_seconds: None,
+            max_diff_bytes: 60_000,
+            second_pass_on_clean: false,
+            batch_review: false,
+            max_batch_diff_bytes: 30_000,
+            max_batches: 6,
+            system_prompt: None,
+            extra_instructions: String::new(),
+            max_tool_calls: 8,
+            max_tool_result_bytes: 60_000,
+            context_tools: AiReviewContextTools::default(),
+            when_changed: vec![],
+        }
+    }
+
+    async fn read_http_json_request(stream: &mut TcpStream) -> Value {
+        let mut data = Vec::new();
+        let header_end = loop {
+            let mut chunk = [0_u8; 1024];
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "connection closed before HTTP headers");
+            data.extend_from_slice(&chunk[..read]);
+            if let Some(header_end) = data.windows(4).position(|window| window == b"\r\n\r\n") {
+                break header_end;
+            }
+        };
+        let headers = String::from_utf8_lossy(&data[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap();
+        let body_start = header_end + 4;
+        let expected_len = body_start + content_length;
+        while data.len() < expected_len {
+            let mut chunk = [0_u8; 1024];
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "connection closed before HTTP body");
+            data.extend_from_slice(&chunk[..read]);
+        }
+        serde_json::from_slice(&data[body_start..expected_len]).unwrap()
+    }
 
     #[test]
     fn parses_openai_compatible_findings_from_assistant_content() {
@@ -723,6 +845,33 @@ mod tests {
         assert_eq!(findings[0].new_line, Some(12));
         assert_eq!(findings[0].title, "Possible panic");
         assert_eq!(findings[0].message, "Avoid unwrap here.");
+    }
+
+    #[test]
+    fn parses_findings_from_assistant_content_with_explanatory_prefix() {
+        let response = r#"
+{
+  "choices": [{
+    "message": {
+      "content": "经过仔细审查，未发现高置信度问题。\n\n{\"findings\":[]}"
+    }
+  }]
+}
+"#;
+
+        let findings = parse_openai_response("ai-review", "AI Review", response).unwrap();
+
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn extracts_json_object_without_breaking_on_braces_inside_strings() {
+        let content = "说明文字 {\"findings\":[{\"path\":\"src/lib.rs\",\"line\":1,\"severity\":\"error\",\"title\":\"Bug\",\"message\":\"contains } brace\"}]} trailing";
+
+        let parsed = parse_ai_findings_response(content).unwrap();
+
+        assert_eq!(parsed.findings.len(), 1);
+        assert_eq!(parsed.findings[0].message, "contains } brace");
     }
 
     #[test]
@@ -797,21 +946,56 @@ mod tests {
 
     #[test]
     fn prompt_requires_findings_in_final_json_content() {
+        let config = test_ai_review_config();
+        let changes = vec![GitLabChange {
+            old_path: "src/lib.rs".into(),
+            new_path: "src/lib.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "@@ -1 +1 @@\n+panic!();\n".into(),
+        }];
+
+        let (prompt, _, _) = build_review_prompt(&config, &changes);
+
+        assert!(prompt.contains("submit_review_findings"));
+        assert!(prompt.contains("不要把最终结果只写在 reasoning_content"));
+    }
+
+    #[test]
+    fn prompt_includes_extra_ai_review_instructions() {
         let config = AiReviewConfig {
-            auto_enabled: true,
-            id: "ai-review".into(),
-            title: "AI Review".into(),
-            base_url: "https://ai.example.com".into(),
-            api_key: "test-key".into(),
-            model: "test-model".into(),
-            timeout_seconds: 60,
-            request_timeout_seconds: None,
-            max_diff_bytes: 60_000,
-            second_pass_on_clean: false,
-            batch_review: false,
-            max_batch_diff_bytes: 30_000,
-            max_batches: 6,
-            when_changed: vec![],
+            system_prompt: Some("Custom system prompt".into()),
+            extra_instructions: "Focus on C++ lifetime bugs.".into(),
+            ..test_ai_review_config()
+        };
+        let changes = vec![GitLabChange {
+            old_path: "src/lib.rs".into(),
+            new_path: "src/lib.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "@@ -1 +1 @@\n+panic!();\n".into(),
+        }];
+
+        let (prompt, _, _) = build_review_prompt(&config, &changes);
+        let messages = initial_chat_messages(&config, &prompt);
+        let body = serialize_review_request_body(&config, &messages, true).unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+
+        assert!(prompt.contains("Focus on C++ lifetime bugs."));
+        assert_eq!(json["messages"][0]["content"], "Custom system prompt");
+    }
+
+    #[test]
+    fn prompt_guides_context_tool_usage_when_enabled() {
+        let config = AiReviewConfig {
+            context_tools: AiReviewContextTools {
+                read_file: true,
+                search_code: true,
+                list_files: true,
+            },
+            ..test_ai_review_config()
         };
         let changes = vec![GitLabChange {
             old_path: "src/lib.rs".into(),
@@ -824,28 +1008,15 @@ mod tests {
 
         let (prompt, _, _) = build_review_prompt(&config, &changes);
 
-        assert!(prompt.contains("最终返回的 JSON"));
-        assert!(prompt.contains("不要把问题只写在 reasoning_content"));
+        assert!(prompt.contains("上下文工具已启用"));
+        assert!(prompt.contains("list_files/search_code"));
+        assert!(prompt.contains("不要为了风格"));
+        assert!(prompt.contains("最终仍然只提交高置信度"));
     }
 
     #[test]
     fn serializes_review_request_body_with_prompt() {
-        let config = AiReviewConfig {
-            auto_enabled: true,
-            id: "ai-review".into(),
-            title: "AI Review".into(),
-            base_url: "https://ai.example.com".into(),
-            api_key: "test-key".into(),
-            model: "test-model".into(),
-            timeout_seconds: 60,
-            request_timeout_seconds: None,
-            max_diff_bytes: 60_000,
-            second_pass_on_clean: false,
-            batch_review: false,
-            max_batch_diff_bytes: 30_000,
-            max_batches: 6,
-            when_changed: vec![],
-        };
+        let config = test_ai_review_config();
         let changes = vec![GitLabChange {
             old_path: "src/lib.rs".into(),
             new_path: "src/lib.rs".into(),
@@ -856,12 +1027,158 @@ mod tests {
         }];
 
         let (prompt, _, _) = build_review_prompt(&config, &changes);
-        let body = serialize_review_request_body(&config, &prompt).unwrap();
+        let messages = initial_chat_messages(&config, &prompt);
+        let body = serialize_review_request_body(&config, &messages, true).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(json["model"], "test-model");
         assert_eq!(json["messages"][1]["content"], prompt);
+        assert!(json.get("response_format").is_none());
+        assert_eq!(json["tools"][0]["type"], "function");
+        assert_eq!(
+            json["tools"][0]["function"]["name"],
+            "submit_review_findings"
+        );
+        assert!(json.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn serializes_enabled_context_tools() {
+        let config = AiReviewConfig {
+            context_tools: AiReviewContextTools {
+                read_file: true,
+                search_code: true,
+                list_files: true,
+            },
+            ..test_ai_review_config()
+        };
+        let messages = initial_chat_messages(&config, "prompt");
+        let body = serialize_review_request_body(&config, &messages, true).unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let names: Vec<_> = json["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect();
+
+        assert_eq!(
+            names,
+            vec![
+                "read_file",
+                "search_code",
+                "list_files",
+                "submit_review_findings"
+            ]
+        );
+    }
+
+    #[test]
+    fn context_tool_schemas_describe_arguments_and_results() {
+        let read_file = read_file_tool();
+        let search_code = search_code_tool();
+        let list_files = list_files_tool();
+
+        assert!(read_file.function.description.contains("Returns JSON"));
+        assert!(read_file
+            .function
+            .description
+            .contains("repository-relative"));
+        assert!(
+            read_file.function.parameters["properties"]["path"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Repository-relative")
+        );
+        assert!(search_code.function.description.contains("plain substring"));
+        assert!(search_code
+            .function
+            .description
+            .contains("At most 50 total matches"));
+        assert!(search_code
+            .function
+            .description
+            .contains("5 matches per file"));
+        assert!(search_code.function.description.contains("before"));
+        assert!(
+            search_code.function.parameters["properties"]["query"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("not a regex")
+        );
+        assert!(list_files
+            .function
+            .description
+            .contains("At most 200 files"));
+        assert!(
+            list_files.function.parameters["properties"]["glob"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Optional glob")
+        );
+    }
+
+    #[test]
+    fn builtin_read_file_rejects_unsafe_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("lib.rs"), "pub fn value() {}\n").unwrap();
+        std::fs::write(temp.path().join(".env"), "SECRET=1\n").unwrap();
+        let config = AiReviewConfig {
+            context_tools: AiReviewContextTools {
+                read_file: true,
+                search_code: false,
+                list_files: false,
+            },
+            ..test_ai_review_config()
+        };
+        let context = AiReviewToolContext::new(&config, Some(temp.path()));
+
+        let parent_result = context.read_file(r#"{"path":"../lib.rs"}"#);
+        let env_result = context.read_file(r#"{"path":".env"}"#);
+        let ok_result = context.read_file(r#"{"path":"lib.rs"}"#);
+
+        assert_eq!(parent_result["ok"], false);
+        assert_eq!(env_result["ok"], false);
+        assert_eq!(ok_result["ok"], true);
+        assert!(ok_result["content"].as_str().unwrap().contains("value"));
+    }
+
+    #[test]
+    fn serializes_json_content_fallback_review_request_body() {
+        let config = test_ai_review_config();
+        let messages = initial_chat_messages(&config, "prompt");
+        let body = serialize_review_request_body(&config, &messages, false).unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+
         assert_eq!(json["response_format"]["type"], "json_object");
+        assert!(json.get("tools").is_none());
+        assert!(json.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn parses_findings_from_tool_call_arguments() {
+        let response = r#"
+{
+  "choices": [{
+    "message": {
+      "content": "",
+      "tool_calls": [{
+        "type": "function",
+        "function": {
+          "name": "submit_review_findings",
+          "arguments": "{\"findings\":[{\"path\":\"src/lib.rs\",\"line\":12,\"severity\":\"error\",\"title\":\"Possible panic\",\"message\":\"Avoid unwrap here.\"}]}"
+        }
+      }]
+    }
+  }]
+}
+"#;
+
+        let findings = parse_openai_response("ai-review", "AI Review", response).unwrap();
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].path, "src/lib.rs");
+        assert_eq!(findings[0].new_line, Some(12));
     }
 
     #[test]
@@ -870,6 +1187,86 @@ mod tests {
         let client_two = shared_ai_http_client().unwrap() as *const ureq::Agent;
 
         assert_eq!(client_one, client_two);
+    }
+
+    #[tokio::test]
+    async fn returns_tool_limit_result_before_requiring_final_findings() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let tool_message_count = Arc::new(AtomicUsize::new(0));
+        let limit_result_count = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let request_count_for_server = Arc::clone(&request_count);
+        let tool_message_count_for_server = Arc::clone(&tool_message_count);
+        let limit_result_count_for_server = Arc::clone(&limit_result_count);
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request_count = Arc::clone(&request_count_for_server);
+                let tool_message_count = Arc::clone(&tool_message_count_for_server);
+                let limit_result_count = Arc::clone(&limit_result_count_for_server);
+                tokio::spawn(async move {
+                    let request_index = request_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    let request = read_http_json_request(&mut stream).await;
+                    let body = if request_index == 1 {
+                        r#"{"choices":[{"message":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"search_code","arguments":"{\"query\":\"panic\"}"}},{"id":"call_2","type":"function","function":{"name":"search_code","arguments":"{\"query\":\"unwrap\"}"}}]}}]}"#
+                            .as_bytes()
+                            .to_vec()
+                    } else {
+                        let messages = request["messages"].as_array().unwrap();
+                        let tool_messages = messages
+                            .iter()
+                            .filter(|message| message["role"] == "tool")
+                            .collect::<Vec<_>>();
+                        tool_message_count.store(tool_messages.len(), Ordering::SeqCst);
+                        let limit_results = tool_messages
+                            .iter()
+                            .filter(|message| {
+                                message["content"].as_str().is_some_and(|content| {
+                                    content.contains("context tool call limit reached")
+                                })
+                            })
+                            .count();
+                        limit_result_count.store(limit_results, Ordering::SeqCst);
+                        r#"{"choices":[{"message":{"tool_calls":[{"id":"submit_1","type":"function","function":{"name":"submit_review_findings","arguments":"{\"findings\":[]}"}}]}}]}"#
+                            .as_bytes()
+                            .to_vec()
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    stream.write_all(&body).await.unwrap();
+                });
+            }
+        });
+
+        let config = AiReviewConfig {
+            base_url: format!("http://{}", addr),
+            max_tool_calls: 1,
+            context_tools: AiReviewContextTools {
+                read_file: false,
+                search_code: true,
+                list_files: false,
+            },
+            ..test_ai_review_config()
+        };
+        let changes = vec![GitLabChange {
+            old_path: "src/lib.rs".into(),
+            new_path: "src/lib.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "@@ -1 +1 @@\n+panic!();\n".into(),
+        }];
+
+        let findings = run_ai_review(&config, &changes).await.unwrap();
+
+        assert!(findings.is_empty());
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        assert_eq!(tool_message_count.load(Ordering::SeqCst), 2);
+        assert_eq!(limit_result_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -904,20 +1301,9 @@ mod tests {
         });
 
         let config = AiReviewConfig {
-            auto_enabled: true,
-            id: "ai-review".into(),
-            title: "AI Review".into(),
             base_url: format!("http://{}", addr),
-            api_key: "test-key".into(),
-            model: "test-model".into(),
             timeout_seconds: 2,
-            request_timeout_seconds: None,
-            max_diff_bytes: 60_000,
-            second_pass_on_clean: false,
-            batch_review: false,
-            max_batch_diff_bytes: 30_000,
-            max_batches: 6,
-            when_changed: vec![],
+            ..test_ai_review_config()
         };
         let changes = vec![GitLabChange {
             old_path: "src/lib.rs".into(),
@@ -958,20 +1344,10 @@ mod tests {
         });
 
         let config = AiReviewConfig {
-            auto_enabled: true,
-            id: "ai-review".into(),
-            title: "AI Review".into(),
             base_url: format!("http://{}", addr),
-            api_key: "test-key".into(),
-            model: "test-model".into(),
             timeout_seconds: 2,
             request_timeout_seconds: Some(3),
-            max_diff_bytes: 60_000,
-            second_pass_on_clean: false,
-            batch_review: false,
-            max_batch_diff_bytes: 30_000,
-            max_batches: 6,
-            when_changed: vec![],
+            ..test_ai_review_config()
         };
         let changes = vec![GitLabChange {
             old_path: "src/lib.rs".into(),
