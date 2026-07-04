@@ -387,6 +387,13 @@ fn collect_files(root: &Path, current: &Path, visit: &mut impl FnMut(&str, &Path
             continue;
         };
         if file_type.is_dir() {
+            let Ok(relative) = path.strip_prefix(root) else {
+                continue;
+            };
+            let relative = normalize_path(&relative.to_string_lossy());
+            if is_low_value_context_path(&relative) || is_sensitive_path(&relative) {
+                continue;
+            }
             collect_files(root, &path, visit);
         } else if file_type.is_file() {
             let Ok(relative) = path.strip_prefix(root) else {
@@ -598,6 +605,23 @@ mod tests {
         let files = result["files"].as_array().unwrap();
 
         assert_eq!(files, &[serde_json::json!("src/lib.rs")]);
+    }
+
+    #[test]
+    fn collect_files_prunes_low_value_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::create_dir_all(temp.path().join("node_modules/pkg")).unwrap();
+        std::fs::write(temp.path().join("src/lib.rs"), "pub fn value() {}\n").unwrap();
+        std::fs::write(temp.path().join("node_modules/pkg/index.js"), "needle\n").unwrap();
+        let mut visited = Vec::new();
+
+        collect_files(temp.path(), temp.path(), &mut |relative, _path| {
+            visited.push(relative.to_string());
+        });
+        visited.sort();
+
+        assert_eq!(visited, vec!["src/lib.rs"]);
     }
 
     #[test]
