@@ -1,21 +1,5 @@
-[[rules]]
-auto_enabled = true
-id = "forbid-unwrap"
-title = "避免直接 unwrap"
-severity = "warning"
-path = "**/*.rs"
-pattern = "\\.unwrap\\(\\)"
-message = "直接使用 unwrap 可能导致运行时 panic，建议改成错误传播或显式处理。"
-
-[[script_tasks]]
-auto_enabled = false
-id = "check-todo-tbd"
-title = "TODO/TBD 标记检查"
-# Relative paths are resolved from the runner executable directory.
-# The checked MR source root and result file path are appended as arguments.
-command = "python examples/scripts/check_todo_tbd.py"
-timeout_seconds = 30
-when_changed = ["**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.rs"]
+# Default example: AI Review only.
+# You do not need [[rules]] or [[script_tasks]] for the normal AI review workflow.
 
 # Global AI review prompt settings shared by every [[ai_reviews]] entry.
 # Leave these empty to use the built-in reviewer prompt.
@@ -36,6 +20,8 @@ search_code = false
 list_files = false
 
 [[ai_reviews]]
+# Keep false for comment-driven manual review with @ai-review.
+# Change to true if MR updates should run AI Review automatically.
 auto_enabled = false
 id = "ai-review"
 title = "AI Review"
@@ -52,3 +38,6 @@ batch_review = true
 max_batch_diff_bytes = 15000
 max_batches = 10
 when_changed = ["**/*.rs", "**/*.toml", "**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp"]
+
+# Optional deterministic regex checks can still be added with [[rules]].
+# Optional local script tasks can still be added with [[script_tasks]].

@@ -16,7 +16,7 @@ Secret token: config.toml 中 [server].webhook_secret 的值
 Trigger: Merge request events, Comments
 ```
 
-自动 Review 需要开启 `Merge request events`。如果需要在 MR 评论中用 `@script_task_id` 手动触发 disabled script task，或用 `@ai_review_id` 手动触发 AI Review，还需要开启 `Comments`。不需要开启 `Push events`。
+自动 Review 需要开启 `Merge request events`。如果需要在 MR 评论中用 `@ai_review_id` 手动触发 AI Review，还需要开启 `Comments`。脚本任务仍可选支持，但不是默认推荐路径。不需要开启 `Push events`。
 
 ## Webhook Secret 和 GitLab API Token
 
@@ -98,13 +98,9 @@ project_id + mr_iid + commit_sha + ruleset_hash
 - 只修改标题、描述、label、reviewer 等元信息时，`last_commit.id` 通常不变，会被去重跳过。
 - 规则文件改变时，`ruleset_hash` 改变，同一个 commit 也可以重新 review。
 
-## Comments 手动触发脚本任务和 AI Review
+## Comments 手动触发 AI Review
 
-开启 `Comments` 后，用户可以在 MR 评论中发送脚本任务或 AI Review 命令：
-
-```text
-@check-todo-tbd
-```
+开启 `Comments` 后，用户可以在 MR 评论中发送 AI Review 命令：
 
 ```text
 @ai-review
@@ -119,12 +115,9 @@ object_attributes.noteable_type = "MergeRequest"
 
 手动触发行为：
 
-- 只按 `@id` 精确匹配 `[[script_tasks]].id`。
-- 即使任务配置了 `auto_enabled = false`，也允许手动触发。
-- 手动触发忽略 `when_changed`，因为用户已经明确要求执行该任务。
 - AI Review 手动触发按 `[[ai_reviews]].id` 精确匹配，忽略 `auto_enabled` 和 `when_changed`。
-- 如果同一条评论同时包含脚本任务和 AI Review 的合法命令，服务会分别执行匹配项。
-- 手动触发不使用自动 Review 的去重键；用户每发一次合法命令，服务就执行一次。
+- 手动触发不使用自动 Review 的已完成去重键；同一个 commit 完成后可以再次触发。
+- 但同一个 `project_id + mr_iid + commit_sha` 如果仍在执行中，新的触发会被跳过；服务会给触发评论加 `eyes`，并回复一条 MR 评论提示当前 commit 已有 review 正在执行，请稍后再试。
 - 如果评论里没有合法脚本任务或 AI Review 命令，或 `@id` 不存在，服务只记录日志并返回 accepted。
 - issue、wiki、work item 等非 MR 评论会被忽略。
 
@@ -135,7 +128,7 @@ object_attributes.noteable_type = "MergeRequest"
 - 只要用户能在 MR 评论，并且评论内容包含合法的 `@id`，服务就会执行对应手动任务。
 - 如果需要限制只有 Maintainer 或指定用户可以手动触发，需要在服务侧增加评论人权限校验或 allowlist。
 
-这意味着可以把高成本或低频脚本配置为：
+如果确实需要可选脚本任务，也可以把高成本或低频脚本配置为：
 
 ```toml
 [[script_tasks]]
@@ -149,6 +142,8 @@ when_changed = ["**/*.rs"]
 
 平时 MR 更新不会自动执行；需要时在 MR 评论区发送 `@check-todo-tbd` 即可。
 
+脚本任务的手动触发规则和 AI Review 类似：只按 `@id` 精确匹配 `[[script_tasks]].id`；即使任务配置了 `auto_enabled = false`，也允许手动触发；手动触发忽略 `when_changed`。如果同一条评论同时包含脚本任务和 AI Review 的合法命令，服务会分别执行匹配项。
+
 ## 当前服务的处理流程
 
 收到 GitLab Webhook 后：
@@ -156,14 +151,17 @@ when_changed = ["**/*.rs"]
 1. 校验 `X-Gitlab-Token`。
 2. 解析 payload，确认是 `object_kind = "merge_request"` 或 MR `object_kind = "note"`。
 3. 提取 `project_id`、`mr_iid`、`last_commit.id`、source branch、target branch。
-4. 对 MR event，计算去重键：`project_id + mr_iid + commit_sha + ruleset_hash`。
-5. 对 MR event，如果已处理，直接跳过。
-6. 通过 GitLab API 拉取 MR changes。
-7. 对 MR event，如果 GitLab diff refs 不完整，发布一条 MR 级跳过提示并写入状态存储。
-8. 对 MR event，解析 diff，只对新增行执行 `auto_enabled = true` 的规则，并自动执行匹配的 `auto_enabled = true` AI Review 和脚本任务。
-9. 对 MR comment event，解析评论正文中的 `@id`，手动执行匹配的脚本任务和 AI Review。
-10. 发布 GitLab MR Discussion。
-11. 对 MR event 写入状态存储，避免重复评论；手动 comment event 不写入自动去重记录。
+4. 对实际会执行 review 的事件，先登记运行中 key：`project_id + mr_iid + commit_sha`。
+5. 如果同一个 key 已经在运行中，跳过本次 review；MR comment 触发时会加 `eyes` 并发布提示评论。
+6. 对 MR event，计算已完成去重键：`project_id + mr_iid + commit_sha + ruleset_hash`。
+7. 对 MR event，如果已处理，直接跳过。
+8. 通过 GitLab API 拉取 MR changes。
+9. 对 MR event，如果 GitLab diff refs 不完整，发布一条 MR 级跳过提示并写入状态存储。
+10. 对 MR event，解析 diff，只对新增行执行 `auto_enabled = true` 的规则，并自动执行匹配的 `auto_enabled = true` AI Review 和脚本任务。
+11. 对 MR comment event，解析评论正文中的 `@id`，手动执行匹配的脚本任务和 AI Review。
+12. 发布 GitLab MR Discussion。
+13. 对 MR event 写入状态存储，避免重复评论；手动 comment event 不写入自动去重记录。
+14. review 完成或失败后，释放运行中 key；因此同一个 commit 完成后可以再次手动触发。
 
 ## 后续可以增强的地方
 
