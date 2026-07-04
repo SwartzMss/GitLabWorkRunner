@@ -81,6 +81,10 @@ exit 1"#,
 
 #[tokio::test]
 async fn reviews_merge_request_and_records_state() {
+    let discussion_count = Arc::new(AtomicUsize::new(0));
+    let discussion_count_for_handler = Arc::clone(&discussion_count);
+    let ai_request_count = Arc::new(AtomicUsize::new(0));
+    let ai_request_count_for_handler = Arc::clone(&ai_request_count);
     let app = Router::new()
         .route(
             "/api/v4/projects/123/merge_requests/45/changes",
@@ -92,31 +96,64 @@ async fn reviews_merge_request_and_records_state() {
         )
         .route(
             "/api/v4/projects/123/merge_requests/45/discussions",
-            post(|| async {
-                (
-                    StatusCode::CREATED,
+            post(move |body: Bytes| {
+                let discussion_count = Arc::clone(&discussion_count_for_handler);
+                async move {
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    assert!(body["body"].as_str().unwrap().contains("Avoid unwrap"));
+                    assert_eq!(body["position"]["new_path"], "src/lib.rs");
+                    assert_eq!(body["position"]["new_line"], 1);
+                    discussion_count.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::CREATED,
+                        Json(json!({
+                            "id": "discussion-1",
+                            "notes": [{ "id": 99 }]
+                        })),
+                    )
+                }
+            }),
+        )
+        .route(
+            "/chat/completions",
+            post(move |_body: Bytes| {
+                let ai_request_count = Arc::clone(&ai_request_count_for_handler);
+                async move {
+                    ai_request_count.fetch_add(1, Ordering::SeqCst);
                     Json(json!({
-                        "id": "discussion-1",
-                        "notes": [{ "id": 99 }]
-                    })),
-                )
+                        "choices": [{
+                            "message": {
+                                "content": serde_json::json!({
+                                    "findings": [{
+                                        "path": "src/lib.rs",
+                                        "line": 1,
+                                        "severity": "warning",
+                                        "title": "Avoid unwrap",
+                                        "message": "Do not unwrap."
+                                    }]
+                                }).to_string()
+                            }
+                        }]
+                    }))
+                }
             }),
         );
     let base_url = spawn_server(app).await;
 
     let store = StateStore::connect("sqlite::memory:").await.unwrap();
     store.migrate().await.unwrap();
-    let ruleset = Ruleset::from_toml(
+    let ruleset = Ruleset::from_toml(&format!(
         r#"
-[[rules]]
-id = "forbid-unwrap"
-title = "Avoid unwrap"
-severity = "warning"
-path = "**/*.rs"
-pattern = "\\.unwrap\\(\\)"
-message = "Do not unwrap."
+[[ai_reviews]]
+id = "ai-review"
+title = "AI Review"
+base_url = "{}"
+api_key = "test-api-key"
+model = "test-model"
+when_changed = ["src/**"]
 "#,
-    )
+        base_url
+    ))
     .unwrap();
     let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset);
     let event = MergeRequestEvent {
@@ -133,12 +170,16 @@ message = "Do not unwrap."
     assert_eq!(summary.findings, 1);
     assert_eq!(summary.comments, 1);
     assert!(!summary.skipped);
+    assert_eq!(ai_request_count.load(Ordering::SeqCst), 1);
+    assert_eq!(discussion_count.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
 async fn continues_publishing_review_comments_after_one_comment_fails() {
     let discussion_count = Arc::new(AtomicUsize::new(0));
     let discussion_count_for_handler = Arc::clone(&discussion_count);
+    let ai_request_count = Arc::new(AtomicUsize::new(0));
+    let ai_request_count_for_handler = Arc::clone(&ai_request_count);
     let app = Router::new()
         .route(
             "/api/v4/projects/123/merge_requests/45/changes",
@@ -162,9 +203,11 @@ async fn continues_publishing_review_comments_after_one_comment_fails() {
         )
         .route(
             "/api/v4/projects/123/merge_requests/45/discussions",
-            post(move || {
+            post(move |body: Bytes| {
                 let discussion_count = Arc::clone(&discussion_count_for_handler);
                 async move {
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    assert!(body["body"].as_str().unwrap().contains("AI finding"));
                     let attempt = discussion_count.fetch_add(1, Ordering::SeqCst) + 1;
                     if attempt == 1 {
                         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -179,22 +222,56 @@ async fn continues_publishing_review_comments_after_one_comment_fails() {
                         .into_response()
                 }
             }),
+        )
+        .route(
+            "/chat/completions",
+            post(move |_body: Bytes| {
+                let ai_request_count = Arc::clone(&ai_request_count_for_handler);
+                async move {
+                    ai_request_count.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({
+                        "choices": [{
+                            "message": {
+                                "content": serde_json::json!({
+                                    "findings": [
+                                        {
+                                            "path": "src/lib.rs",
+                                            "line": 1,
+                                            "severity": "warning",
+                                            "title": "AI finding one",
+                                            "message": "First finding."
+                                        },
+                                        {
+                                            "path": "src/lib.rs",
+                                            "line": 2,
+                                            "severity": "warning",
+                                            "title": "AI finding two",
+                                            "message": "Second finding."
+                                        }
+                                    ]
+                                }).to_string()
+                            }
+                        }]
+                    }))
+                }
+            }),
         );
     let base_url = spawn_server(app).await;
 
     let store = StateStore::connect("sqlite::memory:").await.unwrap();
     store.migrate().await.unwrap();
-    let ruleset = Ruleset::from_toml(
+    let ruleset = Ruleset::from_toml(&format!(
         r#"
-[[rules]]
-id = "forbid-unwrap"
-title = "Avoid unwrap"
-severity = "warning"
-path = "**/*.rs"
-pattern = "\\.unwrap\\(\\)"
-message = "Do not unwrap."
+[[ai_reviews]]
+id = "ai-review"
+title = "AI Review"
+base_url = "{}"
+api_key = "test-api-key"
+model = "test-model"
+when_changed = ["src/**"]
 "#,
-    )
+        base_url
+    ))
     .unwrap();
     let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset);
     let event = MergeRequestEvent {
@@ -211,11 +288,12 @@ message = "Do not unwrap."
     assert_eq!(summary.findings, 2);
     assert_eq!(summary.comments, 1);
     assert!(!summary.skipped);
+    assert_eq!(ai_request_count.load(Ordering::SeqCst), 1);
     assert_eq!(discussion_count.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
-async fn skips_rule_comments_when_diff_refs_are_incomplete() {
+async fn skips_review_when_diff_refs_are_incomplete() {
     let discussion_count = Arc::new(AtomicUsize::new(0));
     let discussion_count_for_handler = Arc::clone(&discussion_count);
     let (listener, addr) = bind_test_listener().await;
@@ -265,18 +343,7 @@ async fn skips_rule_comments_when_diff_refs_are_incomplete() {
 
     let store = StateStore::connect("sqlite::memory:").await.unwrap();
     store.migrate().await.unwrap();
-    let ruleset = Ruleset::from_toml(
-        r#"
-[[rules]]
-id = "forbid-unwrap"
-title = "Avoid unwrap"
-severity = "warning"
-path = "**/*.rs"
-pattern = "\\.unwrap\\(\\)"
-message = "Do not unwrap."
-"#,
-    )
-    .unwrap();
+    let ruleset = Ruleset::from_toml("").unwrap();
     let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset);
     let event = MergeRequestEvent {
         project_id: 123,

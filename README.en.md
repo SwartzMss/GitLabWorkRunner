@@ -4,7 +4,7 @@ Language: [简体中文](README.md) | **English**
 
 GitLabWorkRunner is a Rust service for automated GitLab Merge Request review. It receives GitLab webhooks, fetches MR changes, runs `[[ai_reviews]]` by default, and publishes the result back to GitLab MR Discussions.
 
-It is not a GitLab Runner replacement and does not automatically run CI scripts from the target repository. The default example is AI Review only. Regex rules and script tasks are still supported as optional capabilities, but they are not the recommended minimal path.
+It is not a GitLab Runner replacement and does not automatically run CI scripts from the target repository. The default example enables AI Review configuration and keeps a disabled script task example for later use.
 
 ## How It Works
 
@@ -14,7 +14,7 @@ flowchart LR
     B --> C["Fetch MR diff"]
     C --> D["Parse added lines"]
     D --> F["AI Review"]
-    D --> E["Optional: regex rules / script tasks"]
+    D --> E["Optional: script tasks"]
     F --> H["Build comments"]
     E --> H
     H --> I["GitLab MR Discussion"]
@@ -50,7 +50,7 @@ See [docs/design.md](docs/design.md) for more design detail.
 - Manual AI Review triggers from MR comments, such as `@ai-review`.
 - If the same `project_id + mr_iid + commit_sha` is already running, duplicate triggers are skipped. For MR comment triggers, the service awards an `eyes` emoji and posts a comment saying the commit is already being reviewed.
 - SQLite dedupe state to avoid repeating automatic comments for the same commit and ruleset.
-- Optional capabilities: `[[rules]]` path + regex checks on added lines, and `[[script_tasks]]` local script tasks over the MR head snapshot.
+- Optional capability: `[[script_tasks]]` local script tasks over the MR head snapshot, disabled by default.
 
 ## Quick Start
 
@@ -144,7 +144,7 @@ file = "rules.toml"
 
 ## AI Review Config
 
-The recommended setup is AI Review only. In that mode, `rules.toml` only needs `[ai_review]` and `[[ai_reviews]]`; `[[rules]]` and `[[script_tasks]]` are not required.
+The recommended setup is AI Review-first. `rules.toml` should keep `[ai_review]` and `[[ai_reviews]]`; script tasks can stay configured with `auto_enabled = false` and be enabled or triggered manually later.
 
 Recommended `rules.toml` example:
 
@@ -195,26 +195,9 @@ Do not commit a real `rules.toml` that contains an actual `api_key`.
 
 `@ai-review` matches `id = "ai-review"` inside `[[ai_reviews]]`. `[[ai_reviews]]` is the config block type, not the trigger command.
 
-### Optional: Regex Rules
-
-If you still want lightweight deterministic checks on added lines, add `[[rules]]` entries:
-
-```toml
-[[rules]]
-auto_enabled = true
-id = "forbid-unwrap"
-title = "Avoid unwrap"
-severity = "warning"
-path = "**/*.rs"
-pattern = "\\.unwrap\\(\\)"
-message = "Direct unwrap can panic at runtime. Prefer explicit error handling."
-```
-
-You can define multiple `[[rules]]` entries and distinguish them by `id`. `auto_enabled` defaults to `true`; set it to `false` to exclude the rule from automatic review.
-
 ### Optional: Script Tasks
 
-Script tasks are still supported, but they are no longer the default recommended path. Configure them only when you need deterministic local checks:
+Script tasks are still supported, but disabled by default. Keep the config now and enable it later when you need deterministic local checks:
 
 ```toml
 [[script_tasks]]

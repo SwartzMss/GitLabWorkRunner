@@ -1,7 +1,6 @@
 use crate::{
     ai_review::run_ai_review_with_context,
     comments::{build_comment_drafts, CommentDraft},
-    diff::parse_unified_diff,
     error::{AppError, AppResult},
     gitlab::{CreateDiscussionRequest, DiscussionPosition, GitLabChange, GitLabClient},
     rules::{AiReviewConfig, Finding, Ruleset, Severity},
@@ -151,53 +150,8 @@ impl ReviewService {
             });
         }
 
-        let mut findings = Vec::new();
         let mut ai_finding_count = 0_usize;
         let mut published = 0_usize;
-        let mut line_review_skipped = false;
-
-        if self.ruleset.has_line_rules() && !changes.diff_refs.is_complete() {
-            warn!(
-                project_id = event.project_id,
-                mr_iid = event.mr_iid,
-                commit_sha = %event.commit_sha,
-                base_sha = ?changes.diff_refs.base_sha,
-                start_sha = ?changes.diff_refs.start_sha,
-                head_sha = ?changes.diff_refs.head_sha,
-                "line review skipped because gitlab diff refs are incomplete"
-            );
-            let created = self
-                .gitlab
-                .create_discussion(
-                    event.project_id,
-                    event.mr_iid,
-                    &CreateDiscussionRequest {
-                        body: incomplete_diff_refs_body(),
-                        position: None,
-                    },
-                )
-                .await?;
-            self.store
-                .record_comment(&StoredComment {
-                    project_id: event.project_id,
-                    mr_iid: event.mr_iid,
-                    commit_sha: &event.commit_sha,
-                    ruleset_hash: self.ruleset.hash(),
-                    rule_id: "incomplete-diff-refs",
-                    path: "",
-                    new_line: None,
-                    discussion_id: Some(&created.id),
-                    note_id: created.notes.first().map(|note| note.id),
-                })
-                .await?;
-            published += 1;
-            line_review_skipped = true;
-        } else if changes.diff_refs.is_complete() {
-            findings = self.evaluate_line_rules(event, &changes.changes)?;
-            published += self
-                .publish_line_findings(event, &changes, &findings)
-                .await?;
-        }
 
         let (ai_findings, ai_comments) = self.run_ai_reviews(event, &changes).await?;
         ai_finding_count += ai_findings;
@@ -211,13 +165,13 @@ impl ReviewService {
             mr_iid = event.mr_iid,
             commit_sha = %event.commit_sha,
             ruleset_hash = %self.ruleset.hash(),
-            findings = findings.len() + ai_finding_count,
+            findings = ai_finding_count,
             comments = published,
             "review completed"
         );
         Ok(ReviewSummary {
-            skipped: line_review_skipped && published == 1,
-            findings: findings.len() + ai_finding_count,
+            skipped: false,
+            findings: ai_finding_count,
             comments: published,
         })
     }
@@ -311,43 +265,6 @@ impl ReviewService {
             findings: ai_result.findings,
             comments,
         })
-    }
-
-    fn evaluate_line_rules(
-        &self,
-        event: &MergeRequestEvent,
-        changes: &[GitLabChange],
-    ) -> AppResult<Vec<crate::rules::Finding>> {
-        let mut findings = Vec::new();
-        for change in changes {
-            if change.deleted_file || change.diff.trim().is_empty() {
-                info!(
-                    project_id = event.project_id,
-                    mr_iid = event.mr_iid,
-                    path = %change.new_path,
-                    deleted_file = change.deleted_file,
-                    empty_diff = change.diff.trim().is_empty(),
-                    "diff file skipped"
-                );
-                continue;
-            }
-            let diff_file = parse_unified_diff(&change.old_path, &change.new_path, &change.diff)?;
-            let file_findings = self.ruleset.evaluate(&diff_file);
-            info!(
-                project_id = event.project_id,
-                mr_iid = event.mr_iid,
-                old_path = %change.old_path,
-                new_path = %change.new_path,
-                hunks = diff_file.hunks.len(),
-                findings = file_findings.len(),
-                new_file = change.new_file,
-                renamed_file = change.renamed_file,
-                deleted_file = change.deleted_file,
-                "diff file evaluated"
-            );
-            findings.extend(file_findings);
-        }
-        Ok(findings)
     }
 
     async fn publish_line_findings(

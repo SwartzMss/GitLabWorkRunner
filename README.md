@@ -4,7 +4,7 @@
 
 GitLabWorkRunner 是一个 Rust 编写的 GitLab Merge Request 自动 Review 服务。它通过 GitLab Webhook 获取 MR 变更，推荐使用 `[[ai_reviews]]` 执行 AI Review，并把结果发布到 MR Discussion。
 
-它不是 GitLab Runner 替代品，也不会自动执行目标仓库里的 CI 脚本；默认示例只配置 AI Review。正则规则和脚本任务仍作为可选能力保留，但不是推荐的最小使用路径。
+它不是 GitLab Runner 替代品，也不会自动执行目标仓库里的 CI 脚本；默认示例启用 AI Review 配置，并保留一个默认不启用的脚本任务示例。
 
 ## 工作原理
 
@@ -14,7 +14,7 @@ flowchart LR
     B --> C["拉取 MR diff"]
     C --> D["解析新增行"]
     D --> F["AI Review"]
-    D --> E["可选：正则规则 / 脚本任务"]
+    D --> E["可选：脚本任务"]
     F --> H["生成评论"]
     E --> H
     H --> I["GitLab MR Discussion"]
@@ -50,7 +50,7 @@ sequenceDiagram
 - MR 评论手动触发 AI Review，例如 `@ai-review`。
 - 同一个 `project_id + mr_iid + commit_sha` 正在执行 review 时，会拦截重复触发；如果是 MR 评论触发，会给评论加 `eyes` 并回复“当前 commit 已有 review 正在执行”。
 - 自动 MR event 使用 SQLite 去重，避免同一 commit 和规则集重复评论。
-- 可选能力：`[[rules]]` 按路径和正则匹配新增行；`[[script_tasks]]` 下载 MR head 快照并执行本地脚本。
+- 可选能力：`[[script_tasks]]` 下载 MR head 快照并执行本地脚本，默认不启用。
 
 ## 快速开始
 
@@ -144,7 +144,7 @@ file = "rules.toml"
 
 ## AI Review 配置
 
-当前推荐只配置 AI Review。也就是说，`rules.toml` 里只需要保留 `[ai_review]` 和 `[[ai_reviews]]`；不需要配置 `[[rules]]` 或 `[[script_tasks]]`。
+当前推荐以 AI Review 为主。`rules.toml` 里需要保留 `[ai_review]` 和 `[[ai_reviews]]`；脚本任务可以保留一个默认 `auto_enabled = false` 的配置，后续需要时再打开或手动触发。
 
 推荐 `rules.toml` 示例：
 
@@ -268,26 +268,9 @@ AI Review 默认请求 Chat Completions `tool_calls` 结构化输出，并从 `s
 
 `@ai-review` 匹配的是 `[[ai_reviews]]` 里的 `id = "ai-review"`。`[[ai_reviews]]` 只是配置块类型，不是触发命令。
 
-### 可选：正则规则
-
-如果后续还想保留轻量、确定性的新增行检查，可以额外配置 `[[rules]]`：
-
-```toml
-[[rules]]
-auto_enabled = true
-id = "forbid-unwrap"
-title = "避免直接 unwrap"
-severity = "warning"
-path = "**/*.rs"
-pattern = "\\.unwrap\\(\\)"
-message = "直接使用 unwrap 可能导致运行时 panic，建议改成错误传播或显式处理。"
-```
-
-`[[rules]]` 可以配置多条，每条通过 `id` 区分。`auto_enabled` 默认是 `true`；设置为 `false` 时，这条规则不会参与自动 Review。
-
 ### 可选：脚本任务
 
-脚本任务仍然支持，但不再作为默认推荐路径。只有确实需要跑本地确定性检查时再配置：
+脚本任务仍然支持，但默认不启用。可以先保留配置，后续需要跑本地确定性检查时再打开：
 
 ```toml
 [[script_tasks]]

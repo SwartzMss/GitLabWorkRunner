@@ -217,7 +217,6 @@ async fn gitlab_webhook(
         review_run_id = %review_run_id,
         rules_file = %state.config.rules.file,
         ruleset_hash = %ruleset.hash(),
-        line_rules = ruleset.line_rule_count(),
         script_tasks = ruleset.script_task_count(),
         ai_reviews = ruleset.ai_review_count(),
         "ruleset loaded"

@@ -1,5 +1,4 @@
-# Default example: AI Review only.
-# You do not need [[rules]] or [[script_tasks]] for the normal AI review workflow.
+# Default example: AI Review enabled, script task configured but disabled.
 
 # Global AI review prompt settings shared by every [[ai_reviews]] entry.
 # Leave these empty to use the built-in reviewer prompt.
@@ -39,5 +38,12 @@ max_batch_diff_bytes = 15000
 max_batches = 10
 when_changed = ["**/*.rs", "**/*.toml", "**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp"]
 
-# Optional deterministic regex checks can still be added with [[rules]].
-# Optional local script tasks can still be added with [[script_tasks]].
+[[script_tasks]]
+auto_enabled = false
+id = "check-todo-tbd"
+title = "TODO/TBD 标记检查"
+# Relative paths are resolved from the runner executable directory.
+# The checked MR source root and result file path are appended as arguments.
+command = "python examples/scripts/check_todo_tbd.py"
+timeout_seconds = 30
+when_changed = ["**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.rs"]

@@ -1104,7 +1104,7 @@ mod tests {
             search_code.function.parameters["properties"]["query"]["description"]
                 .as_str()
                 .unwrap()
-                .contains("not a regex")
+                .contains("Plain substring")
         );
         assert!(list_files
             .function

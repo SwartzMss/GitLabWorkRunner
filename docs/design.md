@@ -8,7 +8,7 @@
 2. 服务校验事件并做去重。
 3. 通过 GitLab API 获取 MR diff。
 4. 解析 diff，建立文件、hunk、行号映射。
-5. 执行配置文件定义的行级规则、AI Review 和可选脚本任务。
+5. 执行配置文件定义的 AI Review 和可选脚本任务。
 6. 在 GitLab MR Discussion 中发布行级或 MR 级评论。
 7. 记录已处理 commit、评论 note id 和 MR 状态，避免重复评论。
 
@@ -25,9 +25,9 @@
 
 ## 推荐方案
 
-采用“Webhook 实时触发 + GitLab API 获取 Diff + SQLite 状态存储 + 配置化规则引擎 + GitLab MR Discussion 输出”的服务化架构。
+采用“Webhook 实时触发 + GitLab API 获取 Diff + SQLite 状态存储 + 配置化 Review 任务 + GitLab MR Discussion 输出”的服务化架构。
 
-这个方案比内置写死规则更灵活，也比第一版直接做插件系统更可控。行级规则、AI Review 和脚本任务都放在 `rules.toml` 中：基础 review 通过路径匹配、正则匹配和提示模板完成；AI Review 调用 OpenAI-compatible API；复杂检查通过独立的 `script_tasks` 下载 MR head 快照后执行。
+这个方案比直接做插件系统更可控。AI Review 和脚本任务都放在 `rules.toml` 中：AI Review 调用 OpenAI-compatible API；复杂检查可以通过独立的 `script_tasks` 下载 MR head 快照后执行。脚本任务默认可以保持 `auto_enabled = false`，后续需要时再启用或手动触发。
 
 ## 系统架构
 
@@ -38,7 +38,7 @@ GitLab Merge Request / MR Note Event
   -> GitLab API Client
   -> Diff Fetcher
   -> Diff Parser
-  -> Rule Engine
+  -> Review Engine
   -> Comment Builder
   -> GitLab Discussion Publisher
   -> State Store
@@ -143,37 +143,11 @@ enum DiffLineKind {
 }
 ```
 
-第一版规则只对 `Added` 行运行，避免对历史代码产生大量噪音。
+AI Review 和脚本任务只对当前 MR diff 中能够定位的新增行发布行级评论，避免对历史代码产生噪音。
 
-### Rule Engine
+### Review Finding
 
-职责：
-
-- 读取 `rules.toml`。
-- 对 diff 文件路径和新增行内容执行匹配。
-- 生成 review finding。
-
-第一版规则格式：
-
-```toml
-[[rules]]
-auto_enabled = true
-id = "forbid-unwrap"
-title = "避免直接 unwrap"
-severity = "warning"
-path = "**/*.rs"
-pattern = "\\.unwrap\\(\\)"
-message = "这里直接使用 unwrap 可能导致运行时 panic，建议改成错误传播或显式处理。"
-```
-
-规则字段：
-
-- `id`: 规则唯一标识。
-- `title`: 评论标题。
-- `severity`: `info`、`warning`、`error`。
-- `path`: glob 路径匹配。
-- `pattern`: 正则表达式。
-- `message`: 评论内容。
+AI Review 和脚本任务都会转换成统一的 finding：
 
 匹配结果结构：
 
@@ -265,11 +239,11 @@ src/config.rs:5: //TODO aa
 评论正文示例：
 
 ```markdown
-**[警告] 避免直接 unwrap**
+**[警告] AI finding**
 
-这里直接使用 unwrap 可能导致运行时 panic，建议改成错误传播或显式处理。
+Review finding.
 
-<!-- gitlab-work-runner:rule=forbid-unwrap -->
+<!-- gitlab-work-runner:rule=ai:ai-review -->
 ```
 
 ### GitLab Discussion Publisher
@@ -356,7 +330,7 @@ max_bytes = 10485760
 max_files = 5
 ```
 
-规则配置使用 `rules.toml`。当前支持三类配置：`[[rules]]` 正则匹配新增行、`[[ai_reviews]]` 调用 OpenAI-compatible API、`[[script_tasks]]` 下载 MR head 快照后执行外部脚本。`[[rules]]` 的 `auto_enabled` 默认是 `true`，设置为 `false` 时不参与自动 Review。脚本任务使用同一个 `rules.toml`，但作为独立任务执行，不与行级规则共享 Finding 模型。
+Review 配置使用 `rules.toml`。当前支持两类配置：`[[ai_reviews]]` 调用 OpenAI-compatible API、`[[script_tasks]]` 下载 MR head 快照后执行外部脚本。脚本任务使用同一个 `rules.toml`，但作为独立任务执行；它的输出也会转换成统一 Finding 后发布。
 
 ## 错误处理
 
@@ -379,7 +353,7 @@ max_files = 5
 - token 校验。
 - 去重 key 生成。
 - unified diff parser 的新增行、删除行、上下文行号映射。
-- rules.toml 解析和正则匹配。
+- rules.toml 解析、AI Review 配置选择和脚本任务选择。
 - AI Review 配置解析、自动/手动选择、OpenAI-compatible 响应解析和新增行过滤。
 - finding 到 GitLab discussion payload 的转换。
 - script task 的 archive 下载、解压、输出文件和 timeout 处理。
@@ -388,7 +362,7 @@ max_files = 5
 集成测试可以使用 mock GitLab API server，验证完整流程：
 
 ```text
-Webhook payload -> diff fixture -> rule finding -> discussion API request -> state store
+Webhook payload -> diff fixture -> AI finding -> discussion API request -> state store
 ```
 
 ## 第一版交付边界
@@ -399,7 +373,7 @@ Webhook payload -> diff fixture -> rule finding -> discussion API request -> sta
 2. 配置 GitLab webhook。
 3. MR 更新后自动触发 review。
 4. 服务拉取 MR diff。
-5. 根据 `rules.toml` 对新增行执行规则。
+5. 根据 `rules.toml` 执行 AI Review 和可选脚本任务。
 6. 在 MR 中发布行级评论。
 7. 对同一 commit 和同一规则集不重复评论。
 8. 将完整 Review 流程写入 stdout 和日志文件，并按大小轮转日志文件。
@@ -408,7 +382,6 @@ Webhook payload -> diff fixture -> rule finding -> discussion API request -> sta
 
 ## 后续扩展
 
-- 支持规则插件。
 - 支持更多 AI Review API 适配方式。
 - 支持更完整的 MR 级汇总评论。
 - 支持 Redis / PostgreSQL。

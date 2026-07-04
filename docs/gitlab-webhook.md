@@ -157,7 +157,7 @@ when_changed = ["**/*.rs"]
 7. 对 MR event，如果已处理，直接跳过。
 8. 通过 GitLab API 拉取 MR changes。
 9. 对 MR event，如果 GitLab diff refs 不完整，发布一条 MR 级跳过提示并写入状态存储。
-10. 对 MR event，解析 diff，只对新增行执行 `auto_enabled = true` 的规则，并自动执行匹配的 `auto_enabled = true` AI Review 和脚本任务。
+10. 对 MR event，解析 diff，并自动执行匹配的 `auto_enabled = true` AI Review 和脚本任务。
 11. 对 MR comment event，解析评论正文中的 `@id`，手动执行匹配的脚本任务和 AI Review。
 12. 发布 GitLab MR Discussion。
 13. 对 MR event 写入状态存储，避免重复评论；手动 comment event 不写入自动去重记录。
