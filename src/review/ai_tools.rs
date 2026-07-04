@@ -1,0 +1,571 @@
+use crate::rules::AiReviewConfig;
+
+use super::ai_schema::{OpenAiTool, OpenAiToolCall, OpenAiToolFunction};
+use std::{
+    fs,
+    path::{Component, Path, PathBuf},
+};
+use tracing::info;
+
+const SEARCH_MAX_MATCHES: usize = 50;
+const SEARCH_MAX_MATCHES_PER_FILE: usize = 5;
+const SEARCH_MAX_FILE_BYTES: u64 = 1024 * 1024;
+const LIST_MAX_FILES: usize = 200;
+
+pub(crate) fn enabled_context_tools(config: &AiReviewConfig) -> Vec<OpenAiTool> {
+    if config.max_tool_calls == 0 {
+        return Vec::new();
+    }
+    let mut tools = Vec::new();
+    if config.context_tools.read_file {
+        tools.push(read_file_tool());
+    }
+    if config.context_tools.search_code {
+        tools.push(search_code_tool());
+    }
+    if config.context_tools.list_files {
+        tools.push(list_files_tool());
+    }
+    tools
+}
+
+pub(crate) fn read_file_tool() -> OpenAiTool {
+    OpenAiTool {
+        tool_type: "function",
+        function: OpenAiToolFunction {
+            name: "read_file",
+            description: "Read one UTF-8 text file from the merge request head checkout. Use this when the diff references code whose surrounding implementation, type definitions, or call contract is needed. The path must be a repository-relative file path such as \"src/lib.rs\". Absolute paths, parent-directory traversal, .env, and .git are rejected. Returns JSON: {\"ok\":true,\"path\":\"src/lib.rs\",\"content\":\"...\",\"truncated\":false}; on failure returns {\"ok\":false,\"error\":\"...\"}. The result may be truncated by max_tool_result_bytes.",
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Repository-relative path of the UTF-8 text file to read, for example \"src/lib.rs\". Do not use absolute paths or \"..\"."
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        },
+    }
+}
+
+pub(crate) fn search_code_tool() -> OpenAiTool {
+    OpenAiTool {
+        tool_type: "function",
+        function: OpenAiToolFunction {
+            name: "search_code",
+            description: "Search UTF-8 text files in the merge request head checkout using a plain substring query, not a regular expression. Use this to find definitions, references, config keys, or related call sites before deciding whether a diff is buggy. Optional glob limits searched files, for example \"src/**/*.rs\". Sensitive files, dependency/build directories, lock files, and files larger than 1 MiB are skipped. Returns JSON: {\"ok\":true,\"matches\":[{\"path\":\"src/config.rs\",\"line\":42,\"before\":\"...\",\"text\":\"...\",\"after\":\"...\"}],\"truncated\":false}; on failure returns {\"ok\":false,\"error\":\"...\"}. At most 50 total matches and 5 matches per file are returned; result may be truncated by max_tool_result_bytes.",
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Plain substring to search for. This is not a regex. Use exact identifiers, function names, type names, config keys, or distinctive text."
+                    },
+                    "glob": {
+                        "type": "string",
+                        "description": "Optional glob that restricts searched files, for example \"src/**/*.rs\" or \"**/*.toml\"."
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+        },
+    }
+}
+
+pub(crate) fn list_files_tool() -> OpenAiTool {
+    OpenAiTool {
+        tool_type: "function",
+        function: OpenAiToolFunction {
+            name: "list_files",
+            description: "List repository files from the merge request head checkout. Use this when you need to discover likely file paths before calling read_file or search_code. Optional glob limits results, for example \"src/**/*.rs\". Sensitive files, dependency/build directories, and lock files are skipped. Returns JSON: {\"ok\":true,\"files\":[\"src/lib.rs\"],\"truncated\":false}; on failure returns {\"ok\":false,\"error\":\"...\"}. At most 200 files are returned and the result may be truncated by max_tool_result_bytes.",
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "glob": {
+                        "type": "string",
+                        "description": "Optional glob that restricts listed files, for example \"src/**/*.rs\" or \"**/*.toml\"."
+                    }
+                },
+                "additionalProperties": false
+            }),
+        },
+    }
+}
+
+pub(crate) fn review_findings_tool() -> OpenAiTool {
+    OpenAiTool {
+        tool_type: "function",
+        function: OpenAiToolFunction {
+            name: "submit_review_findings",
+            description:
+                "Submit high-confidence code review findings for the GitLab merge request diff.",
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "findings": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string" },
+                                "line": { "type": "integer" },
+                                "severity": {
+                                    "type": "string",
+                                    "enum": ["error"]
+                                },
+                                "title": { "type": "string" },
+                                "message": { "type": "string" }
+                            },
+                            "required": ["path", "line", "severity", "title", "message"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["findings"],
+                "additionalProperties": false
+            }),
+        },
+    }
+}
+
+pub(crate) fn is_context_tool_call(tool_call: &OpenAiToolCall) -> bool {
+    matches!(
+        tool_call.function.name.as_str(),
+        "read_file" | "search_code" | "list_files"
+    )
+}
+
+pub(crate) fn non_empty_tool_call_id(tool_call: &OpenAiToolCall) -> String {
+    if tool_call.id.trim().is_empty() {
+        format!("call_{}", tool_call.function.name)
+    } else {
+        tool_call.id.clone()
+    }
+}
+
+pub(crate) struct AiReviewToolContext {
+    source_dir: Option<PathBuf>,
+    read_file: bool,
+    search_code: bool,
+    list_files: bool,
+    max_result_bytes: usize,
+}
+
+impl AiReviewToolContext {
+    pub(crate) fn new(config: &AiReviewConfig, source_dir: Option<&Path>) -> Self {
+        let source_dir = source_dir.map(Path::to_path_buf);
+        if config.context_tools.any_enabled() {
+            info!(
+                ai_review_id = %config.id,
+                read_file = config.context_tools.read_file,
+                search_code = config.context_tools.search_code,
+                list_files = config.context_tools.list_files,
+                max_tool_calls = config.max_tool_calls,
+                max_tool_result_bytes = config.max_tool_result_bytes,
+                source_dir = %source_dir.as_ref().map(|path| path.display().to_string()).unwrap_or_default(),
+                "AI review context tools configured"
+            );
+        }
+        Self {
+            source_dir,
+            read_file: config.context_tools.read_file,
+            search_code: config.context_tools.search_code,
+            list_files: config.context_tools.list_files,
+            max_result_bytes: config.max_tool_result_bytes.max(1),
+        }
+    }
+
+    pub(crate) fn call(&self, tool_call: &OpenAiToolCall) -> String {
+        let result = match tool_call.function.name.as_str() {
+            "read_file" if self.read_file => self.read_file(&tool_call.function.arguments),
+            "search_code" if self.search_code => self.search_code(&tool_call.function.arguments),
+            "list_files" if self.list_files => self.list_files(&tool_call.function.arguments),
+            name => serde_json::json!({
+                "ok": false,
+                "error": format!("tool is not enabled: {name}")
+            }),
+        };
+        truncate_json_result(result, self.max_result_bytes)
+    }
+
+    pub(crate) fn enabled(&self) -> bool {
+        self.read_file || self.search_code || self.list_files
+    }
+
+    pub(crate) fn source_available(&self) -> bool {
+        self.source_dir.is_some()
+    }
+
+    pub(crate) fn enabled_tool_names(&self) -> String {
+        let mut names = Vec::new();
+        if self.read_file {
+            names.push("read_file");
+        }
+        if self.search_code {
+            names.push("search_code");
+        }
+        if self.list_files {
+            names.push("list_files");
+        }
+        names.join(",")
+    }
+
+    pub(crate) fn read_file(&self, arguments: &str) -> serde_json::Value {
+        #[derive(serde::Deserialize)]
+        struct Args {
+            path: String,
+        }
+        let args: Args = match serde_json::from_str(arguments) {
+            Ok(args) => args,
+            Err(err) => return tool_error(format!("invalid read_file arguments: {err}")),
+        };
+        let path = match self.resolve_safe_path(&args.path) {
+            Ok(path) => path,
+            Err(err) => return tool_error(err),
+        };
+        match fs::read_to_string(&path) {
+            Ok(content) => serde_json::json!({
+                "ok": true,
+                "path": normalize_path(&args.path),
+                "content": content,
+                "truncated": false
+            }),
+            Err(err) => tool_error(format!("failed to read file: {err}")),
+        }
+    }
+
+    fn search_code(&self, arguments: &str) -> serde_json::Value {
+        #[derive(serde::Deserialize)]
+        struct Args {
+            query: String,
+            #[serde(default)]
+            glob: Option<String>,
+        }
+        let args: Args = match serde_json::from_str(arguments) {
+            Ok(args) => args,
+            Err(err) => return tool_error(format!("invalid search_code arguments: {err}")),
+        };
+        if args.query.trim().is_empty() {
+            return tool_error("query must not be empty");
+        }
+        let Some(root) = &self.source_dir else {
+            return tool_error("source checkout is not available");
+        };
+        let matcher = match optional_glob_matcher(args.glob.as_deref()) {
+            Ok(matcher) => matcher,
+            Err(err) => return tool_error(err),
+        };
+        let mut matches = Vec::new();
+        collect_files(root, root, &mut |relative, path| {
+            if matches.len() >= SEARCH_MAX_MATCHES {
+                return;
+            }
+            if is_low_value_context_path(relative) || file_too_large(path, SEARCH_MAX_FILE_BYTES) {
+                return;
+            }
+            if !matcher
+                .as_ref()
+                .is_none_or(|matcher| matcher.is_match(relative))
+            {
+                return;
+            }
+            let Ok(content) = fs::read_to_string(path) else {
+                return;
+            };
+            let lines: Vec<_> = content.lines().collect();
+            let mut file_matches = 0_usize;
+            for (index, line) in lines.iter().enumerate() {
+                if line.contains(&args.query) {
+                    matches.push(serde_json::json!({
+                        "path": relative,
+                        "line": index + 1,
+                        "before": index.checked_sub(1).and_then(|before| lines.get(before)).copied().unwrap_or(""),
+                        "text": line
+                            ,
+                        "after": lines.get(index + 1).copied().unwrap_or("")
+                    }));
+                    file_matches += 1;
+                    if matches.len() >= SEARCH_MAX_MATCHES
+                        || file_matches >= SEARCH_MAX_MATCHES_PER_FILE
+                    {
+                        break;
+                    }
+                }
+            }
+        });
+        serde_json::json!({
+            "ok": true,
+            "matches": matches,
+            "truncated": matches.len() >= SEARCH_MAX_MATCHES
+        })
+    }
+
+    fn list_files(&self, arguments: &str) -> serde_json::Value {
+        #[derive(serde::Deserialize)]
+        struct Args {
+            #[serde(default)]
+            glob: Option<String>,
+        }
+        let args: Args = match serde_json::from_str(arguments) {
+            Ok(args) => args,
+            Err(err) => return tool_error(format!("invalid list_files arguments: {err}")),
+        };
+        let Some(root) = &self.source_dir else {
+            return tool_error("source checkout is not available");
+        };
+        let matcher = match optional_glob_matcher(args.glob.as_deref()) {
+            Ok(matcher) => matcher,
+            Err(err) => return tool_error(err),
+        };
+        let mut files = Vec::new();
+        collect_files(root, root, &mut |relative, _path| {
+            if files.len() >= LIST_MAX_FILES {
+                return;
+            }
+            if is_low_value_context_path(relative) {
+                return;
+            }
+            if matcher
+                .as_ref()
+                .is_none_or(|matcher| matcher.is_match(relative))
+            {
+                files.push(relative.to_string());
+            }
+        });
+        serde_json::json!({
+            "ok": true,
+            "files": files,
+            "truncated": files.len() >= LIST_MAX_FILES
+        })
+    }
+
+    fn resolve_safe_path(&self, raw_path: &str) -> Result<PathBuf, String> {
+        let Some(root) = &self.source_dir else {
+            return Err("source checkout is not available".into());
+        };
+        let normalized = normalize_path(raw_path);
+        if normalized.is_empty() {
+            return Err("path must not be empty".into());
+        }
+        if is_sensitive_path(&normalized) {
+            return Err("path is blocked by AI review tool policy".into());
+        }
+        let relative = Path::new(&normalized);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err("path must be a relative repository file path".into());
+        }
+        let candidate = root.join(relative);
+        let canonical_root = root
+            .canonicalize()
+            .map_err(|err| format!("failed to resolve source checkout: {err}"))?;
+        let canonical_candidate = candidate
+            .canonicalize()
+            .map_err(|err| format!("failed to resolve file path: {err}"))?;
+        if !canonical_candidate.starts_with(&canonical_root) {
+            return Err("path escapes source checkout".into());
+        }
+        Ok(canonical_candidate)
+    }
+}
+
+fn collect_files(root: &Path, current: &Path, visit: &mut impl FnMut(&str, &Path)) {
+    let Ok(entries) = fs::read_dir(current) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            collect_files(root, &path, visit);
+        } else if file_type.is_file() {
+            let Ok(relative) = path.strip_prefix(root) else {
+                continue;
+            };
+            let relative = normalize_path(&relative.to_string_lossy());
+            if is_sensitive_path(&relative) {
+                continue;
+            }
+            visit(&relative, &path);
+        }
+    }
+}
+
+fn optional_glob_matcher(pattern: Option<&str>) -> Result<Option<globset::GlobMatcher>, String> {
+    let Some(pattern) = pattern.map(str::trim).filter(|pattern| !pattern.is_empty()) else {
+        return Ok(None);
+    };
+    globset::Glob::new(pattern)
+        .map(|glob| Some(glob.compile_matcher()))
+        .map_err(|err| format!("invalid glob: {err}"))
+}
+
+fn truncate_json_result(value: serde_json::Value, max_bytes: usize) -> String {
+    let text = value.to_string();
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    serde_json::json!({
+        "ok": true,
+        "truncated": true,
+        "content": &text[..end]
+    })
+    .to_string()
+}
+
+fn tool_error(message: impl ToString) -> serde_json::Value {
+    serde_json::json!({
+        "ok": false,
+        "error": message.to_string()
+    })
+}
+
+fn normalize_path(path: &str) -> String {
+    path.replace('\\', "/").trim_matches('/').to_string()
+}
+
+fn is_sensitive_path(path: &str) -> bool {
+    let normalized = normalize_path(path).to_ascii_lowercase();
+    normalized == ".env"
+        || normalized.starts_with(".env.")
+        || normalized.ends_with("/.env")
+        || normalized.contains("/.env.")
+        || normalized.contains("/.git/")
+        || normalized.starts_with(".git/")
+}
+
+fn is_low_value_context_path(path: &str) -> bool {
+    let normalized = normalize_path(path).to_ascii_lowercase();
+    let components: Vec<_> = normalized.split('/').collect();
+    if components.iter().any(|component| {
+        matches!(
+            *component,
+            "node_modules"
+                | "target"
+                | "dist"
+                | "build"
+                | ".next"
+                | ".nuxt"
+                | "coverage"
+                | "vendor"
+        )
+    }) {
+        return true;
+    }
+    matches!(
+        normalized.rsplit('/').next().unwrap_or(normalized.as_str()),
+        "cargo.lock"
+            | "package-lock.json"
+            | "pnpm-lock.yaml"
+            | "yarn.lock"
+            | "bun.lockb"
+            | "composer.lock"
+            | "poetry.lock"
+    )
+}
+
+fn file_too_large(path: &Path, max_bytes: u64) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.len() > max_bytes)
+        .unwrap_or(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rules::{AiReviewConfig, AiReviewContextTools};
+    use std::io::Write;
+
+    fn test_config() -> AiReviewConfig {
+        AiReviewConfig {
+            auto_enabled: true,
+            id: "ai-review".into(),
+            title: "AI Review".into(),
+            base_url: "https://ai.example.com".into(),
+            api_key: "test-key".into(),
+            model: "test-model".into(),
+            timeout_seconds: 60,
+            request_timeout_seconds: None,
+            max_diff_bytes: 60_000,
+            second_pass_on_clean: false,
+            batch_review: false,
+            max_batch_diff_bytes: 30_000,
+            max_batches: 6,
+            system_prompt: None,
+            extra_instructions: String::new(),
+            max_tool_calls: 8,
+            max_tool_result_bytes: 60_000,
+            context_tools: AiReviewContextTools {
+                read_file: false,
+                search_code: true,
+                list_files: true,
+            },
+            when_changed: vec![],
+        }
+    }
+
+    #[test]
+    fn search_code_returns_context_and_limits_matches_per_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("src/lib.rs");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(
+            &file,
+            "before one\nneedle one\nafter one\nneedle two\nneedle three\nneedle four\nneedle five\nneedle six\n",
+        )
+        .unwrap();
+        let context = AiReviewToolContext::new(&test_config(), Some(temp.path()));
+
+        let result = context.search_code(r#"{"query":"needle","glob":"src/**/*.rs"}"#);
+        let matches = result["matches"].as_array().unwrap();
+
+        assert_eq!(matches.len(), SEARCH_MAX_MATCHES_PER_FILE);
+        assert_eq!(matches[0]["before"], "before one");
+        assert_eq!(matches[0]["text"], "needle one");
+        assert_eq!(matches[0]["after"], "after one");
+    }
+
+    #[test]
+    fn search_code_skips_low_value_and_large_files() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("Cargo.lock"), "needle lock\n").unwrap();
+        let large_file = temp.path().join("src/large.rs");
+        std::fs::create_dir_all(large_file.parent().unwrap()).unwrap();
+        let mut file = std::fs::File::create(&large_file).unwrap();
+        file.write_all(&vec![b'a'; SEARCH_MAX_FILE_BYTES as usize + 1])
+            .unwrap();
+        let context = AiReviewToolContext::new(&test_config(), Some(temp.path()));
+
+        let result = context.search_code(r#"{"query":"needle"}"#);
+
+        assert!(result["matches"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_files_skips_low_value_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::create_dir_all(temp.path().join("node_modules/pkg")).unwrap();
+        std::fs::write(temp.path().join("src/lib.rs"), "pub fn value() {}\n").unwrap();
+        std::fs::write(temp.path().join("node_modules/pkg/index.js"), "needle\n").unwrap();
+        std::fs::write(temp.path().join("package-lock.json"), "{}\n").unwrap();
+        let context = AiReviewToolContext::new(&test_config(), Some(temp.path()));
+
+        let result = context.list_files(r#"{}"#);
+        let files = result["files"].as_array().unwrap();
+
+        assert_eq!(files, &[serde_json::json!("src/lib.rs")]);
+    }
+}

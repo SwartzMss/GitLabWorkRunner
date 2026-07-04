@@ -17,6 +17,24 @@ command = "python examples/scripts/check_todo_tbd.py"
 timeout_seconds = 30
 when_changed = ["**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.rs"]
 
+# Global AI review prompt settings shared by every [[ai_reviews]] entry.
+# Leave these empty to use the built-in reviewer prompt.
+[ai_review]
+# system_prompt = "You are a careful code reviewer. Return only high-confidence bugs."
+extra_instructions = """
+重点关注编译错误、运行时错误、资源生命周期、线程安全和安全漏洞。
+不要报告风格建议、命名建议或不确定的问题。
+"""
+# Built-in read-only context tools are disabled by default. Enable them when the model may need
+# repository context beyond the diff. The runner controls call count and result size.
+max_tool_calls = 8
+max_tool_result_bytes = 60000
+
+[ai_review.context_tools]
+read_file = false
+search_code = false
+list_files = false
+
 [[ai_reviews]]
 auto_enabled = false
 id = "ai-review"
@@ -28,6 +46,8 @@ timeout_seconds = 900
 request_timeout_seconds = 180
 max_diff_bytes = 60000
 second_pass_on_clean = false
+# AI Review requests Chat Completions tool_calls by default and falls back to JSON content parsing when needed.
+# This does not require MCP; findings are read from submit_review_findings arguments when tool_calls are returned.
 batch_review = true
 max_batch_diff_bytes = 15000
 max_batches = 10
