@@ -912,7 +912,7 @@ fn sanitize_work_path_segment(value: &str) -> String {
     }
 }
 
-fn manual_script_task_ids(text: &str) -> Vec<String> {
+pub(crate) fn manual_script_task_ids(text: &str) -> Vec<String> {
     let mut ids = BTreeSet::new();
     for raw in text.split_whitespace() {
         let token = raw.trim_matches(|ch: char| {
