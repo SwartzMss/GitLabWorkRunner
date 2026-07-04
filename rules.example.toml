@@ -27,7 +27,7 @@ extra_instructions = """
 """
 # Built-in read-only context tools are disabled by default. Enable them when the model may need
 # repository context beyond the diff. The runner controls call count and result size.
-max_tool_calls = 8
+max_tool_calls = 30
 max_tool_result_bytes = 60000
 
 [ai_review.context_tools]

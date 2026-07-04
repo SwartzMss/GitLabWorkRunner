@@ -339,7 +339,7 @@ fn default_ai_max_batches() -> usize {
 }
 
 fn default_ai_max_tool_calls() -> usize {
-    8
+    30
 }
 
 fn default_ai_max_tool_result_bytes() -> usize {
@@ -513,7 +513,7 @@ when_changed = ["src/**"]
         assert_eq!(reviews[0].max_batches, 6);
         assert_eq!(reviews[0].system_prompt, None);
         assert!(reviews[0].extra_instructions.is_empty());
-        assert_eq!(reviews[0].max_tool_calls, 8);
+        assert_eq!(reviews[0].max_tool_calls, 30);
         assert_eq!(reviews[0].max_tool_result_bytes, 60_000);
         assert_eq!(reviews[0].context_tools, AiReviewContextTools::default());
     }
