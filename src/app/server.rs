@@ -2,6 +2,7 @@ use crate::{
     config::AppConfig,
     error::AppResult,
     gitlab::{CreateDiscussionRequest, GitLabClient},
+    review::work_cleanup::{cleanup_stale_review_work, spawn_periodic_stale_review_work_cleanup},
     review::{service::manual_script_task_ids, ReviewService},
     rules::Ruleset,
     storage::StateStore,
@@ -122,6 +123,10 @@ pub async fn serve(config: AppConfig, store: StateStore) -> AppResult<()> {
         })?;
     let app = router(config, store);
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    if let Err(err) = cleanup_stale_review_work() {
+        warn!(error = %err, "initial stale review work cleanup failed");
+    }
+    spawn_periodic_stale_review_work_cleanup();
     info!(bind = %addr, "http server listening");
     axum::serve(listener, app).await?;
     Ok(())

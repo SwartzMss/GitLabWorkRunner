@@ -243,6 +243,17 @@ If optional script tasks are configured, they can also be triggered by their id:
 
 The current implementation does not perform an extra GitLab role check for the comment author. If a user can comment on the MR and the comment contains a valid `@id`, the service runs the matching manual task. Add a service-side permission check or allowlist if only Maintainers or selected users should be allowed to trigger manual tasks.
 
+## Work Directory Cleanup
+
+Downloaded GitLab archive zip bytes stay in memory; the service does not write the zip file to disk. When repository context is needed, the archive is extracted under `work/`:
+
+- AI context tools: `work/ai_review_context/.../<review_run_id>/source`
+- Script tasks: `work/script_tasks/.../<task_id>/source`
+
+After normal completion or failure, AI Review removes the current context run directory. Script tasks remove `source` but keep `run.log` and `result.txt` for troubleshooting. On startup, the service cleans stale work directories older than 24 hours, and it repeats that cleanup every hour while running. Cleanup failures are logged as WARN and do not block review.
+
+The active-review guard is process-local. For multi-instance deployments, move the running lock to SQLite/PostgreSQL if cross-process exclusion and global cleanup are required.
+
 ## More Docs
 
 - [docs/design.md](docs/design.md): design and module boundaries.

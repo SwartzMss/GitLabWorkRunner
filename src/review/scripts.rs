@@ -71,6 +71,13 @@ impl ScriptTaskRunner {
         );
         reset_task_dir(&task_dir)?;
         fs::create_dir_all(&source_dir)?;
+        let _source_guard = ScriptTaskSourceDirGuard {
+            source_dir: source_dir.clone(),
+            project_id: context.project_id,
+            mr_iid: context.mr_iid,
+            commit_sha: context.commit_sha.to_string(),
+            script_task_id: task.id.clone(),
+        };
         let extracted_files = extract_zip_archive(archive, &source_dir)?;
         info!(
             project_id = context.project_id,
@@ -156,18 +163,6 @@ impl ScriptTaskRunner {
             }
         };
 
-        if source_dir.exists() {
-            fs::remove_dir_all(&source_dir)?;
-            info!(
-                project_id = context.project_id,
-                mr_iid = context.mr_iid,
-                commit_sha = %context.commit_sha,
-                script_task_id = %task.id,
-                source_dir = %source_dir.display(),
-                "script task source directory removed"
-            );
-        }
-
         info!(
             project_id = context.project_id,
             mr_iid = context.mr_iid,
@@ -197,6 +192,41 @@ impl ScriptTaskRunner {
             .join(context.mr_iid.to_string())
             .join(sanitize_path_segment(context.commit_sha))
             .join(sanitize_path_segment(task_id))
+    }
+}
+
+struct ScriptTaskSourceDirGuard {
+    source_dir: PathBuf,
+    project_id: i64,
+    mr_iid: i64,
+    commit_sha: String,
+    script_task_id: String,
+}
+
+impl Drop for ScriptTaskSourceDirGuard {
+    fn drop(&mut self) {
+        if !self.source_dir.exists() {
+            return;
+        }
+        match fs::remove_dir_all(&self.source_dir) {
+            Ok(()) => info!(
+                project_id = self.project_id,
+                mr_iid = self.mr_iid,
+                commit_sha = %self.commit_sha,
+                script_task_id = %self.script_task_id,
+                source_dir = %self.source_dir.display(),
+                "script task source directory removed"
+            ),
+            Err(err) => warn!(
+                project_id = self.project_id,
+                mr_iid = self.mr_iid,
+                commit_sha = %self.commit_sha,
+                script_task_id = %self.script_task_id,
+                source_dir = %self.source_dir.display(),
+                error = %err,
+                "failed to remove script task source directory"
+            ),
+        }
     }
 }
 
@@ -558,6 +588,7 @@ mod tests {
             "{}",
             fs::read_to_string(&result.run_log_path).unwrap_or_default()
         );
+        assert!(!result.source_dir.exists());
         assert!(result.run_log_path.exists());
         assert_eq!(fs::read_to_string(result.result_path).unwrap().trim(), "ok");
     }

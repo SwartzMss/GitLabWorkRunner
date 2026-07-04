@@ -305,6 +305,15 @@ create table review_comments (
 );
 ```
 
+### Work Directory Cleanup
+
+GitLab archive zip 只保存在内存中，不落盘保存。需要仓库上下文时，服务会把 archive 解压到 `work/`：
+
+- AI context tools 解压到 `work/ai_review_context/.../<review_run_id>/source`，review 完成或失败后删除本次 context run 目录。
+- 脚本任务解压到 `work/script_tasks/.../<task_id>/source`，任务结束后删除 `source`，保留 `run.log` 和 `result.txt` 便于排查。
+
+进程启动时会清理一次超过 24 小时的残留目录，运行中每小时再清理一次。清理失败只记录 WARN，不阻断 review。当前运行中去重和清理都是单进程内防护；多实例部署时需要把运行中锁迁移到 SQLite/PostgreSQL。
+
 ## 配置设计
 
 服务配置使用 `config.toml`：

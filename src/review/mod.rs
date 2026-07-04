@@ -8,5 +8,6 @@ pub mod diff;
 pub mod rules;
 pub mod scripts;
 pub mod service;
+pub(crate) mod work_cleanup;
 
 pub use service::*;

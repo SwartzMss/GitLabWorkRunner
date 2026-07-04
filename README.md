@@ -316,6 +316,17 @@ src/config.rs:5: //TODO aa
 
 当前实现不会额外校验评论人的 GitLab 角色；只要用户能在 MR 评论，并且评论内容包含合法的 `@id`，服务就会执行对应手动任务。如果需要限制只有 Maintainer 或指定用户可以触发，需要在服务侧增加权限校验或 allowlist。
 
+## 工作目录清理
+
+GitLab archive zip 下载后只保存在内存里，不会作为 zip 文件写入磁盘。需要仓库上下文时，服务会把 archive 解压到 `work/` 下：
+
+- AI context tools：`work/ai_review_context/.../<review_run_id>/source`
+- 脚本任务：`work/script_tasks/.../<task_id>/source`
+
+正常完成或失败后，AI Review 会删除本次 context run 目录；脚本任务会删除 `source` 目录，但保留 `run.log` 和 `result.txt` 便于排查。服务启动时会清理一次超过 24 小时的残留目录，运行中也会每小时清理一次。清理失败只写 WARN，不会阻断 review。
+
+当前运行中去重是单进程内的；多实例部署时，如果需要跨进程互斥和全局清理，需要把运行中锁迁移到 SQLite/PostgreSQL。
+
 ## 更多文档
 
 - [docs/design.md](docs/design.md)：设计和模块边界。
