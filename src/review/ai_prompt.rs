@@ -24,7 +24,7 @@ pub(crate) fn build_review_prompt_with_limit(
     } else {
         ""
     };
-    let response_instruction = "优先调用 submit_review_findings tool 提交最终结果，arguments 格式必须是 {\"findings\":[{\"path\":\"src/file.rs\",\"line\":123,\"severity\":\"error\",\"title\":\"简短中文标题\",\"message\":\"具体说明为什么这是错误，以及应该如何修复。\"}]}。如果服务没有返回 tool_calls，则最终 content 必须是同样格式的 JSON，且 JSON 是唯一有效输出。如果没有确定的错误，提交或返回 {\"findings\":[]}。不要把最终结果只写在 reasoning_content、分析过程或其他非 tool arguments/content 字段里。";
+    let response_instruction = "优先调用 submit_review_findings tool 提交最终结果，arguments 格式必须是 {\"findings\":[{\"path\":\"src/file.rs\",\"line\":123,\"severity\":\"error\",\"title\":\"简短中文标题\",\"message\":\"具体说明为什么这是错误，以及应该如何修复。\"}]}。如果服务没有返回 tool_calls，则最终 content 必须只包含同样格式的 JSON，不能在 JSON 前后添加解释、Markdown 或其他文字。如果没有确定的错误，提交或返回 {\"findings\":[]}。不要把最终结果只写在 reasoning_content、分析过程或其他非 tool arguments/content 字段里。";
     let context_tool_instruction = context_tool_instruction(config);
     let extra_instructions = config.extra_instructions.trim();
     let extra_instructions = if extra_instructions.is_empty() {

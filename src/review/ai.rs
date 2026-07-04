@@ -532,7 +532,7 @@ fn parse_openai_message(
         assistant_content_preview = %preview_log_text(content, AI_RESPONSE_PREVIEW_CHARS),
         "AI review assistant content received"
     );
-    let parsed: AiFindingsResponse = serde_json::from_str(content)?;
+    let parsed = parse_ai_findings_response(content)?;
     info!(
         ai_review_id = %review_id,
         parsed_findings = parsed.findings.len(),
@@ -551,6 +551,52 @@ fn parse_openai_message(
             message: finding.message.trim().to_string(),
         })
         .collect())
+}
+
+fn parse_ai_findings_response(content: &str) -> AppResult<AiFindingsResponse> {
+    match serde_json::from_str(content) {
+        Ok(parsed) => Ok(parsed),
+        Err(strict_error) => {
+            let Some(json_content) = extract_first_json_object(content) else {
+                return Err(strict_error.into());
+            };
+            serde_json::from_str(json_content).map_err(Into::into)
+        }
+    }
+}
+
+fn extract_first_json_object(content: &str) -> Option<&str> {
+    let start = content.find('{')?;
+    let mut depth = 0_usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, ch) in content[start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    let end = start + offset + ch.len_utf8();
+                    return Some(&content[start..end]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn tool_call_arguments(message: &OpenAiMessage) -> AppResult<&str> {
@@ -714,6 +760,33 @@ mod tests {
         assert_eq!(findings[0].new_line, Some(12));
         assert_eq!(findings[0].title, "Possible panic");
         assert_eq!(findings[0].message, "Avoid unwrap here.");
+    }
+
+    #[test]
+    fn parses_findings_from_assistant_content_with_explanatory_prefix() {
+        let response = r#"
+{
+  "choices": [{
+    "message": {
+      "content": "经过仔细审查，未发现高置信度问题。\n\n{\"findings\":[]}"
+    }
+  }]
+}
+"#;
+
+        let findings = parse_openai_response("ai-review", "AI Review", response).unwrap();
+
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn extracts_json_object_without_breaking_on_braces_inside_strings() {
+        let content = "说明文字 {\"findings\":[{\"path\":\"src/lib.rs\",\"line\":1,\"severity\":\"error\",\"title\":\"Bug\",\"message\":\"contains } brace\"}]} trailing";
+
+        let parsed = parse_ai_findings_response(content).unwrap();
+
+        assert_eq!(parsed.findings.len(), 1);
+        assert_eq!(parsed.findings[0].message, "contains } brace");
     }
 
     #[test]
