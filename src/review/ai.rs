@@ -410,6 +410,7 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                 "AI review context tool call limit reached"
             );
         }
+        let context_tool_calls = synthesize_context_tool_call_ids(context_tool_calls);
 
         messages.push(ChatMessage {
             role: "assistant".into(),
@@ -484,6 +485,19 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
         }
         body = response.body;
     }
+}
+
+fn synthesize_context_tool_call_ids(tool_calls: Vec<OpenAiToolCall>) -> Vec<OpenAiToolCall> {
+    tool_calls
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut tool_call)| {
+            if tool_call.id.trim().is_empty() {
+                tool_call.id = format!("call_{}_{}", tool_call.function.name, index + 1);
+            }
+            tool_call
+        })
+        .collect()
 }
 
 fn context_tool_call_limit_result(config: &AiReviewConfig) -> String {

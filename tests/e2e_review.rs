@@ -881,6 +881,91 @@ async fn ai_review_falls_back_to_json_content_after_retryable_tool_request_failu
 }
 
 #[tokio::test]
+async fn ai_review_synthesizes_matching_ids_for_empty_context_tool_calls() {
+    let ai_request_count = Arc::new(AtomicUsize::new(0));
+    let ai_request_count_for_handler = Arc::clone(&ai_request_count);
+    let (listener, addr) = bind_test_listener().await;
+    let app = Router::new().route(
+        "/chat/completions",
+        post(move |body: Bytes| {
+            let ai_request_count = Arc::clone(&ai_request_count_for_handler);
+            async move {
+                let request_index = ai_request_count.fetch_add(1, Ordering::SeqCst) + 1;
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                if request_index == 1 {
+                    return Json(json!({
+                        "choices": [{
+                            "message": {
+                                "tool_calls": [{
+                                    "id": "",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "search_code",
+                                        "arguments": "{\"query\":\"panic\"}"
+                                    }
+                                }]
+                            }
+                        }]
+                    }));
+                }
+
+                let messages = body["messages"].as_array().unwrap();
+                let assistant = messages
+                    .iter()
+                    .find(|message| message["role"] == "assistant")
+                    .unwrap();
+                let tool = messages
+                    .iter()
+                    .find(|message| message["role"] == "tool")
+                    .unwrap();
+                let assistant_tool_call_id = assistant["tool_calls"][0]["id"].as_str().unwrap();
+                assert!(!assistant_tool_call_id.is_empty());
+                assert_eq!(tool["tool_call_id"], assistant_tool_call_id);
+
+                Json(json!({
+                    "choices": [{
+                        "message": {
+                            "tool_calls": [{
+                                "id": "submit_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "submit_review_findings",
+                                    "arguments": "{\"findings\":[]}"
+                                }
+                            }]
+                        }
+                    }]
+                }))
+            }
+        }),
+    );
+    spawn_server_on(listener, app);
+
+    let config = AiReviewConfig {
+        base_url: format!("http://{}", addr),
+        context_tools: AiReviewContextTools {
+            read_file: false,
+            search_code: true,
+            list_files: false,
+        },
+        ..test_ai_review_config(format!("http://{}", addr))
+    };
+    let changes = vec![GitLabChange {
+        old_path: "src/lib.rs".into(),
+        new_path: "src/lib.rs".into(),
+        new_file: false,
+        renamed_file: false,
+        deleted_file: false,
+        diff: "@@ -1 +1 @@\n+panic!();\n".into(),
+    }];
+
+    let findings = run_ai_review(&config, &changes).await.unwrap();
+
+    assert!(findings.is_empty());
+    assert_eq!(ai_request_count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn ai_review_uses_builtin_read_file_context_tool() {
     let ai_request_count = Arc::new(AtomicUsize::new(0));
     let ai_request_count_for_handler = Arc::clone(&ai_request_count);
