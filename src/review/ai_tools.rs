@@ -2,7 +2,8 @@ use crate::rules::AiReviewConfig;
 
 use super::ai_schema::{OpenAiTool, OpenAiToolCall, OpenAiToolFunction};
 use std::{
-    fs,
+    fs::{self, File},
+    io::Read,
     path::{Component, Path, PathBuf},
 };
 use tracing::info;
@@ -10,6 +11,7 @@ use tracing::info;
 const SEARCH_MAX_MATCHES: usize = 50;
 const SEARCH_MAX_MATCHES_PER_FILE: usize = 5;
 const SEARCH_MAX_FILE_BYTES: u64 = 1024 * 1024;
+const READ_MAX_FILE_BYTES: usize = 1024 * 1024;
 const LIST_MAX_FILES: usize = 200;
 
 pub(crate) fn enabled_context_tools(config: &AiReviewConfig) -> Vec<OpenAiTool> {
@@ -34,7 +36,7 @@ pub(crate) fn read_file_tool() -> OpenAiTool {
         tool_type: "function",
         function: OpenAiToolFunction {
             name: "read_file",
-            description: "Read one UTF-8 text file from the merge request head checkout. Use this when the diff references code whose surrounding implementation, type definitions, or call contract is needed. The path must be a repository-relative file path such as \"src/lib.rs\". Absolute paths, parent-directory traversal, .env, and .git are rejected. Returns JSON: {\"ok\":true,\"path\":\"src/lib.rs\",\"content\":\"...\",\"truncated\":false}; on failure returns {\"ok\":false,\"error\":\"...\"}. The result may be truncated by max_tool_result_bytes.",
+            description: "Read one UTF-8 text file from the merge request head checkout. Use this when the diff references code whose surrounding implementation, type definitions, or call contract is needed. The path must be a repository-relative file path such as \"src/lib.rs\". Absolute paths, parent-directory traversal, .env, and .git are rejected. Returns JSON: {\"ok\":true,\"path\":\"src/lib.rs\",\"content\":\"...\",\"truncated\":false}; on failure returns {\"ok\":false,\"error\":\"...\"}. File content is limited by max_tool_result_bytes and an internal 1 MiB cap, and may be returned with truncated=true.",
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -226,12 +228,12 @@ impl AiReviewToolContext {
             Ok(path) => path,
             Err(err) => return tool_error(err),
         };
-        match fs::read_to_string(&path) {
-            Ok(content) => serde_json::json!({
+        match read_utf8_file_limited(&path, self.max_result_bytes.min(READ_MAX_FILE_BYTES)) {
+            Ok((content, truncated)) => serde_json::json!({
                 "ok": true,
                 "path": normalize_path(&args.path),
                 "content": content,
-                "truncated": false
+                "truncated": truncated
             }),
             Err(err) => tool_error(format!("failed to read file: {err}")),
         }
@@ -482,6 +484,35 @@ fn file_too_large(path: &Path, max_bytes: u64) -> bool {
         .unwrap_or(true)
 }
 
+fn read_utf8_file_limited(path: &Path, max_bytes: usize) -> Result<(String, bool), String> {
+    let max_bytes = max_bytes.max(1);
+    let mut file = File::open(path).map_err(|err| err.to_string())?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(max_bytes as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|err| err.to_string())?;
+    let truncated = bytes.len() > max_bytes;
+    if truncated {
+        bytes.truncate(max_bytes);
+    }
+    loop {
+        match String::from_utf8(bytes) {
+            Ok(text) => return Ok((text, truncated)),
+            Err(err) => {
+                let utf8_error = err.utf8_error();
+                if truncated && utf8_error.error_len().is_none() {
+                    let valid_up_to = utf8_error.valid_up_to();
+                    bytes = err.into_bytes();
+                    bytes.truncate(valid_up_to);
+                    continue;
+                }
+                return Err(format!("file is not valid UTF-8: {utf8_error}"));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -567,5 +598,28 @@ mod tests {
         let files = result["files"].as_array().unwrap();
 
         assert_eq!(files, &[serde_json::json!("src/lib.rs")]);
+    }
+
+    #[test]
+    fn read_file_limits_content_and_preserves_utf8_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("large.txt");
+        std::fs::write(&path, "一二三四五六").unwrap();
+        let config = AiReviewConfig {
+            context_tools: AiReviewContextTools {
+                read_file: true,
+                search_code: false,
+                list_files: false,
+            },
+            max_tool_result_bytes: 10,
+            ..test_config()
+        };
+        let context = AiReviewToolContext::new(&config, Some(temp.path()));
+
+        let result = context.read_file(r#"{"path":"large.txt"}"#);
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["truncated"], true);
+        assert_eq!(result["content"], "一二三");
     }
 }
