@@ -1,12 +1,11 @@
 use crate::{
     ai_review::run_ai_review_with_context,
     comments::{build_comment_drafts, CommentDraft},
-    diff::parse_unified_diff,
     error::{AppError, AppResult},
     gitlab::{CreateDiscussionRequest, DiscussionPosition, GitLabChange, GitLabClient},
     rules::{AiReviewConfig, Finding, Ruleset, Severity},
     script_tasks::{
-        extract_zip_archive, ScriptTaskContext, ScriptTaskResult, ScriptTaskRunner,
+        extract_zip_archive, ArchiveLimits, ScriptTaskContext, ScriptTaskResult, ScriptTaskRunner,
         ScriptTaskStatus,
     },
     storage::{ReviewKey, StateStore, StoredComment},
@@ -26,6 +25,8 @@ pub struct ReviewService {
     gitlab: GitLabClient,
     store: StateStore,
     ruleset: Ruleset,
+    review_run_id: Option<String>,
+    archive_limits: ArchiveLimits,
 }
 
 impl ReviewService {
@@ -34,7 +35,19 @@ impl ReviewService {
             gitlab,
             store,
             ruleset,
+            review_run_id: None,
+            archive_limits: ArchiveLimits::default(),
         }
+    }
+
+    pub fn with_review_run_id(mut self, review_run_id: String) -> Self {
+        self.review_run_id = Some(review_run_id);
+        self
+    }
+
+    pub fn with_archive_limits(mut self, archive_limits: ArchiveLimits) -> Self {
+        self.archive_limits = archive_limits;
+        self
     }
 
     pub async fn review_merge_request(
@@ -144,53 +157,8 @@ impl ReviewService {
             });
         }
 
-        let mut findings = Vec::new();
         let mut ai_finding_count = 0_usize;
         let mut published = 0_usize;
-        let mut line_review_skipped = false;
-
-        if self.ruleset.has_line_rules() && !changes.diff_refs.is_complete() {
-            warn!(
-                project_id = event.project_id,
-                mr_iid = event.mr_iid,
-                commit_sha = %event.commit_sha,
-                base_sha = ?changes.diff_refs.base_sha,
-                start_sha = ?changes.diff_refs.start_sha,
-                head_sha = ?changes.diff_refs.head_sha,
-                "line review skipped because gitlab diff refs are incomplete"
-            );
-            let created = self
-                .gitlab
-                .create_discussion(
-                    event.project_id,
-                    event.mr_iid,
-                    &CreateDiscussionRequest {
-                        body: incomplete_diff_refs_body(),
-                        position: None,
-                    },
-                )
-                .await?;
-            self.store
-                .record_comment(&StoredComment {
-                    project_id: event.project_id,
-                    mr_iid: event.mr_iid,
-                    commit_sha: &event.commit_sha,
-                    ruleset_hash: self.ruleset.hash(),
-                    rule_id: "incomplete-diff-refs",
-                    path: "",
-                    new_line: None,
-                    discussion_id: Some(&created.id),
-                    note_id: created.notes.first().map(|note| note.id),
-                })
-                .await?;
-            published += 1;
-            line_review_skipped = true;
-        } else if changes.diff_refs.is_complete() {
-            findings = self.evaluate_line_rules(event, &changes.changes)?;
-            published += self
-                .publish_line_findings(event, &changes, &findings)
-                .await?;
-        }
 
         let (ai_findings, ai_comments) = self.run_ai_reviews(event, &changes).await?;
         ai_finding_count += ai_findings;
@@ -204,13 +172,13 @@ impl ReviewService {
             mr_iid = event.mr_iid,
             commit_sha = %event.commit_sha,
             ruleset_hash = %self.ruleset.hash(),
-            findings = findings.len() + ai_finding_count,
+            findings = ai_finding_count,
             comments = published,
             "review completed"
         );
         Ok(ReviewSummary {
-            skipped: line_review_skipped && published == 1,
-            findings: findings.len() + ai_finding_count,
+            skipped: false,
+            findings: ai_finding_count,
             comments: published,
         })
     }
@@ -248,6 +216,19 @@ impl ReviewService {
             selected_ai_reviews = ai_reviews.len(),
             "manual review started"
         );
+        if let Err(err) = self
+            .gitlab
+            .award_merge_request_note_emoji(event.project_id, event.mr_iid, event.note_id, "eyes")
+            .await
+        {
+            warn!(
+                project_id = event.project_id,
+                mr_iid = event.mr_iid,
+                note_id = event.note_id,
+                error = %err,
+                "failed to award manual review request emoji; continuing review"
+            );
+        }
         info!(
             project_id = event.project_id,
             mr_iid = event.mr_iid,
@@ -291,43 +272,6 @@ impl ReviewService {
             findings: ai_result.findings,
             comments,
         })
-    }
-
-    fn evaluate_line_rules(
-        &self,
-        event: &MergeRequestEvent,
-        changes: &[GitLabChange],
-    ) -> AppResult<Vec<crate::rules::Finding>> {
-        let mut findings = Vec::new();
-        for change in changes {
-            if change.deleted_file || change.diff.trim().is_empty() {
-                info!(
-                    project_id = event.project_id,
-                    mr_iid = event.mr_iid,
-                    path = %change.new_path,
-                    deleted_file = change.deleted_file,
-                    empty_diff = change.diff.trim().is_empty(),
-                    "diff file skipped"
-                );
-                continue;
-            }
-            let diff_file = parse_unified_diff(&change.old_path, &change.new_path, &change.diff)?;
-            let file_findings = self.ruleset.evaluate(&diff_file);
-            info!(
-                project_id = event.project_id,
-                mr_iid = event.mr_iid,
-                old_path = %change.old_path,
-                new_path = %change.new_path,
-                hunks = diff_file.hunks.len(),
-                findings = file_findings.len(),
-                new_file = change.new_file,
-                renamed_file = change.renamed_file,
-                deleted_file = change.deleted_file,
-                "diff file evaluated"
-            );
-            findings.extend(file_findings);
-        }
-        Ok(findings)
     }
 
     async fn publish_line_findings(
@@ -430,7 +374,14 @@ impl ReviewService {
                     );
                 }
                 Err(err) => {
+                    if matches!(err, AppError::Archive(_)) {
+                        return Err(err);
+                    }
                     summary.failed_reviews += 1;
+                    summary.failed_review_items.push(AiReviewFailureSummary {
+                        id: review.id.clone(),
+                        title: review.title.clone(),
+                    });
                     warn!(
                         project_id = event.project_id,
                         mr_iid = event.mr_iid,
@@ -442,7 +393,32 @@ impl ReviewService {
                 }
             }
         }
+        summary.comments += self
+            .publish_ai_review_partial_failure_summary(event, changes, &summary)
+            .await?;
         Ok(summary)
+    }
+
+    async fn publish_ai_review_partial_failure_summary(
+        &self,
+        event: &MergeRequestEvent,
+        changes: &crate::gitlab::MergeRequestChanges,
+        summary: &AiReviewRunSummary,
+    ) -> AppResult<usize> {
+        if summary.failed_review_items.is_empty() {
+            return Ok(0);
+        }
+        let draft = CommentDraft {
+            path: String::new(),
+            new_line: None,
+            body: build_ai_review_partial_failure_body(
+                &event.commit_sha,
+                self.review_run_id.as_deref().unwrap_or("unknown"),
+                &summary.failed_review_items,
+            ),
+        };
+        self.publish_comment_drafts(event, changes, &[draft], "ai:partial-failed")
+            .await
     }
 
     async fn publish_manual_ai_review_clean_comments(
@@ -614,9 +590,13 @@ impl ReviewService {
         }
         let archive = self
             .gitlab
-            .repository_archive(event.project_id, archive_sha)
+            .repository_archive(
+                event.project_id,
+                archive_sha,
+                self.archive_limits.max_archive_bytes,
+            )
             .await?;
-        let runner = ScriptTaskRunner::new();
+        let runner = ScriptTaskRunner::new().with_archive_limits(self.archive_limits.clone());
         let context = ScriptTaskContext {
             project_id: event.project_id,
             mr_iid: event.mr_iid,
@@ -723,6 +703,36 @@ fn build_ai_review_clean_body(review_id: &str) -> String {
     )
 }
 
+fn build_ai_review_partial_failure_body(
+    commit_sha: &str,
+    review_run_id: &str,
+    failures: &[AiReviewFailureSummary],
+) -> String {
+    let failed_reviews = failures
+        .iter()
+        .map(|failure| {
+            format!(
+                "- `{}` {}",
+                sanitize_comment_inline(&failure.id),
+                sanitize_comment_inline(&failure.title)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "**部分 AI Review 失败**\n\n以下 AI review 执行失败，本次 review 已继续处理其它任务。请查看 runner 日志定位具体原因。\n\n{}\n\ncommit: `{}`\nreview_run_id: `{}`\n\n<!-- gitlab-work-runner:ai-review-partial-failed review_run_id={} commit={} -->",
+        failed_reviews,
+        sanitize_comment_inline(commit_sha),
+        sanitize_comment_inline(review_run_id),
+        sanitize_comment_inline(review_run_id),
+        sanitize_comment_inline(commit_sha)
+    )
+}
+
+fn sanitize_comment_inline(value: &str) -> String {
+    value.replace('`', "'")
+}
+
 fn changed_paths(changes: &[GitLabChange]) -> Vec<String> {
     let mut paths = Vec::new();
     for change in changes {
@@ -802,16 +812,25 @@ impl ReviewService {
             .unwrap_or(&event.commit_sha);
         let archive = self
             .gitlab
-            .repository_archive(event.project_id, archive_sha)
+            .repository_archive(
+                event.project_id,
+                archive_sha,
+                self.archive_limits.max_archive_bytes,
+            )
             .await?;
-        let work_dir =
-            ai_review_context_work_dir(event.project_id, event.mr_iid, archive_sha, &review.id)?;
+        let work_dir = ai_review_context_work_dir(
+            event.project_id,
+            event.mr_iid,
+            archive_sha,
+            &review.id,
+            self.review_run_id.as_deref(),
+        )?;
         if work_dir.exists() {
             fs::remove_dir_all(&work_dir)?;
         }
         let source_dir = work_dir.join("source");
         fs::create_dir_all(&source_dir)?;
-        let extracted_files = extract_zip_archive(&archive, &source_dir)?;
+        let extracted_files = extract_zip_archive(&archive, &source_dir, &self.archive_limits)?;
         info!(
             project_id = event.project_id,
             mr_iid = event.mr_iid,
@@ -851,13 +870,17 @@ fn ai_review_context_work_dir(
     mr_iid: i64,
     commit_sha: &str,
     review_id: &str,
+    review_run_id: Option<&str>,
 ) -> AppResult<PathBuf> {
-    let base = Path::new("work")
+    let mut base = Path::new("work")
         .join("ai_review_context")
         .join(project_id.to_string())
         .join(mr_iid.to_string())
         .join(sanitize_work_path_segment(commit_sha))
         .join(sanitize_work_path_segment(review_id));
+    if let Some(review_run_id) = review_run_id {
+        base = base.join(sanitize_work_path_segment(review_run_id));
+    }
     Ok(if base.is_absolute() {
         base
     } else {
@@ -883,7 +906,7 @@ fn sanitize_work_path_segment(value: &str) -> String {
     }
 }
 
-fn manual_script_task_ids(text: &str) -> Vec<String> {
+pub(crate) fn manual_script_task_ids(text: &str) -> Vec<String> {
     let mut ids = BTreeSet::new();
     for raw in text.split_whitespace() {
         let token = raw.trim_matches(|ch: char| {
@@ -975,7 +998,14 @@ struct AiReviewRunSummary {
     comments: usize,
     successful_reviews: usize,
     failed_reviews: usize,
+    failed_review_items: Vec<AiReviewFailureSummary>,
     clean_review_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AiReviewFailureSummary {
+    id: String,
+    title: String,
 }
 
 #[cfg(test)]
@@ -996,6 +1026,14 @@ mod tests {
     fn ignores_non_standalone_manual_script_task_ids() {
         assert!(manual_script_task_ids("please@check-todo-tbd").is_empty());
         assert!(manual_script_task_ids("@").is_empty());
+    }
+
+    #[test]
+    fn ai_review_context_work_dir_includes_review_run_id() {
+        let path = ai_review_context_work_dir(1, 2, "abc123", "ai-review", Some("run/1")).unwrap();
+        let normalized = path.to_string_lossy().replace('\\', "/");
+
+        assert!(normalized.contains("/abc123/ai-review/run_1"));
     }
 
     #[tokio::test]

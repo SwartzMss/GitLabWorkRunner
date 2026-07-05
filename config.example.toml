@@ -1,6 +1,7 @@
 [server]
 bind = "0.0.0.0:8080"
 webhook_secret = "change-me"
+max_concurrent_reviews = 4
 
 [gitlab]
 base_url = "https://gitlab.example.com"
@@ -16,3 +17,10 @@ file = "rules.toml"
 file = "logs/gitlab-work-runner.log"
 max_bytes = 10485760
 max_files = 5
+
+[archive]
+max_archive_bytes = 104857600      # 100 MiB
+max_extracted_files = 10000        # 10,000 files
+max_extracted_bytes = 209715200    # 200 MiB
+max_single_file_bytes = 10485760   # 10 MiB
+max_entry_path_bytes = 512         # 512 bytes

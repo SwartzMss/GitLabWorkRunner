@@ -1,9 +1,5 @@
-use crate::{
-    diff::{DiffFile, DiffLineKind},
-    error::{AppError, AppResult},
-};
-use globset::{Glob, GlobMatcher, GlobSet, GlobSetBuilder};
-use regex::Regex;
+use crate::error::{AppError, AppResult};
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{fs, path::Path};
@@ -13,23 +9,9 @@ pub struct RulesFile {
     #[serde(default)]
     pub ai_review: AiReviewPromptConfig,
     #[serde(default)]
-    pub rules: Vec<RuleConfig>,
-    #[serde(default)]
     pub script_tasks: Vec<ScriptTaskConfig>,
     #[serde(default)]
     pub ai_reviews: Vec<AiReviewConfig>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct RuleConfig {
-    #[serde(default = "default_auto_enabled")]
-    pub auto_enabled: bool,
-    pub id: String,
-    pub title: String,
-    pub severity: Severity,
-    pub path: String,
-    pub pattern: String,
-    pub message: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -142,12 +124,6 @@ pub struct Finding {
     pub message: String,
 }
 
-struct CompiledRule {
-    config: RuleConfig,
-    matcher: GlobMatcher,
-    regex: Regex,
-}
-
 #[derive(Clone)]
 pub struct CompiledScriptTask {
     pub config: ScriptTaskConfig,
@@ -162,7 +138,6 @@ pub struct CompiledAiReview {
 
 pub struct Ruleset {
     hash: String,
-    rules: Vec<CompiledRule>,
     script_tasks: Vec<CompiledScriptTask>,
     ai_reviews: Vec<CompiledAiReview>,
 }
@@ -175,24 +150,6 @@ impl Ruleset {
 
     pub fn from_toml(text: &str) -> AppResult<Self> {
         let parsed: RulesFile = toml::from_str(text)?;
-        let mut rules = Vec::new();
-        for config in parsed
-            .rules
-            .into_iter()
-            .filter(|config| config.auto_enabled)
-        {
-            let matcher = Glob::new(&config.path)
-                .map_err(|err| AppError::Rule(format!("invalid glob {}: {err}", config.path)))?
-                .compile_matcher();
-            let regex = Regex::new(&config.pattern).map_err(|err| {
-                AppError::Rule(format!("invalid regex for rule {}: {err}", config.id))
-            })?;
-            rules.push(CompiledRule {
-                config,
-                matcher,
-                regex,
-            });
-        }
         let mut script_tasks = Vec::new();
         for config in parsed.script_tasks {
             let changed_matcher = build_optional_glob_set(
@@ -221,7 +178,6 @@ impl Ruleset {
         let hash = format!("{:x}", Sha256::digest(text.as_bytes()));
         Ok(Self {
             hash,
-            rules,
             script_tasks,
             ai_reviews,
         })
@@ -229,14 +185,6 @@ impl Ruleset {
 
     pub fn hash(&self) -> &str {
         &self.hash
-    }
-
-    pub fn has_line_rules(&self) -> bool {
-        !self.rules.is_empty()
-    }
-
-    pub fn line_rule_count(&self) -> usize {
-        self.rules.len()
     }
 
     pub fn script_task_count(&self) -> usize {
@@ -287,30 +235,6 @@ impl Ruleset {
             .filter(|review| requested_ids.iter().any(|id| id == &review.config.id))
             .map(|review| review.config.clone())
             .collect()
-    }
-
-    pub fn evaluate(&self, file: &DiffFile) -> Vec<Finding> {
-        let mut findings = Vec::new();
-        for rule in &self.rules {
-            if !rule.matcher.is_match(&file.new_path) {
-                continue;
-            }
-            for hunk in &file.hunks {
-                for line in &hunk.lines {
-                    if line.kind == DiffLineKind::Added && rule.regex.is_match(&line.content) {
-                        findings.push(Finding {
-                            rule_id: rule.config.id.clone(),
-                            severity: rule.config.severity.clone(),
-                            path: file.new_path.clone(),
-                            new_line: line.new_line,
-                            title: rule.config.title.clone(),
-                            message: rule.config.message.clone(),
-                        });
-                    }
-                }
-            }
-        }
-        findings
     }
 }
 
@@ -365,97 +289,28 @@ fn build_optional_glob_set(patterns: &[String], owner: &str) -> AppResult<Option
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diff::parse_unified_diff;
 
     #[test]
-    fn matches_added_lines_only() {
-        let rules = Ruleset::from_toml(
-            r#"
-[[rules]]
-id = "forbid-unwrap"
-title = "Avoid unwrap"
-severity = "warning"
-path = "**/*.rs"
-pattern = "\\.unwrap\\(\\)"
-message = "Do not unwrap."
-"#,
-        )
-        .unwrap();
-        let diff = "@@ -1,2 +1,2 @@\n-let a = old.unwrap();\n+let a = new.unwrap();\n";
-        let file = parse_unified_diff("src/lib.rs", "src/lib.rs", diff).unwrap();
-
-        let findings = rules.evaluate(&file);
-
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].rule_id, "forbid-unwrap");
-        assert_eq!(findings[0].new_line, Some(1));
-    }
-
-    #[test]
-    fn ignores_non_matching_paths() {
-        let rules = Ruleset::from_toml(
-            r#"
-[[rules]]
-id = "forbid-unwrap"
-title = "Avoid unwrap"
-severity = "warning"
-path = "**/*.rs"
-pattern = "\\.unwrap\\(\\)"
-message = "Do not unwrap."
-"#,
-        )
-        .unwrap();
-        let diff = "@@ -1 +1 @@\n+value.unwrap()\n";
-        let file = parse_unified_diff("README.md", "README.md", diff).unwrap();
-
-        assert!(rules.evaluate(&file).is_empty());
-    }
-
-    #[test]
-    fn ignores_disabled_line_rules() {
-        let rules = Ruleset::from_toml(
-            r#"
-[[rules]]
-auto_enabled = false
-id = "forbid-unwrap"
-title = "Avoid unwrap"
-severity = "warning"
-path = "**/*.rs"
-pattern = "\\.unwrap\\(\\)"
-message = "Do not unwrap."
-"#,
-        )
-        .unwrap();
-        let diff = "@@ -1 +1 @@\n+value.unwrap()\n";
-        let file = parse_unified_diff("src/lib.rs", "src/lib.rs", diff).unwrap();
-
-        assert_eq!(rules.line_rule_count(), 0);
-        assert!(rules.evaluate(&file).is_empty());
-    }
-
-    #[test]
-    fn hash_changes_when_rule_text_changes() {
+    fn hash_changes_when_rules_file_text_changes() {
         let first = Ruleset::from_toml(
             r#"
-[[rules]]
-id = "a"
-title = "A"
-severity = "info"
-path = "**/*"
-pattern = "a"
-message = "a"
+[[ai_reviews]]
+id = "ai-review"
+title = "AI Review"
+base_url = "https://api.openai.com/v1"
+api_key = "test-api-key"
+model = "gpt-4.1-mini"
 "#,
         )
         .unwrap();
         let second = Ruleset::from_toml(
             r#"
-[[rules]]
-id = "a"
-title = "A"
-severity = "info"
-path = "**/*"
-pattern = "b"
-message = "a"
+[[ai_reviews]]
+id = "ai-review"
+title = "AI Review"
+base_url = "https://api.openai.com/v1"
+api_key = "other-test-api-key"
+model = "gpt-4.1-mini"
 "#,
         )
         .unwrap();

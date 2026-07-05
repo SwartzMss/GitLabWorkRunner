@@ -7,7 +7,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tracing::{info, warn};
+use tracing::{info, warn, Span};
 
 pub(crate) static AI_HTTP_CLIENT: OnceLock<Result<ureq::Agent, String>> = OnceLock::new();
 
@@ -46,9 +46,11 @@ pub(crate) async fn perform_ai_review_http_attempt(
     let url = url.to_string();
     let api_key = api_key.to_string();
     let (sender, receiver) = tokio::sync::oneshot::channel();
+    let span = Span::current();
     thread::Builder::new()
         .name(format!("ai-review-http-{attempt}"))
         .spawn(move || {
+            let _entered = span.enter();
             let result = perform_ai_review_http_attempt_blocking(AiReviewHttpAttempt {
                 client,
                 review_id: worker_review_id.clone(),

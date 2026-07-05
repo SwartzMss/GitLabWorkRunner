@@ -1,10 +1,12 @@
 use crate::error::{AppError, AppResult};
+use crate::review::scripts::ArchiveLimits;
 use serde::Deserialize;
 use std::{fs, path::Path};
 
 const DEFAULT_LOG_FILE: &str = "logs/gitlab-work-runner.log";
 const DEFAULT_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
 const DEFAULT_LOG_MAX_FILES: usize = 5;
+const DEFAULT_MAX_CONCURRENT_REVIEWS: usize = 4;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct AppConfig {
@@ -14,12 +16,16 @@ pub struct AppConfig {
     pub rules: RulesConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub archive: ArchiveLimits,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct ServerConfig {
     pub bind: String,
     pub webhook_secret: String,
+    #[serde(default = "default_max_concurrent_reviews")]
+    pub max_concurrent_reviews: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -68,6 +74,10 @@ fn default_log_max_bytes() -> u64 {
 
 fn default_log_max_files() -> usize {
     DEFAULT_LOG_MAX_FILES
+}
+
+fn default_max_concurrent_reviews() -> usize {
+    DEFAULT_MAX_CONCURRENT_REVIEWS
 }
 
 impl AppConfig {
@@ -119,6 +129,7 @@ file = "rules.toml"
 
         assert_eq!(config.server.bind, "127.0.0.1:8080");
         assert_eq!(config.server.webhook_secret, "secret");
+        assert_eq!(config.server.max_concurrent_reviews, 4);
         assert_eq!(config.gitlab.base_url, "https://gitlab.example.com");
         assert_eq!(config.gitlab.token, "glpat-test-token");
         assert_eq!(config.gitlab_token().unwrap(), "glpat-test-token");
@@ -127,6 +138,7 @@ file = "rules.toml"
         assert_eq!(config.logging.file, "logs/gitlab-work-runner.log");
         assert_eq!(config.logging.max_bytes, 10 * 1024 * 1024);
         assert_eq!(config.logging.max_files, 5);
+        assert_eq!(config.archive, ArchiveLimits::default());
     }
 
     #[test]
@@ -135,6 +147,7 @@ file = "rules.toml"
             server: ServerConfig {
                 bind: "127.0.0.1:8080".into(),
                 webhook_secret: "secret".into(),
+                max_concurrent_reviews: 4,
             },
             gitlab: GitLabConfig {
                 base_url: "https://gitlab.example.com".into(),
@@ -147,6 +160,7 @@ file = "rules.toml"
                 file: "rules.toml".into(),
             },
             logging: LoggingConfig::default(),
+            archive: ArchiveLimits::default(),
         };
 
         let err = config.gitlab_token().unwrap_err().to_string();
@@ -186,5 +200,49 @@ max_files = 3
         assert_eq!(config.logging.file, "runner.log");
         assert_eq!(config.logging.max_bytes, 1024);
         assert_eq!(config.logging.max_files, 3);
+    }
+
+    #[test]
+    fn loads_custom_archive_limits_config() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"
+[server]
+bind = "127.0.0.1:8080"
+webhook_secret = "secret"
+
+[gitlab]
+base_url = "https://gitlab.example.com"
+token = "glpat-test-token"
+
+[storage]
+database_url = "sqlite::memory:"
+
+[rules]
+file = "rules.toml"
+
+[archive]
+max_archive_bytes = 1
+max_extracted_files = 2
+max_extracted_bytes = 3
+max_single_file_bytes = 4
+max_entry_path_bytes = 5
+"#
+        )
+        .unwrap();
+
+        let config = AppConfig::from_path(file.path()).unwrap();
+
+        assert_eq!(
+            config.archive,
+            ArchiveLimits {
+                max_archive_bytes: 1,
+                max_extracted_files: 2,
+                max_extracted_bytes: 3,
+                max_single_file_bytes: 4,
+                max_entry_path_bytes: 5,
+            }
+        );
     }
 }

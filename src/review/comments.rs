@@ -62,32 +62,32 @@ mod tests {
             severity: Severity::Warning,
             path: "src/lib.rs".into(),
             new_line: line,
-            title: "Avoid unwrap".into(),
-            message: "Do not unwrap.".into(),
+            title: "AI finding".into(),
+            message: "Review finding.".into(),
         }
     }
 
     #[test]
     fn creates_stable_marker() {
-        let drafts = build_comment_drafts(&[finding("forbid-unwrap", Some(12))]);
+        let drafts = build_comment_drafts(&[finding("ai:ai-review", Some(12))]);
 
         assert_eq!(drafts.len(), 1);
         assert_eq!(drafts[0].new_line, Some(12));
-        assert!(drafts[0].body.contains("**[警告] Avoid unwrap**"));
+        assert!(drafts[0].body.contains("**[警告] AI finding**"));
         assert!(drafts[0]
             .body
-            .contains("<!-- gitlab-work-runner:rule=forbid-unwrap -->"));
+            .contains("<!-- gitlab-work-runner:rule=ai:ai-review -->"));
     }
 
     #[test]
     fn groups_findings_on_same_line() {
         let drafts = build_comment_drafts(&[
-            finding("forbid-unwrap", Some(12)),
-            finding("other-rule", Some(12)),
+            finding("ai:ai-review", Some(12)),
+            finding("script:check-todo-tbd", Some(12)),
         ]);
 
         assert_eq!(drafts.len(), 1);
-        assert!(drafts[0].body.contains("forbid-unwrap"));
-        assert!(drafts[0].body.contains("other-rule"));
+        assert!(drafts[0].body.contains("ai:ai-review"));
+        assert!(drafts[0].body.contains("script:check-todo-tbd"));
     }
 }

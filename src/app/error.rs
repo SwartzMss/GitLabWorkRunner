@@ -14,6 +14,8 @@ pub enum AppError {
     AiReview(String),
     #[error("gitlab api error: {0}")]
     GitLab(String),
+    #[error("archive error: {0}")]
+    Archive(String),
     #[error("storage error: {0}")]
     Storage(String),
     #[error(transparent)]

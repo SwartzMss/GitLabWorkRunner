@@ -63,7 +63,7 @@ pub(crate) fn search_code_tool() -> OpenAiTool {
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Plain substring to search for. This is not a regex. Use exact identifiers, function names, type names, config keys, or distinctive text."
+                        "description": "Plain substring to search for. Use exact identifiers, function names, type names, config keys, or distinctive text."
                     },
                     "glob": {
                         "type": "string",

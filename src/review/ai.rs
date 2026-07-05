@@ -29,6 +29,7 @@ use super::{
 
 const AI_RESPONSE_PREVIEW_CHARS: usize = 1000;
 const AI_HTTP_ATTEMPTS: usize = 2;
+const TOOL_ARGUMENT_SUMMARY_CHARS: usize = 160;
 
 pub async fn run_ai_review(
     config: &AiReviewConfig,
@@ -179,6 +180,7 @@ async fn run_ai_review_single(
                         attempt,
                         request_timeout,
                         request_guard_timeout,
+                        batch,
                     })
                     .await?;
                     let raw_finding_count = findings.len();
@@ -330,6 +332,7 @@ struct AiReviewCompletion<'a> {
     attempt: usize,
     request_timeout: Duration,
     request_guard_timeout: Duration,
+    batch: Option<(usize, usize)>,
 }
 
 async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResult<Vec<Finding>> {
@@ -345,6 +348,7 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
         attempt,
         request_timeout,
         request_guard_timeout,
+        batch,
     } = context;
     let mut body = first_body.to_string();
     let mut tool_calls_used = 0_usize;
@@ -357,6 +361,18 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
             .map(|choice| &choice.message)
             .ok_or_else(|| AppError::AiReview("AI review API returned no choices".into()))?;
         if has_submit_review_findings(message) || !use_tool_calls {
+            if tool_calls_used > 0 {
+                info!(
+                    ai_review_id = %config.id,
+                    model = %config.model,
+                    attempt,
+                    total_tool_calls_used = tool_calls_used,
+                    max_tool_calls = config.max_tool_calls,
+                    batch_index = batch.map(|(index, _)| index),
+                    batch_count = batch.map(|(_, count)| count),
+                    "AI review context tool calls completed"
+                );
+            }
             return parse_openai_message(&config.id, &config.title, message);
         }
 
@@ -382,6 +398,8 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
             tool_call_names = %tool_call_names,
             tool_calls_used,
             max_tool_calls = config.max_tool_calls,
+            batch_index = batch.map(|(index, _)| index),
+            batch_count = batch.map(|(_, count)| count),
             "AI review context tool calls requested"
         );
         let remaining_tool_calls = config.max_tool_calls.saturating_sub(tool_calls_used);
@@ -392,6 +410,8 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                 requested_tool_calls = context_tool_calls.len(),
                 tool_calls_used,
                 max_tool_calls = config.max_tool_calls,
+                batch_index = batch.map(|(index, _)| index),
+                batch_count = batch.map(|(_, count)| count),
                 "AI review context tool call limit already reported"
             );
             return Err(AppError::AiReview(format!(
@@ -407,6 +427,8 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                 remaining_tool_calls,
                 tool_calls_used,
                 max_tool_calls = config.max_tool_calls,
+                batch_index = batch.map(|(index, _)| index),
+                batch_count = batch.map(|(_, count)| count),
                 "AI review context tool call limit reached"
             );
         }
@@ -420,32 +442,51 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
         });
         for (tool_call_index, tool_call) in context_tool_calls.into_iter().enumerate() {
             let tool_call_id = non_empty_tool_call_id(&tool_call);
+            let tool_name = tool_call.function.name.as_str();
+            let arguments_summary =
+                tool_call_argument_summary(tool_name, &tool_call.function.arguments);
             let result = if tool_call_index < remaining_tool_calls {
                 let result = tool_context.call(&tool_call);
                 tool_calls_used += 1;
                 info!(
                     ai_review_id = %config.id,
                     model = %config.model,
-                    tool_name = %tool_call.function.name,
+                    tool_name,
                     tool_call_id = %tool_call_id,
-                    result_bytes = result.len(),
+                    arguments_summary = %arguments_summary,
+                    result_bytes = tool_result_bytes(&result),
+                    result_truncated = tool_result_truncated(&result),
+                    result_limit_reached = tool_result_limit_reached(&result, config.max_tool_result_bytes),
+                    tool_call_limit_reached = false,
                     tool_calls_used,
+                    total_tool_calls_used = tool_calls_used,
                     max_tool_calls = config.max_tool_calls,
+                    batch_index = batch.map(|(index, _)| index),
+                    batch_count = batch.map(|(_, count)| count),
                     "AI review context tool result returned"
                 );
                 result
             } else {
                 tool_call_limit_notice_sent = true;
+                let result = context_tool_call_limit_result(config);
                 warn!(
                     ai_review_id = %config.id,
                     model = %config.model,
-                    tool_name = %tool_call.function.name,
+                    tool_name,
                     tool_call_id = %tool_call_id,
+                    arguments_summary = %arguments_summary,
+                    result_bytes = tool_result_bytes(&result),
+                    result_truncated = tool_result_truncated(&result),
+                    result_limit_reached = tool_result_limit_reached(&result, config.max_tool_result_bytes),
+                    tool_call_limit_reached = true,
                     tool_calls_used,
+                    total_tool_calls_used = tool_calls_used,
                     max_tool_calls = config.max_tool_calls,
+                    batch_index = batch.map(|(index, _)| index),
+                    batch_count = batch.map(|(_, count)| count),
                     "AI review context tool call skipped because limit was reached"
                 );
-                context_tool_call_limit_result(config)
+                result
             };
             messages.push(ChatMessage {
                 role: "tool".into(),
@@ -699,6 +740,62 @@ fn preview_log_text(value: &str, max_chars: usize) -> String {
         preview.push_str("...");
     }
     preview
+}
+
+fn tool_call_argument_summary(tool_name: &str, arguments: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) else {
+        return format!(
+            "invalid_json bytes={} preview=\"{}\"",
+            arguments.len(),
+            preview_log_text(arguments, TOOL_ARGUMENT_SUMMARY_CHARS)
+        );
+    };
+    match tool_name {
+        "read_file" => format_tool_fields(&value, &[("path", "path")]),
+        "search_code" => format_tool_fields(&value, &[("query", "query"), ("glob", "glob")]),
+        "list_files" => format_tool_fields(&value, &[("glob", "glob")]),
+        _ => format!(
+            "arguments_preview=\"{}\"",
+            preview_log_text(arguments, TOOL_ARGUMENT_SUMMARY_CHARS)
+        ),
+    }
+}
+
+fn format_tool_fields(value: &serde_json::Value, fields: &[(&str, &str)]) -> String {
+    let parts = fields
+        .iter()
+        .filter_map(|(field, label)| {
+            value
+                .get(*field)
+                .and_then(serde_json::Value::as_str)
+                .map(|value| {
+                    format!(
+                        "{label}=\"{}\"",
+                        preview_log_text(value, TOOL_ARGUMENT_SUMMARY_CHARS)
+                    )
+                })
+        })
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        "no_known_arguments".into()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn tool_result_bytes(result: &str) -> usize {
+    result.len()
+}
+
+fn tool_result_truncated(result: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(result)
+        .ok()
+        .and_then(|value| value.get("truncated").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false)
+}
+
+fn tool_result_limit_reached(result: &str, max_tool_result_bytes: usize) -> bool {
+    tool_result_truncated(result) || result.len() >= max_tool_result_bytes.max(1)
 }
 
 fn filter_findings_to_added_lines(
@@ -1104,7 +1201,7 @@ mod tests {
             search_code.function.parameters["properties"]["query"]["description"]
                 .as_str()
                 .unwrap()
-                .contains("not a regex")
+                .contains("Plain substring")
         );
         assert!(list_files
             .function
@@ -1368,5 +1465,29 @@ mod tests {
         let preview = preview_log_text("中文\nabcdef", 5);
 
         assert_eq!(preview, "中文\\nab...");
+    }
+
+    #[test]
+    fn summarizes_context_tool_log_fields_without_full_arguments() {
+        let summary = tool_call_argument_summary(
+            "search_code",
+            r#"{"query":"panic\nunwrap","glob":"src/**/*.rs","ignored":"secret"}"#,
+        );
+
+        assert_eq!(summary, r#"query="panic\nunwrap" glob="src/**/*.rs""#);
+        assert!(!summary.contains("ignored"));
+        assert!(!summary.contains("secret"));
+
+        let long_path = format!("src/{}.rs", "a".repeat(300));
+        let read_file_summary =
+            tool_call_argument_summary("read_file", &format!(r#"{{"path":"{long_path}"}}"#));
+        assert!(read_file_summary.contains("path=\"src/"));
+        assert!(read_file_summary.ends_with("...\""));
+        assert!(!read_file_summary.contains(&long_path));
+
+        let result = r#"{"ok":true,"files":[],"truncated":true}"#;
+        assert!(tool_result_truncated(result));
+        assert!(tool_result_limit_reached(result, 60_000));
+        assert_eq!(tool_result_bytes(result), result.len());
     }
 }
