@@ -181,22 +181,23 @@ impl ReviewService {
         let ai_completion_comments = self
             .publish_manual_ai_review_clean_comments(&mr_event, &changes, &ai_result)
             .await?;
-        let script_comments = self
+        let script_result = self
             .run_selected_script_tasks(&mr_event, &changes, tasks)
             .await?;
-        let comments = ai_result.comments + ai_completion_comments + script_comments;
+        let findings = ai_result.findings + script_result.findings;
+        let comments = ai_result.comments + ai_completion_comments + script_result.comments;
         info!(
             project_id = event.project_id,
             mr_iid = event.mr_iid,
             note_id = event.note_id,
             commit_sha = %event.commit_sha,
-            findings = ai_result.findings,
+            findings,
             comments,
             "manual review completed"
         );
         Ok(ReviewSummary {
             skipped: false,
-            findings: ai_result.findings,
+            findings,
             comments,
         })
     }
@@ -509,7 +510,7 @@ impl ReviewService {
         event: &MergeRequestEvent,
         changes: &crate::gitlab::MergeRequestChanges,
         tasks: Vec<crate::rules::ScriptTaskConfig>,
-    ) -> AppResult<usize> {
+    ) -> AppResult<ScriptTaskRunSummary> {
         if tasks.is_empty() {
             info!(
                 project_id = event.project_id,
@@ -517,7 +518,7 @@ impl ReviewService {
                 commit_sha = %event.commit_sha,
                 "no script tasks selected"
             );
-            return Ok(0);
+            return Ok(ScriptTaskRunSummary::default());
         }
 
         let archive_sha = changes
@@ -547,7 +548,7 @@ impl ReviewService {
             mr_iid: event.mr_iid,
             commit_sha: archive_sha,
         };
-        let mut published = 0_usize;
+        let mut summary = ScriptTaskRunSummary::default();
         for task in tasks {
             info!(
                 project_id = event.project_id,
@@ -585,7 +586,8 @@ impl ReviewService {
                 let (comments, findings) = self
                     .publish_script_task_result(event, changes, &result)
                     .await?;
-                published += comments;
+                summary.comments += comments;
+                summary.findings += findings;
                 self.store
                     .finish_task_run(&TaskRunFinish {
                         review_run_id: self.review_run_id(),
@@ -623,10 +625,11 @@ impl ReviewService {
             project_id = event.project_id,
             mr_iid = event.mr_iid,
             commit_sha = archive_sha,
-            comments = published,
+            findings = summary.findings,
+            comments = summary.comments,
             "script tasks completed"
         );
-        Ok(published)
+        Ok(summary)
     }
 
     async fn publish_script_task_result(
@@ -996,6 +999,12 @@ struct AiReviewRunSummary {
 struct AiReviewFailureSummary {
     id: String,
     title: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ScriptTaskRunSummary {
+    findings: usize,
+    comments: usize,
 }
 
 #[cfg(test)]

@@ -1,6 +1,8 @@
 use super::*;
 use crate::{
-    app::config::{GitLabConfig, LoggingConfig, RulesConfig, ServerConfig, StorageConfig},
+    app::config::{
+        DashboardConfig, GitLabConfig, LoggingConfig, RulesConfig, ServerConfig, StorageConfig,
+    },
     storage::StateStore,
 };
 use axum::body::to_bytes;
@@ -39,6 +41,7 @@ async fn test_state(
             },
             logging: LoggingConfig::default(),
             archive: Default::default(),
+            dashboard: DashboardConfig::default(),
         },
         store,
         active_reviews: Arc::new(ActiveReviews::default()),

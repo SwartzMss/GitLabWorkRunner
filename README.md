@@ -154,6 +154,50 @@ max_entry_path_bytes = 512         # 512 bytes
 
 `[archive]` 控制 GitLab repository archive 的下载和解压硬限制。超过 `max_archive_bytes` 会停止下载并让本次 review 失败；解压时超过 `max_extracted_files`、`max_extracted_bytes`、`max_single_file_bytes` 或 `max_entry_path_bytes` 会停止解压并让本次 review 失败。失败会走现有 MR 失败通知，不会继续执行 AI context tools 或脚本任务。
 
+## Dashboard
+
+Dashboard 是独立二进制，不和 webhook runner 共用 HTTP 端口。runner 负责写 SQLite 统计表，dashboard 只读同一个数据库。
+
+它默认读取同一个 `config.toml`：`[storage].database_url` 决定读取哪个 SQLite 数据库，`[dashboard].bind` 决定 dashboard HTTP 监听地址。不提供 `config.toml` 时会退回到本地默认值：监听 `127.0.0.1:8082`，读取当前目录的 `gitlab-work-runner.db`。
+
+配置示例：
+
+```toml
+[storage]
+database_url = "sqlite://gitlab-work-runner.db"
+
+[dashboard]
+bind = "127.0.0.1:8082"
+```
+
+启动：
+
+```powershell
+.\gitlab-work-runner-dashboard.exe
+```
+
+访问：
+
+```text
+http://127.0.0.1:8082/dashboard
+```
+
+API：
+
+```text
+GET /api/summary
+GET /api/finding-summary
+GET /api/runs
+GET /api/runs?status=failed&project_id=1&mr_iid=2
+GET /api/runs/<review_run_id>
+GET /api/projects
+GET /api/merge-requests
+GET /api/findings
+GET /api/comments
+```
+
+dashboard 进程不会执行 migration。如果数据库或统计表不存在，先启动一次 `gitlab-work-runner.exe` 完成迁移。
+
 ## AI Review 配置
 
 当前只支持在 MR 评论里手动触发 review，不再支持 MR 更新后自动筛选执行。`rules.toml` 里需要保留 `[ai_review]` 和 `[[ai_reviews]]`；脚本任务可以保留配置，后续需要跑本地确定性检查时通过评论手动触发。

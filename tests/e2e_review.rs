@@ -1918,7 +1918,7 @@ timeout_seconds = 10
 
     let summary = service.review_merge_request_note(&event).await.unwrap();
 
-    assert_eq!(summary.findings, 0);
+    assert_eq!(summary.findings, 1);
     assert_eq!(summary.comments, 1);
     assert!(!summary.skipped);
     assert_eq!(discussion_count.load(Ordering::SeqCst), 1);
@@ -2031,7 +2031,7 @@ timeout_seconds = 10
 
     let summary = service.review_merge_request_note(&event).await.unwrap();
 
-    assert_eq!(summary.findings, 0);
+    assert_eq!(summary.findings, 1);
     assert_eq!(summary.comments, 1);
     assert!(!summary.skipped);
     assert_eq!(discussion_count.load(Ordering::SeqCst), 1);

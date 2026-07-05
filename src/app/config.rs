@@ -7,6 +7,7 @@ const DEFAULT_LOG_FILE: &str = "logs/gitlab-work-runner.log";
 const DEFAULT_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
 const DEFAULT_LOG_MAX_FILES: usize = 5;
 const DEFAULT_MAX_CONCURRENT_REVIEWS: usize = 4;
+const DEFAULT_DASHBOARD_BIND: &str = "127.0.0.1:8082";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct AppConfig {
@@ -18,6 +19,8 @@ pub struct AppConfig {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub archive: ArchiveLimits,
+    #[serde(default)]
+    pub dashboard: DashboardConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -45,6 +48,12 @@ pub struct RulesConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct DashboardConfig {
+    #[serde(default = "default_dashboard_bind")]
+    pub bind: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct LoggingConfig {
     #[serde(default = "default_log_file")]
     pub file: String,
@@ -64,6 +73,14 @@ impl Default for LoggingConfig {
     }
 }
 
+impl Default for DashboardConfig {
+    fn default() -> Self {
+        Self {
+            bind: default_dashboard_bind(),
+        }
+    }
+}
+
 fn default_log_file() -> String {
     DEFAULT_LOG_FILE.into()
 }
@@ -78,6 +95,10 @@ fn default_log_max_files() -> usize {
 
 fn default_max_concurrent_reviews() -> usize {
     DEFAULT_MAX_CONCURRENT_REVIEWS
+}
+
+fn default_dashboard_bind() -> String {
+    DEFAULT_DASHBOARD_BIND.into()
 }
 
 impl AppConfig {
@@ -135,6 +156,7 @@ file = "rules.toml"
         assert_eq!(config.gitlab_token().unwrap(), "glpat-test-token");
         assert_eq!(config.storage.database_url, "sqlite::memory:");
         assert_eq!(config.rules.file, "rules.toml");
+        assert_eq!(config.dashboard.bind, "127.0.0.1:8082");
         assert_eq!(config.logging.file, "logs/gitlab-work-runner.log");
         assert_eq!(config.logging.max_bytes, 10 * 1024 * 1024);
         assert_eq!(config.logging.max_files, 5);
@@ -161,6 +183,7 @@ file = "rules.toml"
             },
             logging: LoggingConfig::default(),
             archive: ArchiveLimits::default(),
+            dashboard: DashboardConfig::default(),
         };
 
         let err = config.gitlab_token().unwrap_err().to_string();
@@ -187,6 +210,9 @@ database_url = "sqlite::memory:"
 [rules]
 file = "rules.toml"
 
+[dashboard]
+bind = "127.0.0.1:18082"
+
 [logging]
 file = "runner.log"
 max_bytes = 1024
@@ -200,6 +226,7 @@ max_files = 3
         assert_eq!(config.logging.file, "runner.log");
         assert_eq!(config.logging.max_bytes, 1024);
         assert_eq!(config.logging.max_files, 3);
+        assert_eq!(config.dashboard.bind, "127.0.0.1:18082");
     }
 
     #[test]
