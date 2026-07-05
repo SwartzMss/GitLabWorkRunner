@@ -51,6 +51,7 @@ jobs:
           New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
 
           Copy-Item "target\release\gitlab-work-runner.exe" $packageDir
+          Copy-Item "target\release\gitlab-work-runner-dashboard.exe" $packageDir
           Copy-Item "config.example.toml" $packageDir
           Copy-Item "rules.example.toml" $packageDir
           Copy-Item "README.md" $packageDir
@@ -100,7 +101,9 @@ jobs:
         run: |
           ldd --version
           ldd target/release/gitlab-work-runner
+          ldd target/release/gitlab-work-runner-dashboard
           readelf -V target/release/gitlab-work-runner | grep -E "Name: (GLIBC|GCC)_" | sort -u
+          readelf -V target/release/gitlab-work-runner-dashboard | grep -E "Name: (GLIBC|GCC)_" | sort -u
 
       - name: Package release
         run: |
@@ -110,6 +113,7 @@ jobs:
           mkdir -p "$package_dir"
 
           cp target/release/gitlab-work-runner "$package_dir/"
+          cp target/release/gitlab-work-runner-dashboard "$package_dir/"
           cp config.example.toml "$package_dir/"
           cp rules.example.toml "$package_dir/"
           cp README.md "$package_dir/"
