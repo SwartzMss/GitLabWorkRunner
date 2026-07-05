@@ -254,6 +254,10 @@ After normal completion or failure, AI Review removes the current context run di
 
 The active-review guard is process-local. For multi-instance deployments, move the running lock to SQLite/PostgreSQL if cross-process exclusion and global cleanup are required.
 
+## Failure Notifications
+
+If the whole review run fails with a non-recoverable error, such as fetching MR diff, downloading the archive, calling the GitLab API, or internal processing failure, the service posts an MR-level failure comment. The comment includes `commit`, `review_run_id`, and a truncated error summary. If posting the failure notification fails, the runner only logs WARN and does not retry.
+
 ## More Docs
 
 - [docs/design.md](docs/design.md): design and module boundaries.

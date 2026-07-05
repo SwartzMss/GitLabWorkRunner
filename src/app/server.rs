@@ -401,8 +401,67 @@ async fn run_webhook_review(
                 error = %err,
                 "gitlab webhook review failed"
             );
+            notify_review_failed(&service, &response_summary, &err).await;
         }
     }
+}
+
+async fn notify_review_failed(
+    service: &ReviewService,
+    response_summary: &WebhookReviewSummary,
+    err: &crate::error::AppError,
+) {
+    match service
+        .post_merge_request_level_comment(
+            response_summary.project_id,
+            response_summary.mr_iid,
+            review_failed_body(response_summary, err),
+        )
+        .await
+    {
+        Ok(()) => info!(
+            review_run_id = %response_summary.review_run_id,
+            project_id = response_summary.project_id,
+            mr_iid = response_summary.mr_iid,
+            commit_sha = %response_summary.commit_sha,
+            "review failure notification posted"
+        ),
+        Err(comment_err) => warn!(
+            review_run_id = %response_summary.review_run_id,
+            project_id = response_summary.project_id,
+            mr_iid = response_summary.mr_iid,
+            commit_sha = %response_summary.commit_sha,
+            review_error = %err,
+            error = %comment_err,
+            "failed to post review failure notification"
+        ),
+    }
+}
+
+fn review_failed_body(
+    response_summary: &WebhookReviewSummary,
+    err: &crate::error::AppError,
+) -> String {
+    let error_text = truncate_for_comment(&err.to_string(), 1200);
+    format!(
+        "Review 执行失败，请查看 runner 日志后重试。\n\ncommit: `{}`\nreview_run_id: `{}`\nerror: `{}`\n\n<!-- gitlab-work-runner:review-failed review_run_id={} commit={} -->",
+        response_summary.commit_sha,
+        response_summary.review_run_id,
+        error_text,
+        response_summary.review_run_id,
+        response_summary.commit_sha
+    )
+}
+
+fn truncate_for_comment(value: &str, max_chars: usize) -> String {
+    let mut output = String::new();
+    for ch in value.chars().take(max_chars) {
+        output.push(ch);
+    }
+    if value.chars().count() > max_chars {
+        output.push_str("...");
+    }
+    output.replace('`', "'")
 }
 
 fn event_requests_review(event: &GitLabWebhookEvent, ruleset: &Ruleset) -> bool {
@@ -730,5 +789,89 @@ when_changed = ["src/**"]
         assert_eq!(duplicate_comment_count.load(Ordering::SeqCst), 1);
 
         release_change.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn failed_webhook_review_posts_failure_comment() {
+        let rules_file = NamedTempFile::new().unwrap();
+        std::fs::write(rules_file.path(), "").unwrap();
+
+        let failure_comment_count = Arc::new(AtomicUsize::new(0));
+        let failure_comment_count_for_handler = Arc::clone(&failure_comment_count);
+        let app = Router::new()
+            .route(
+                "/api/v4/projects/123/merge_requests/45/changes",
+                get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+            )
+            .route(
+                "/api/v4/projects/123/merge_requests/45/discussions",
+                post(move |body: Bytes| {
+                    let failure_comment_count = Arc::clone(&failure_comment_count_for_handler);
+                    async move {
+                        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        let message = body["body"].as_str().unwrap();
+                        assert!(message.contains("Review 执行失败"));
+                        assert!(message.contains("review_run_id"));
+                        assert!(message.contains("abc123"));
+                        assert!(body.get("position").is_none());
+                        failure_comment_count.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::CREATED,
+                            Json(json!({
+                                "id": "review-failed",
+                                "notes": [{ "id": 999 }]
+                            })),
+                        )
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gitlab_base_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let store = StateStore::connect("sqlite::memory:").await.unwrap();
+        store.migrate().await.unwrap();
+        let state = Arc::new(AppState {
+            config: AppConfig {
+                server: ServerConfig {
+                    bind: "127.0.0.1:0".into(),
+                    webhook_secret: "secret".into(),
+                },
+                gitlab: GitLabConfig {
+                    base_url: gitlab_base_url,
+                    token: "token".into(),
+                },
+                storage: StorageConfig {
+                    database_url: "sqlite::memory:".into(),
+                },
+                rules: RulesConfig {
+                    file: rules_file.path().to_string_lossy().into_owned(),
+                },
+                logging: LoggingConfig::default(),
+            },
+            store,
+            active_reviews: Arc::new(ActiveReviews::default()),
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Gitlab-Token", HeaderValue::from_static("secret"));
+
+        let response = gitlab_webhook(
+            State(state),
+            headers,
+            Bytes::from_static(include_bytes!("../../tests/fixtures/gitlab_mr_event.json")),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        for _ in 0..20 {
+            if failure_comment_count.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(failure_comment_count.load(Ordering::SeqCst), 1);
     }
 }
