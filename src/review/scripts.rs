@@ -788,8 +788,6 @@ mod tests {
             title: "Check root".into(),
             command,
             timeout_seconds: 5,
-            auto_enabled: true,
-            when_changed: Vec::new(),
         };
         let context = ScriptTaskContext {
             project_id: 1,

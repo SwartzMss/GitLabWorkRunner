@@ -1,5 +1,4 @@
-use crate::error::{AppError, AppResult};
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use crate::error::AppResult;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{fs, path::Path};
@@ -16,21 +15,15 @@ pub struct RulesFile {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct ScriptTaskConfig {
-    #[serde(default = "default_auto_enabled")]
-    pub auto_enabled: bool,
     pub id: String,
     pub title: String,
     pub command: String,
     #[serde(default = "default_script_timeout_seconds")]
     pub timeout_seconds: u64,
-    #[serde(default)]
-    pub when_changed: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct AiReviewConfig {
-    #[serde(default = "default_auto_enabled")]
-    pub auto_enabled: bool,
     pub id: String,
     pub title: String,
     pub base_url: String,
@@ -60,8 +53,6 @@ pub struct AiReviewConfig {
     pub max_tool_result_bytes: usize,
     #[serde(default)]
     pub context_tools: AiReviewContextTools,
-    #[serde(default)]
-    pub when_changed: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -127,13 +118,11 @@ pub struct Finding {
 #[derive(Clone)]
 pub struct CompiledScriptTask {
     pub config: ScriptTaskConfig,
-    changed_matcher: Option<GlobSet>,
 }
 
 #[derive(Clone)]
 pub struct CompiledAiReview {
     pub config: AiReviewConfig,
-    changed_matcher: Option<GlobSet>,
 }
 
 pub struct Ruleset {
@@ -152,14 +141,7 @@ impl Ruleset {
         let parsed: RulesFile = toml::from_str(text)?;
         let mut script_tasks = Vec::new();
         for config in parsed.script_tasks {
-            let changed_matcher = build_optional_glob_set(
-                &config.when_changed,
-                &format!("script task {}", config.id),
-            )?;
-            script_tasks.push(CompiledScriptTask {
-                config,
-                changed_matcher,
-            });
+            script_tasks.push(CompiledScriptTask { config });
         }
         let mut ai_reviews = Vec::new();
         for mut config in parsed.ai_reviews {
@@ -168,12 +150,7 @@ impl Ruleset {
             config.max_tool_calls = parsed.ai_review.max_tool_calls;
             config.max_tool_result_bytes = parsed.ai_review.max_tool_result_bytes;
             config.context_tools = parsed.ai_review.context_tools.clone();
-            let changed_matcher =
-                build_optional_glob_set(&config.when_changed, &format!("AI review {}", config.id))?;
-            ai_reviews.push(CompiledAiReview {
-                config,
-                changed_matcher,
-            });
+            ai_reviews.push(CompiledAiReview { config });
         }
         let hash = format!("{:x}", Sha256::digest(text.as_bytes()));
         Ok(Self {
@@ -195,37 +172,11 @@ impl Ruleset {
         self.ai_reviews.len()
     }
 
-    pub fn script_tasks_for_changes(&self, changed_paths: &[String]) -> Vec<ScriptTaskConfig> {
-        self.script_tasks
-            .iter()
-            .filter(|task| {
-                task.config.auto_enabled
-                    && task.changed_matcher.as_ref().is_none_or(|matcher| {
-                        changed_paths.iter().any(|path| matcher.is_match(path))
-                    })
-            })
-            .map(|task| task.config.clone())
-            .collect()
-    }
-
     pub fn script_tasks_by_ids(&self, requested_ids: &[String]) -> Vec<ScriptTaskConfig> {
         self.script_tasks
             .iter()
             .filter(|task| requested_ids.iter().any(|id| id == &task.config.id))
             .map(|task| task.config.clone())
-            .collect()
-    }
-
-    pub fn ai_reviews_for_changes(&self, changed_paths: &[String]) -> Vec<AiReviewConfig> {
-        self.ai_reviews
-            .iter()
-            .filter(|review| {
-                review.config.auto_enabled
-                    && review.changed_matcher.as_ref().is_none_or(|matcher| {
-                        changed_paths.iter().any(|path| matcher.is_match(path))
-                    })
-            })
-            .map(|review| review.config.clone())
             .collect()
     }
 
@@ -236,10 +187,6 @@ impl Ruleset {
             .map(|review| review.config.clone())
             .collect()
     }
-}
-
-fn default_auto_enabled() -> bool {
-    true
 }
 
 fn default_script_timeout_seconds() -> u64 {
@@ -268,22 +215,6 @@ fn default_ai_max_tool_calls() -> usize {
 
 fn default_ai_max_tool_result_bytes() -> usize {
     60_000
-}
-
-fn build_optional_glob_set(patterns: &[String], owner: &str) -> AppResult<Option<GlobSet>> {
-    if patterns.is_empty() {
-        return Ok(None);
-    }
-    let mut builder = GlobSetBuilder::new();
-    for pattern in patterns {
-        builder.add(Glob::new(pattern).map_err(|err| {
-            AppError::Rule(format!("invalid when_changed glob for {owner}: {err}"))
-        })?);
-    }
-    let matcher = builder.build().map_err(|err| {
-        AppError::Rule(format!("invalid when_changed glob set for {owner}: {err}"))
-    })?;
-    Ok(Some(matcher))
 }
 
 #[cfg(test)]
@@ -319,27 +250,23 @@ model = "gpt-4.1-mini"
     }
 
     #[test]
-    fn disabled_script_tasks_are_manual_only() {
+    fn script_tasks_are_selected_by_manual_ids() {
         let rules = Ruleset::from_toml(
             r#"
 [[script_tasks]]
-auto_enabled = false
 id = "manual-check"
 title = "Manual check"
 command = "python check.py"
-when_changed = ["src/**"]
 "#,
         )
         .unwrap();
 
-        assert!(rules
-            .script_tasks_for_changes(&["src/lib.rs".into()])
-            .is_empty());
         assert_eq!(rules.script_tasks_by_ids(&["manual-check".into()]).len(), 1);
+        assert!(rules.script_tasks_by_ids(&["other".into()]).is_empty());
     }
 
     #[test]
-    fn parses_ai_review_defaults_and_selects_auto_reviews() {
+    fn parses_ai_review_defaults_and_selects_by_manual_ids() {
         let rules = Ruleset::from_toml(
             r#"
 [[ai_reviews]]
@@ -348,17 +275,15 @@ title = "AI Review"
 base_url = "https://api.openai.com/v1"
 api_key = "test-api-key"
 model = "gpt-4.1-mini"
-when_changed = ["src/**"]
 "#,
         )
         .unwrap();
 
-        let reviews = rules.ai_reviews_for_changes(&["src/lib.rs".into()]);
+        let reviews = rules.ai_reviews_by_ids(&["ai-review".into()]);
 
         assert_eq!(reviews.len(), 1);
         assert_eq!(reviews[0].id, "ai-review");
         assert_eq!(reviews[0].api_key, "test-api-key");
-        assert!(reviews[0].auto_enabled);
         assert_eq!(reviews[0].timeout_seconds, 60);
         assert_eq!(reviews[0].request_timeout_seconds, None);
         assert_eq!(reviews[0].max_diff_bytes, 60_000);
@@ -402,7 +327,7 @@ max_batches = 6
         )
         .unwrap();
 
-        let reviews = rules.ai_reviews_for_changes(&["src/lib.rs".into()]);
+        let reviews = rules.ai_reviews_by_ids(&["ai-review".into()]);
 
         assert_eq!(reviews.len(), 1);
         assert_eq!(reviews[0].timeout_seconds, 180);
@@ -423,24 +348,20 @@ max_batches = 6
     }
 
     #[test]
-    fn manual_ai_review_selection_ignores_auto_enabled_and_when_changed() {
+    fn unknown_manual_ai_review_id_is_not_selected() {
         let rules = Ruleset::from_toml(
             r#"
 [[ai_reviews]]
-auto_enabled = false
 id = "ai-review"
 title = "AI Review"
 base_url = "https://api.openai.com/v1"
 api_key = "test-api-key"
 model = "gpt-4.1-mini"
-when_changed = ["src/**"]
 "#,
         )
         .unwrap();
 
-        assert!(rules
-            .ai_reviews_for_changes(&["README.md".into()])
-            .is_empty());
+        assert!(rules.ai_reviews_by_ids(&["other".into()]).is_empty());
         assert_eq!(rules.ai_reviews_by_ids(&["ai-review".into()]).len(), 1);
     }
 }

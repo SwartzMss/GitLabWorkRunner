@@ -1,4 +1,4 @@
-# Default example: AI Review enabled, script task configured but disabled.
+# Default example: manual AI Review plus an optional manually triggered script task.
 
 # Global AI review prompt settings shared by every [[ai_reviews]] entry.
 # Leave these empty to use the built-in reviewer prompt.
@@ -19,9 +19,6 @@ search_code = false
 list_files = false
 
 [[ai_reviews]]
-# Keep false for comment-driven manual review with @ai-review.
-# Change to true if MR updates should run AI Review automatically.
-auto_enabled = false
 id = "ai-review"
 title = "AI Review"
 base_url = "https://api.openai.com/v1"
@@ -36,14 +33,11 @@ second_pass_on_clean = false
 batch_review = true
 max_batch_diff_bytes = 15000
 max_batches = 10
-when_changed = ["**/*.rs", "**/*.toml", "**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp"]
 
 [[script_tasks]]
-auto_enabled = false
 id = "check-todo-tbd"
 title = "TODO/TBD 标记检查"
 # Relative paths are resolved from the runner executable directory.
 # The checked MR source root and result file path are appended as arguments.
 command = "python examples/scripts/check_todo_tbd.py"
 timeout_seconds = 30
-when_changed = ["**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.rs"]

@@ -2,15 +2,15 @@
 
 语言：**简体中文** | [English](README.en.md)
 
-GitLabWorkRunner 是一个 Rust 编写的 GitLab Merge Request 自动 Review 服务。它通过 GitLab Webhook 获取 MR 变更，推荐使用 `[[ai_reviews]]` 执行 AI Review，并把结果发布到 MR Discussion。
+GitLabWorkRunner 是一个 Rust 编写的 GitLab Merge Request 手动 Review 服务。它通过 GitLab MR 评论触发 `[[ai_reviews]]` 或脚本任务，获取 MR 变更后把结果发布到 MR Discussion。
 
-它不是 GitLab Runner 替代品，也不会自动执行目标仓库里的 CI 脚本；默认示例启用 AI Review 配置，并保留一个默认不启用的脚本任务示例。
+它不是 GitLab Runner 替代品，也不会自动执行目标仓库里的 CI 脚本；默认示例提供 AI Review 配置，并保留一个可选脚本任务示例。
 
 ## 工作原理
 
 ```mermaid
 flowchart LR
-    A["GitLab MR Webhook"] --> B["GitLabWorkRunner"]
+    A["GitLab MR Comment Webhook"] --> B["GitLabWorkRunner"]
     B --> C["拉取 MR diff"]
     C --> D["解析新增行"]
     D --> F["AI Review"]
@@ -18,10 +18,10 @@ flowchart LR
     F --> H["生成评论"]
     E --> H
     H --> I["GitLab MR Discussion"]
-    B --> J["SQLite 去重状态"]
+    B --> J["SQLite 运行统计"]
 ```
 
-自动 Review 的一次请求大致是：
+手动 Review 的一次请求大致是：
 
 ```mermaid
 sequenceDiagram
@@ -30,26 +30,26 @@ sequenceDiagram
     participant DB as SQLite
     participant AI as OpenAI-compatible API
 
-    GitLab->>Runner: Merge request event
-    Runner->>DB: 检查 commit + ruleset 是否处理过
+    GitLab->>Runner: MR note event with @id
+    Runner->>DB: 记录 review_run_id 和运行状态
     Runner->>GitLab: 拉取 MR changes / diff refs
     Runner->>Runner: 构建 AI Review 输入并定位新增行
     Runner-->>AI: 发送 MR diff，可选附带只读上下文工具
     Runner->>GitLab: 发布行级或 MR 级评论
-    Runner->>DB: 记录处理状态和评论信息
+    Runner->>DB: 记录任务、findings、comments 和完成状态
 ```
 
 更多设计细节见 [docs/design.md](docs/design.md)。
 
 ## 支持能力
 
-- GitLab Merge Request Webhook 自动触发 Review。
+- GitLab Merge Request Note Webhook 手动触发 Review。
 - 只对 MR diff 的新增行发布行级评论。
 - `[[ai_reviews]]`：调用 OpenAI-compatible `POST /chat/completions` 做 AI Review。
 - 支持 Chat Completions `tool_calls` 结构化输出，以及内置只读上下文工具 `read_file`、`search_code`、`list_files`。
 - MR 评论手动触发 AI Review，例如 `@ai-review`。
 - 同一个 `project_id + mr_iid + commit_sha` 正在执行 review 时，会拦截重复触发；如果是 MR 评论触发，会给评论加 `eyes` 并回复“当前 commit 已有 review 正在执行”。
-- 自动 MR event 使用 SQLite 去重，避免同一 commit 和规则集重复评论。
+- 每次 review run、子任务、finding 和已发布评论都会写入 SQLite 结构化表，时间字段使用 RFC3339 UTC 字符串。
 - 可选能力：`[[script_tasks]]` 下载 MR head 快照并执行本地脚本，默认不启用。
 
 ## 快速开始
@@ -156,7 +156,7 @@ max_entry_path_bytes = 512         # 512 bytes
 
 ## AI Review 配置
 
-当前推荐以 AI Review 为主。`rules.toml` 里需要保留 `[ai_review]` 和 `[[ai_reviews]]`；脚本任务可以保留一个默认 `auto_enabled = false` 的配置，后续需要时再打开或手动触发。
+当前只支持在 MR 评论里手动触发 review，不再支持 MR 更新后自动筛选执行。`rules.toml` 里需要保留 `[ai_review]` 和 `[[ai_reviews]]`；脚本任务可以保留配置，后续需要跑本地确定性检查时通过评论手动触发。
 
 推荐 `rules.toml` 示例：
 
@@ -177,7 +177,6 @@ search_code = false
 list_files = false
 
 [[ai_reviews]]
-auto_enabled = false
 id = "ai-review"
 title = "AI Review"
 base_url = "https://api.openai.com/v1"
@@ -190,10 +189,9 @@ second_pass_on_clean = false
 batch_review = true
 max_batch_diff_bytes = 15000
 max_batches = 10
-when_changed = ["**/*.rs", "**/*.toml", "**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp"]
 ```
 
-`auto_enabled` 默认是 `true`；设置为 `false` 时不会自动执行，但仍可以通过 MR 评论 `@ai-review` 手动触发。当前示例使用 `false`，适合你现在这种“评论里 @ai-review 后再跑”的模式；如果希望 MR 更新后自动 review，改成 `true`。
+在 MR 评论中发送独立的 `@ai-review` 会触发 `id = "ai-review"` 的配置。MR 更新事件会被接收并忽略，不会进入 review 队列。
 `[ai_review]` 是全局 AI Review prompt 配置：`system_prompt` 可以替换内置 system prompt，`extra_instructions` 会追加到用户 prompt。缺省时使用内置 prompt，不需要配置。
 `[ai_review.context_tools]` 是进程内只读上下文工具配置，默认全部关闭。开启后，服务会下载 MR head archive，让模型可以通过 tool call 请求 `read_file`、`search_code` 或 `list_files`；runner 只返回仓库目录内的文本内容，不执行 shell，也不会读取 `.env` 或 `.git`。
 `max_tool_calls` 默认是 `30`，`max_tool_result_bytes` 默认是 `60000`。如果 context tools 都关闭，不会额外下载 archive，也不会增加中间 AI 请求。
@@ -287,15 +285,11 @@ AI Review 默认请求 Chat Completions `tool_calls` 结构化输出，并从 `s
 
 ```toml
 [[script_tasks]]
-auto_enabled = false
 id = "check-todo-tbd"
 title = "TODO/TBD marker check"
 command = "python examples/scripts/check_todo_tbd.py"
 timeout_seconds = 30
-when_changed = ["**/*.rs"]
 ```
-
-`auto_enabled` 默认是 `true`；设置为 `false` 时不会自动执行，但仍可以通过 MR 评论 `@check-todo-tbd` 手动触发。
 
 `@check-todo-tbd` 匹配的是 `[[script_tasks]]` 里的 `id = "check-todo-tbd"`。
 
@@ -319,7 +313,7 @@ src/config.rs:5: //TODO aa
 @ai-review
 ```
 
-手动触发不会使用自动 Review 的已完成去重键；同一个 commit 完成后可以再次触发。但如果同一个 `project_id + mr_iid + commit_sha` 仍在执行中，新的触发会被跳过：服务会给触发评论加 `eyes`，并回复一条 MR 评论提示当前 commit 已有 review 正在执行，请稍后再试。如果全局运行中的 review 数已经达到 `[server].max_concurrent_reviews`，也会跳过本次触发并回复队列繁忙提示。
+同一个 commit 完成后可以再次触发。但如果同一个 `project_id + mr_iid + commit_sha` 仍在执行中，新的触发会被跳过：服务会给触发评论加 `eyes`，并回复一条 MR 评论提示当前 commit 已有 review 正在执行，请稍后再试。如果全局运行中的 review 数已经达到 `[server].max_concurrent_reviews`，也会跳过本次触发并回复队列繁忙提示。
 
 如果你配置了可选脚本任务，也可以用对应 id 手动触发：
 

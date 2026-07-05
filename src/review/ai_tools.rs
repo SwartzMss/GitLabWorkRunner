@@ -528,7 +528,6 @@ mod tests {
 
     fn test_config() -> AiReviewConfig {
         AiReviewConfig {
-            auto_enabled: true,
             id: "ai-review".into(),
             title: "AI Review".into(),
             base_url: "https://ai.example.com".into(),
@@ -550,7 +549,6 @@ mod tests {
                 search_code: true,
                 list_files: true,
             },
-            when_changed: vec![],
         }
     }
 

@@ -868,7 +868,6 @@ mod tests {
 
     fn test_ai_review_config() -> AiReviewConfig {
         AiReviewConfig {
-            auto_enabled: true,
             id: "ai-review".into(),
             title: "AI Review".into(),
             base_url: "https://ai.example.com".into(),
@@ -886,7 +885,6 @@ mod tests {
             max_tool_calls: 8,
             max_tool_result_bytes: 60_000,
             context_tools: AiReviewContextTools::default(),
-            when_changed: vec![],
         }
     }
 
