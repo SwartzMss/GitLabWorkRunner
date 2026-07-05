@@ -127,6 +127,7 @@ Before running the binary, still prepare `config.toml` and `rules.toml`.
 [server]
 bind = "0.0.0.0:8080"
 webhook_secret = "change-me"
+max_concurrent_reviews = 4
 
 [gitlab]
 base_url = "https://gitlab.example.com"
@@ -141,6 +142,8 @@ file = "rules.toml"
 ```
 
 `[gitlab].token` is the token used by the service when calling the GitLab API. It is different from the webhook `Secret token`. Prefer a Project Access Token or a dedicated bot user token with the `api` scope and at least the `Developer` project role. It must be able to read MR diffs, download repository archives, and publish MR discussions. Do not commit a real `config.toml` token to the repository.
+
+`[server].max_concurrent_reviews` controls how many review runs can execute at the same time in one process. The default is `4`. When the limit is reached, the runner does not start another background review and posts an MR-level comment asking the user to retry later because the review queue is busy. If the request came from an MR note, the service also awards `eyes` to the triggering note.
 
 ## AI Review Config
 
@@ -233,7 +236,7 @@ After enabling GitLab webhook `Comments`, add standalone commands in an MR comme
 @ai-review
 ```
 
-Manual triggers do not use the completed automatic review dedupe key. The same commit can be triggered again after the current run finishes. If the same `project_id + mr_iid + commit_sha` is still running, a new trigger is skipped; the service awards `eyes` to the triggering note and posts an MR comment asking the user to retry later.
+Manual triggers do not use the completed automatic review dedupe key. The same commit can be triggered again after the current run finishes. If the same `project_id + mr_iid + commit_sha` is still running, a new trigger is skipped; the service awards `eyes` to the triggering note and posts an MR comment asking the user to retry later. If the global number of running reviews has reached `[server].max_concurrent_reviews`, the trigger is also skipped and the MR receives a queue-busy comment.
 
 If optional script tasks are configured, they can also be triggered by their id:
 
@@ -252,7 +255,7 @@ Downloaded GitLab archive zip bytes stay in memory; the service does not write t
 
 After normal completion or failure, AI Review removes the current context run directory. Script tasks remove `source` but keep `run.log` and `result.txt` for troubleshooting. On startup, the service cleans stale work directories older than 24 hours, and it repeats that cleanup every hour while running. Cleanup failures are logged as WARN and do not block review.
 
-The active-review guard is process-local. For multi-instance deployments, move the running lock to SQLite/PostgreSQL if cross-process exclusion and global cleanup are required.
+The active-review guard and global concurrency limit are process-local. For multi-instance deployments, move the running lock to SQLite/PostgreSQL if cross-process exclusion, global concurrency limiting, and global cleanup are required.
 
 ## Failure Notifications
 

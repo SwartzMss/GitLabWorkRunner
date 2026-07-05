@@ -5,6 +5,7 @@ use std::{fs, path::Path};
 const DEFAULT_LOG_FILE: &str = "logs/gitlab-work-runner.log";
 const DEFAULT_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
 const DEFAULT_LOG_MAX_FILES: usize = 5;
+const DEFAULT_MAX_CONCURRENT_REVIEWS: usize = 4;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct AppConfig {
@@ -20,6 +21,8 @@ pub struct AppConfig {
 pub struct ServerConfig {
     pub bind: String,
     pub webhook_secret: String,
+    #[serde(default = "default_max_concurrent_reviews")]
+    pub max_concurrent_reviews: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -68,6 +71,10 @@ fn default_log_max_bytes() -> u64 {
 
 fn default_log_max_files() -> usize {
     DEFAULT_LOG_MAX_FILES
+}
+
+fn default_max_concurrent_reviews() -> usize {
+    DEFAULT_MAX_CONCURRENT_REVIEWS
 }
 
 impl AppConfig {
@@ -119,6 +126,7 @@ file = "rules.toml"
 
         assert_eq!(config.server.bind, "127.0.0.1:8080");
         assert_eq!(config.server.webhook_secret, "secret");
+        assert_eq!(config.server.max_concurrent_reviews, 4);
         assert_eq!(config.gitlab.base_url, "https://gitlab.example.com");
         assert_eq!(config.gitlab.token, "glpat-test-token");
         assert_eq!(config.gitlab_token().unwrap(), "glpat-test-token");
@@ -135,6 +143,7 @@ file = "rules.toml"
             server: ServerConfig {
                 bind: "127.0.0.1:8080".into(),
                 webhook_secret: "secret".into(),
+                max_concurrent_reviews: 4,
             },
             gitlab: GitLabConfig {
                 base_url: "https://gitlab.example.com".into(),

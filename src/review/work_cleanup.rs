@@ -46,13 +46,14 @@ pub(crate) fn cleanup_stale_ai_context_work(root: &Path, ttl: Duration) -> io::R
 }
 
 pub(crate) fn cleanup_stale_script_sources(root: &Path, ttl: Duration) -> io::Result<usize> {
-    cleanup_dirs_matching(
-        root,
+    if !root.exists() {
+        return Ok(0);
+    }
+    let root = absolute_path(root.to_path_buf())?;
+    cleanup_dirs_recursive(
+        &root,
         ttl,
-        &|path| {
-            path.file_name()
-                .is_some_and(|file_name| file_name == "source")
-        },
+        &|path| is_script_task_source_leaf(&root, path),
         false,
     )
 }
@@ -131,6 +132,18 @@ fn absolute_path(path: PathBuf) -> io::Result<PathBuf> {
     }
 }
 
+fn is_script_task_source_leaf(root: &Path, path: &Path) -> bool {
+    if path
+        .file_name()
+        .is_none_or(|file_name| file_name != "source")
+    {
+        return false;
+    }
+    path.strip_prefix(root)
+        .map(|relative| relative.components().count() == 5)
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,6 +176,25 @@ mod tests {
         let removed = cleanup_stale_script_sources(temp.path(), Duration::ZERO).unwrap();
 
         assert_eq!(removed, 1);
+        assert!(!source_dir.exists());
+        assert!(task_dir.join("run.log").exists());
+        assert!(task_dir.join("result.txt").exists());
+    }
+
+    #[test]
+    fn cleanup_preserves_script_logs_when_task_id_is_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let task_dir = temp.path().join("1/2/commit/source");
+        let source_dir = task_dir.join("source");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::write(source_dir.join("src.rs"), "content").unwrap();
+        fs::write(task_dir.join("run.log"), "log").unwrap();
+        fs::write(task_dir.join("result.txt"), "result").unwrap();
+
+        let removed = cleanup_stale_script_sources(temp.path(), Duration::ZERO).unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(task_dir.exists());
         assert!(!source_dir.exists());
         assert!(task_dir.join("run.log").exists());
         assert!(task_dir.join("result.txt").exists());

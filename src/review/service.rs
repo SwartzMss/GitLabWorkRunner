@@ -43,25 +43,6 @@ impl ReviewService {
         self
     }
 
-    pub async fn post_merge_request_level_comment(
-        &self,
-        project_id: i64,
-        mr_iid: i64,
-        body: String,
-    ) -> AppResult<()> {
-        self.gitlab
-            .create_discussion(
-                project_id,
-                mr_iid,
-                &CreateDiscussionRequest {
-                    body,
-                    position: None,
-                },
-            )
-            .await?;
-        Ok(())
-    }
-
     pub async fn review_merge_request(
         &self,
         event: &MergeRequestEvent,

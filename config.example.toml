@@ -1,6 +1,7 @@
 [server]
 bind = "0.0.0.0:8080"
 webhook_secret = "change-me"
+max_concurrent_reviews = 4
 
 [gitlab]
 base_url = "https://gitlab.example.com"

@@ -1,14 +1,15 @@
 use crate::{
     config::AppConfig,
     error::AppResult,
-    gitlab::{CreateDiscussionRequest, GitLabClient},
-    review::work_cleanup::{cleanup_stale_review_work, spawn_periodic_stale_review_work_cleanup},
+    gitlab::GitLabClient,
+    review::{
+        notifier::{ReviewFailureNotification, ReviewNotifier},
+        work_cleanup::{cleanup_stale_review_work, spawn_periodic_stale_review_work_cleanup},
+    },
     review::{service::manual_script_task_ids, ReviewService},
     rules::Ruleset,
     storage::StateStore,
-    webhook::{
-        parse_gitlab_webhook_event, validate_token, GitLabWebhookEvent, MergeRequestNoteEvent,
-    },
+    webhook::{parse_gitlab_webhook_event, validate_token, GitLabWebhookEvent},
 };
 use axum::{
     body::Bytes,
@@ -52,8 +53,20 @@ struct ActiveReviewKey {
     commit_sha: String,
 }
 
-struct ActiveReviewConflict {
-    active_review_run_id: String,
+struct ActiveReviewStart {
+    guard: ActiveReviewGuard,
+    active_count: usize,
+}
+
+enum ActiveReviewStartError {
+    Duplicate {
+        active_review_run_id: String,
+        active_count: usize,
+    },
+    QueueBusy {
+        active_count: usize,
+        max_concurrent_reviews: usize,
+    },
 }
 
 struct ActiveReviewGuard {
@@ -67,21 +80,34 @@ impl ActiveReviews {
         self: &Arc<Self>,
         key: ActiveReviewKey,
         review_run_id: String,
-    ) -> Result<ActiveReviewGuard, ActiveReviewConflict> {
+        max_concurrent_reviews: usize,
+    ) -> Result<ActiveReviewStart, ActiveReviewStartError> {
         let mut running = self
             .running
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(active_review_run_id) = running.get(&key) {
-            return Err(ActiveReviewConflict {
+            return Err(ActiveReviewStartError::Duplicate {
                 active_review_run_id: active_review_run_id.clone(),
+                active_count: running.len(),
+            });
+        }
+        let max_concurrent_reviews = max_concurrent_reviews.max(1);
+        let active_count = running.len();
+        if active_count >= max_concurrent_reviews {
+            return Err(ActiveReviewStartError::QueueBusy {
+                active_count,
+                max_concurrent_reviews,
             });
         }
         running.insert(key.clone(), review_run_id.clone());
-        Ok(ActiveReviewGuard {
-            active_reviews: Arc::clone(self),
-            key,
-            review_run_id,
+        Ok(ActiveReviewStart {
+            active_count: running.len(),
+            guard: ActiveReviewGuard {
+                active_reviews: Arc::clone(self),
+                key,
+                review_run_id,
+            },
         })
     }
 
@@ -270,27 +296,37 @@ async fn gitlab_webhook(
             mr_iid: response_summary.mr_iid,
             commit_sha: response_summary.commit_sha.clone(),
         };
-        match state
-            .active_reviews
-            .try_start(active_key, review_run_id.clone())
-        {
-            Ok(guard) => {
+        match state.active_reviews.try_start(
+            active_key,
+            review_run_id.clone(),
+            state.config.server.max_concurrent_reviews,
+        ) {
+            Ok(start) => {
                 info!(
                     review_run_id = %review_run_id,
                     project_id = response_summary.project_id,
                     mr_iid = response_summary.mr_iid,
                     commit_sha = %response_summary.commit_sha,
+                    queue_status = "accepted",
+                    active_count = start.active_count,
+                    max_concurrent_reviews = state.config.server.max_concurrent_reviews.max(1),
                     "review run registered as active"
                 );
-                Some(guard)
+                Some(start.guard)
             }
-            Err(conflict) => {
+            Err(ActiveReviewStartError::Duplicate {
+                active_review_run_id,
+                active_count,
+            }) => {
                 info!(
                     review_run_id = %review_run_id,
-                    active_review_run_id = %conflict.active_review_run_id,
+                    active_review_run_id = %active_review_run_id,
                     project_id = response_summary.project_id,
                     mr_iid = response_summary.mr_iid,
                     commit_sha = %response_summary.commit_sha,
+                    queue_status = "duplicate",
+                    active_count,
+                    max_concurrent_reviews = state.config.server.max_concurrent_reviews.max(1),
                     "gitlab webhook review skipped because commit review is already running"
                 );
                 if let GitLabWebhookEvent::MergeRequestNote(event) = &event {
@@ -298,16 +334,20 @@ async fn gitlab_webhook(
                         state.config.gitlab.base_url.clone(),
                         gitlab_token.clone(),
                     );
+                    let notifier = ReviewNotifier::new(gitlab);
                     let event = event.clone();
-                    let active_review_run_id = conflict.active_review_run_id.clone();
+                    let active_review_run_id = active_review_run_id.clone();
                     let notification_span =
                         info_span!("review_run", review_run_id = %review_run_id);
                     tokio::spawn(
-                        notify_duplicate_running_review_request(
-                            gitlab,
-                            event,
-                            active_review_run_id,
-                        )
+                        async move {
+                            notifier
+                                .notify_duplicate_running_review_request(
+                                    event,
+                                    active_review_run_id,
+                                )
+                                .await;
+                        }
                         .instrument(notification_span),
                     );
                 }
@@ -318,7 +358,76 @@ async fn gitlab_webhook(
                         "skipped": true,
                         "reason": "review_already_running",
                         "review_run_id": review_run_id,
-                        "active_review_run_id": conflict.active_review_run_id
+                        "active_review_run_id": active_review_run_id,
+                        "active_count": active_count,
+                        "max_concurrent_reviews": state.config.server.max_concurrent_reviews.max(1)
+                    })),
+                )
+                    .into_response();
+            }
+            Err(ActiveReviewStartError::QueueBusy {
+                active_count,
+                max_concurrent_reviews,
+            }) => {
+                info!(
+                    review_run_id = %review_run_id,
+                    project_id = response_summary.project_id,
+                    mr_iid = response_summary.mr_iid,
+                    commit_sha = %response_summary.commit_sha,
+                    queue_status = "busy",
+                    active_count,
+                    max_concurrent_reviews,
+                    "gitlab webhook review skipped because global review concurrency is full"
+                );
+                let gitlab =
+                    GitLabClient::new(state.config.gitlab.base_url.clone(), gitlab_token.clone());
+                let notifier = ReviewNotifier::new(gitlab);
+                let notification_span = info_span!("review_run", review_run_id = %review_run_id);
+                match &event {
+                    GitLabWebhookEvent::MergeRequestNote(event) => {
+                        let event = event.clone();
+                        tokio::spawn(
+                            async move {
+                                notifier
+                                    .notify_review_note_queue_busy(
+                                        event,
+                                        active_count,
+                                        max_concurrent_reviews,
+                                    )
+                                    .await;
+                            }
+                            .instrument(notification_span),
+                        );
+                    }
+                    GitLabWebhookEvent::MergeRequest(_) => {
+                        let commit_sha = response_summary.commit_sha.clone();
+                        let project_id = response_summary.project_id;
+                        let mr_iid = response_summary.mr_iid;
+                        tokio::spawn(
+                            async move {
+                                notifier
+                                    .notify_review_queue_busy(
+                                        project_id,
+                                        mr_iid,
+                                        commit_sha,
+                                        active_count,
+                                        max_concurrent_reviews,
+                                    )
+                                    .await;
+                            }
+                            .instrument(notification_span),
+                        );
+                    }
+                }
+                return (
+                    StatusCode::ACCEPTED,
+                    Json(json!({
+                        "accepted": false,
+                        "skipped": true,
+                        "reason": "review_queue_busy",
+                        "review_run_id": review_run_id,
+                        "active_count": active_count,
+                        "max_concurrent_reviews": max_concurrent_reviews
                     })),
                 )
                     .into_response();
@@ -329,11 +438,13 @@ async fn gitlab_webhook(
     };
 
     let gitlab = GitLabClient::new(state.config.gitlab.base_url.clone(), gitlab_token);
+    let notifier = ReviewNotifier::new(gitlab.clone());
     let service = ReviewService::new(gitlab, state.store.clone(), ruleset)
         .with_review_run_id(review_run_id.clone());
     let review_span = info_span!("review_run", review_run_id = %review_run_id);
     tokio::spawn(
         run_webhook_review(
+            notifier,
             service,
             event,
             response_summary.clone(),
@@ -367,6 +478,7 @@ struct WebhookReviewSummary {
 }
 
 async fn run_webhook_review(
+    notifier: ReviewNotifier,
     service: ReviewService,
     event: GitLabWebhookEvent,
     response_summary: WebhookReviewSummary,
@@ -401,67 +513,17 @@ async fn run_webhook_review(
                 error = %err,
                 "gitlab webhook review failed"
             );
-            notify_review_failed(&service, &response_summary, &err).await;
+            notifier
+                .notify_review_failed(ReviewFailureNotification {
+                    project_id: response_summary.project_id,
+                    mr_iid: response_summary.mr_iid,
+                    commit_sha: &response_summary.commit_sha,
+                    review_run_id: &response_summary.review_run_id,
+                    error: &err,
+                })
+                .await;
         }
     }
-}
-
-async fn notify_review_failed(
-    service: &ReviewService,
-    response_summary: &WebhookReviewSummary,
-    err: &crate::error::AppError,
-) {
-    match service
-        .post_merge_request_level_comment(
-            response_summary.project_id,
-            response_summary.mr_iid,
-            review_failed_body(response_summary, err),
-        )
-        .await
-    {
-        Ok(()) => info!(
-            review_run_id = %response_summary.review_run_id,
-            project_id = response_summary.project_id,
-            mr_iid = response_summary.mr_iid,
-            commit_sha = %response_summary.commit_sha,
-            "review failure notification posted"
-        ),
-        Err(comment_err) => warn!(
-            review_run_id = %response_summary.review_run_id,
-            project_id = response_summary.project_id,
-            mr_iid = response_summary.mr_iid,
-            commit_sha = %response_summary.commit_sha,
-            review_error = %err,
-            error = %comment_err,
-            "failed to post review failure notification"
-        ),
-    }
-}
-
-fn review_failed_body(
-    response_summary: &WebhookReviewSummary,
-    err: &crate::error::AppError,
-) -> String {
-    let error_text = truncate_for_comment(&err.to_string(), 1200);
-    format!(
-        "Review 执行失败，请查看 runner 日志后重试。\n\ncommit: `{}`\nreview_run_id: `{}`\nerror: `{}`\n\n<!-- gitlab-work-runner:review-failed review_run_id={} commit={} -->",
-        response_summary.commit_sha,
-        response_summary.review_run_id,
-        error_text,
-        response_summary.review_run_id,
-        response_summary.commit_sha
-    )
-}
-
-fn truncate_for_comment(value: &str, max_chars: usize) -> String {
-    let mut output = String::new();
-    for ch in value.chars().take(max_chars) {
-        output.push(ch);
-    }
-    if value.chars().count() > max_chars {
-        output.push_str("...");
-    }
-    output.replace('`', "'")
 }
 
 fn event_requests_review(event: &GitLabWebhookEvent, ruleset: &Ruleset) -> bool {
@@ -474,62 +536,6 @@ fn event_requests_review(event: &GitLabWebhookEvent, ruleset: &Ruleset) -> bool 
                     || !ruleset.ai_reviews_by_ids(&requested_ids).is_empty())
         }
     }
-}
-
-async fn notify_duplicate_running_review_request(
-    gitlab: GitLabClient,
-    event: MergeRequestNoteEvent,
-    active_review_run_id: String,
-) {
-    if let Err(err) = gitlab
-        .award_merge_request_note_emoji(event.project_id, event.mr_iid, event.note_id, "eyes")
-        .await
-    {
-        warn!(
-            active_review_run_id = %active_review_run_id,
-            project_id = event.project_id,
-            mr_iid = event.mr_iid,
-            note_id = event.note_id,
-            error = %err,
-            "failed to award duplicate review request emoji; continuing notification"
-        );
-    }
-
-    let body = duplicate_running_review_body(&event.commit_sha, &active_review_run_id);
-    match gitlab
-        .create_discussion(
-            event.project_id,
-            event.mr_iid,
-            &CreateDiscussionRequest {
-                body,
-                position: None,
-            },
-        )
-        .await
-    {
-        Ok(created) => info!(
-            active_review_run_id = %active_review_run_id,
-            project_id = event.project_id,
-            mr_iid = event.mr_iid,
-            note_id = event.note_id,
-            discussion_id = %created.id,
-            "duplicate review request notification posted"
-        ),
-        Err(err) => warn!(
-            active_review_run_id = %active_review_run_id,
-            project_id = event.project_id,
-            mr_iid = event.mr_iid,
-            note_id = event.note_id,
-            error = %err,
-            "failed to post duplicate review request notification"
-        ),
-    }
-}
-
-fn duplicate_running_review_body(commit_sha: &str, active_review_run_id: &str) -> String {
-    format!(
-        "当前 commit `{commit_sha}` 已有 review 正在执行，请稍后再试。\n\n运行中的 review_run_id: `{active_review_run_id}`\n\n<!-- gitlab-work-runner:review-already-running commit={commit_sha} active_review_run_id={active_review_run_id} -->"
-    )
 }
 
 fn new_review_run_id() -> String {
@@ -576,6 +582,7 @@ mod tests {
                 server: ServerConfig {
                     bind: "127.0.0.1:0".into(),
                     webhook_secret: "secret".into(),
+                    max_concurrent_reviews: 4,
                 },
                 gitlab: GitLabConfig {
                     base_url: gitlab_base_url,
@@ -723,6 +730,7 @@ when_changed = ["src/**"]
                 server: ServerConfig {
                     bind: "127.0.0.1:0".into(),
                     webhook_secret: "secret".into(),
+                    max_concurrent_reviews: 4,
                 },
                 gitlab: GitLabConfig {
                     base_url: gitlab_base_url,
@@ -792,6 +800,340 @@ when_changed = ["src/**"]
     }
 
     #[tokio::test]
+    async fn busy_review_queue_note_gets_acknowledgement_comment() {
+        let rules_file = NamedTempFile::new().unwrap();
+        let command = if cfg!(windows) {
+            "echo ok"
+        } else {
+            "printf ok"
+        };
+        std::fs::write(
+            rules_file.path(),
+            format!(
+                r#"
+[[script_tasks]]
+id = "check"
+title = "Check"
+command = "{}"
+timeout_seconds = 10
+when_changed = ["src/**"]
+"#,
+                command.replace('\\', "\\\\").replace('"', "\\\"")
+            ),
+        )
+        .unwrap();
+
+        let change_count = Arc::new(AtomicUsize::new(0));
+        let emoji_count = Arc::new(AtomicUsize::new(0));
+        let busy_comment_count = Arc::new(AtomicUsize::new(0));
+        let change_started = Arc::new(Notify::new());
+        let release_change = Arc::new(Notify::new());
+
+        let change_count_for_handler = Arc::clone(&change_count);
+        let change_started_for_handler = Arc::clone(&change_started);
+        let release_change_for_handler = Arc::clone(&release_change);
+        let emoji_count_for_handler = Arc::clone(&emoji_count);
+        let busy_comment_count_for_handler = Arc::clone(&busy_comment_count);
+        let app = Router::new()
+            .route(
+                "/api/v4/projects/123/merge_requests/45/changes",
+                get(move || {
+                    let change_count = Arc::clone(&change_count_for_handler);
+                    let change_started = Arc::clone(&change_started_for_handler);
+                    let release_change = Arc::clone(&release_change_for_handler);
+                    async move {
+                        change_count.fetch_add(1, Ordering::SeqCst);
+                        change_started.notify_one();
+                        release_change.notified().await;
+                        Json(json!({
+                            "changes": [{
+                                "old_path": "src/lib.rs",
+                                "new_path": "src/lib.rs",
+                                "new_file": false,
+                                "renamed_file": false,
+                                "deleted_file": false,
+                                "diff": "@@ -1 +1 @@\n+pub fn value() {}\n"
+                            }],
+                            "diff_refs": {
+                                "base_sha": "base",
+                                "start_sha": "start",
+                                "head_sha": "abc123"
+                            }
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/api/v4/projects/123/merge_requests/45/notes/988/award_emoji",
+                post(move || {
+                    let emoji_count = Arc::clone(&emoji_count_for_handler);
+                    async move {
+                        emoji_count.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::CREATED,
+                            Json(json!({
+                                "id": 1,
+                                "name": "eyes"
+                            })),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/api/v4/projects/123/merge_requests/45/discussions",
+                post(move |body: Bytes| {
+                    let busy_comment_count = Arc::clone(&busy_comment_count_for_handler);
+                    async move {
+                        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        let message = body["body"].as_str().unwrap();
+                        assert!(message.contains("review 队列繁忙"));
+                        assert!(message.contains("active_count: `1`"));
+                        assert!(message.contains("max_concurrent_reviews: `1`"));
+                        assert!(message.contains("gitlab-work-runner:review-queue-busy"));
+                        assert!(body.get("position").is_none());
+                        busy_comment_count.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::CREATED,
+                            Json(json!({
+                                "id": "review-queue-busy",
+                                "notes": [{ "id": 997 }]
+                            })),
+                        )
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gitlab_base_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let store = StateStore::connect("sqlite::memory:").await.unwrap();
+        store.migrate().await.unwrap();
+        let state = Arc::new(AppState {
+            config: AppConfig {
+                server: ServerConfig {
+                    bind: "127.0.0.1:0".into(),
+                    webhook_secret: "secret".into(),
+                    max_concurrent_reviews: 1,
+                },
+                gitlab: GitLabConfig {
+                    base_url: gitlab_base_url,
+                    token: "token".into(),
+                },
+                storage: StorageConfig {
+                    database_url: "sqlite::memory:".into(),
+                },
+                rules: RulesConfig {
+                    file: rules_file.path().to_string_lossy().into_owned(),
+                },
+                logging: LoggingConfig::default(),
+            },
+            store,
+            active_reviews: Arc::new(ActiveReviews::default()),
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Gitlab-Token", HeaderValue::from_static("secret"));
+
+        let first = gitlab_webhook(
+            State(Arc::clone(&state)),
+            headers.clone(),
+            Bytes::from_static(include_bytes!("../../tests/fixtures/gitlab_mr_event.json")),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        change_started.notified().await;
+
+        let busy_note = Bytes::from_static(
+            br#"{
+                "object_kind": "note",
+                "project_id": 123,
+                "object_attributes": {
+                    "id": 988,
+                    "note": "@check",
+                    "noteable_type": "MergeRequest",
+                    "action": "create"
+                },
+                "merge_request": {
+                    "iid": 45,
+                    "last_commit": { "id": "def456" }
+                }
+            }"#,
+        );
+        let busy = gitlab_webhook(State(state), headers, busy_note)
+            .await
+            .into_response();
+
+        assert_eq!(busy.status(), StatusCode::ACCEPTED);
+        let body = to_bytes(busy.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["accepted"], false);
+        assert_eq!(body["reason"], "review_queue_busy");
+        assert_eq!(body["active_count"], 1);
+        assert_eq!(body["max_concurrent_reviews"], 1);
+
+        for _ in 0..20 {
+            if busy_comment_count.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(change_count.load(Ordering::SeqCst), 1);
+        assert_eq!(emoji_count.load(Ordering::SeqCst), 1);
+        assert_eq!(busy_comment_count.load(Ordering::SeqCst), 1);
+
+        release_change.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn busy_review_queue_merge_request_posts_comment() {
+        let rules_file = NamedTempFile::new().unwrap();
+        std::fs::write(rules_file.path(), "").unwrap();
+
+        let change_count = Arc::new(AtomicUsize::new(0));
+        let busy_comment_count = Arc::new(AtomicUsize::new(0));
+        let change_started = Arc::new(Notify::new());
+        let release_change = Arc::new(Notify::new());
+
+        let change_count_for_handler = Arc::clone(&change_count);
+        let change_started_for_handler = Arc::clone(&change_started);
+        let release_change_for_handler = Arc::clone(&release_change);
+        let busy_comment_count_for_handler = Arc::clone(&busy_comment_count);
+        let app = Router::new()
+            .route(
+                "/api/v4/projects/123/merge_requests/45/changes",
+                get(move || {
+                    let change_count = Arc::clone(&change_count_for_handler);
+                    let change_started = Arc::clone(&change_started_for_handler);
+                    let release_change = Arc::clone(&release_change_for_handler);
+                    async move {
+                        change_count.fetch_add(1, Ordering::SeqCst);
+                        change_started.notify_one();
+                        release_change.notified().await;
+                        Json(json!({
+                            "changes": [{
+                                "old_path": "src/lib.rs",
+                                "new_path": "src/lib.rs",
+                                "new_file": false,
+                                "renamed_file": false,
+                                "deleted_file": false,
+                                "diff": "@@ -1 +1 @@\n+pub fn value() {}\n"
+                            }],
+                            "diff_refs": {
+                                "base_sha": "base",
+                                "start_sha": "start",
+                                "head_sha": "abc123"
+                            }
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/api/v4/projects/123/merge_requests/45/discussions",
+                post(move |body: Bytes| {
+                    let busy_comment_count = Arc::clone(&busy_comment_count_for_handler);
+                    async move {
+                        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        let message = body["body"].as_str().unwrap();
+                        assert!(message.contains("review 队列繁忙"));
+                        assert!(message.contains("commit: `def456`"));
+                        assert!(message.contains("active_count: `1`"));
+                        assert!(message.contains("max_concurrent_reviews: `1`"));
+                        assert!(body.get("position").is_none());
+                        busy_comment_count.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::CREATED,
+                            Json(json!({
+                                "id": "review-queue-busy",
+                                "notes": [{ "id": 996 }]
+                            })),
+                        )
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gitlab_base_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let store = StateStore::connect("sqlite::memory:").await.unwrap();
+        store.migrate().await.unwrap();
+        let state = Arc::new(AppState {
+            config: AppConfig {
+                server: ServerConfig {
+                    bind: "127.0.0.1:0".into(),
+                    webhook_secret: "secret".into(),
+                    max_concurrent_reviews: 1,
+                },
+                gitlab: GitLabConfig {
+                    base_url: gitlab_base_url,
+                    token: "token".into(),
+                },
+                storage: StorageConfig {
+                    database_url: "sqlite::memory:".into(),
+                },
+                rules: RulesConfig {
+                    file: rules_file.path().to_string_lossy().into_owned(),
+                },
+                logging: LoggingConfig::default(),
+            },
+            store,
+            active_reviews: Arc::new(ActiveReviews::default()),
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Gitlab-Token", HeaderValue::from_static("secret"));
+
+        let first = gitlab_webhook(
+            State(Arc::clone(&state)),
+            headers.clone(),
+            Bytes::from_static(include_bytes!("../../tests/fixtures/gitlab_mr_event.json")),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        change_started.notified().await;
+
+        let busy = gitlab_webhook(
+            State(state),
+            headers,
+            Bytes::from_static(
+                br#"{
+                    "object_kind": "merge_request",
+                    "project": { "id": 123 },
+                    "object_attributes": {
+                        "iid": 45,
+                        "action": "update",
+                        "last_commit": { "id": "def456" },
+                        "source_branch": "feature/review",
+                        "target_branch": "main"
+                    }
+                }"#,
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(busy.status(), StatusCode::ACCEPTED);
+        let body = to_bytes(busy.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["accepted"], false);
+        assert_eq!(body["reason"], "review_queue_busy");
+
+        for _ in 0..20 {
+            if busy_comment_count.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(change_count.load(Ordering::SeqCst), 1);
+        assert_eq!(busy_comment_count.load(Ordering::SeqCst), 1);
+
+        release_change.notify_waiters();
+    }
+
+    #[tokio::test]
     async fn failed_webhook_review_posts_failure_comment() {
         let rules_file = NamedTempFile::new().unwrap();
         std::fs::write(rules_file.path(), "").unwrap();
@@ -838,6 +1180,7 @@ when_changed = ["src/**"]
                 server: ServerConfig {
                     bind: "127.0.0.1:0".into(),
                     webhook_secret: "secret".into(),
+                    max_concurrent_reviews: 4,
                 },
                 gitlab: GitLabConfig {
                     base_url: gitlab_base_url,
