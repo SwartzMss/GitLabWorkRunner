@@ -13,6 +13,9 @@ database_url = "sqlite://gitlab-work-runner.db"
 [rules]
 file = "rules.toml"
 
+[dashboard]
+bind = "127.0.0.1:8082"
+
 [logging]
 file = "logs/gitlab-work-runner.log"
 max_bytes = 10485760

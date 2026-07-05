@@ -1,4 +1,5 @@
 pub mod app;
+pub mod dashboard;
 pub mod gitlab;
 pub mod review;
 pub mod storage;
