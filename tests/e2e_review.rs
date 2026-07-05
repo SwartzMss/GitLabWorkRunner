@@ -574,6 +574,136 @@ when_changed = ["src/**"]
     assert_eq!(discussion_count.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test]
+async fn automatic_ai_review_posts_summary_when_one_review_fails() {
+    let discussion_count = Arc::new(AtomicUsize::new(0));
+    let discussion_count_for_handler = Arc::clone(&discussion_count);
+    let ai_request_count = Arc::new(AtomicUsize::new(0));
+    let ai_request_count_for_handler = Arc::clone(&ai_request_count);
+    let (listener, addr) = bind_test_listener().await;
+    let app = Router::new()
+        .route(
+            "/api/v4/projects/123/merge_requests/45/changes",
+            get(|| async {
+                Json(json!({
+                    "changes": [{
+                        "old_path": "src/lib.rs",
+                        "new_path": "src/lib.rs",
+                        "new_file": false,
+                        "renamed_file": false,
+                        "deleted_file": false,
+                        "diff": "@@ -1 +1 @@\n+pub fn value() {}\n"
+                    }],
+                    "diff_refs": {
+                        "base_sha": "base",
+                        "start_sha": "start",
+                        "head_sha": "partial-ai-head"
+                    }
+                }))
+            }),
+        )
+        .route(
+            "/chat/completions",
+            post(move |body: Bytes| {
+                let ai_request_count = Arc::clone(&ai_request_count_for_handler);
+                async move {
+                    ai_request_count.fetch_add(1, Ordering::SeqCst);
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    match body["model"].as_str().unwrap() {
+                        "bad-model" => Json(json!({
+                            "choices": [{
+                                "message": {
+                                    "content": "not json"
+                                }
+                            }]
+                        })),
+                        "good-model" => Json(json!({
+                            "choices": [{
+                                "message": {
+                                    "content": serde_json::json!({
+                                        "findings": []
+                                    }).to_string()
+                                }
+                            }]
+                        })),
+                        other => panic!("unexpected model {other}"),
+                    }
+                }
+            }),
+        )
+        .route(
+            "/api/v4/projects/123/merge_requests/45/discussions",
+            post(move |body: Bytes| {
+                let discussion_count = Arc::clone(&discussion_count_for_handler);
+                async move {
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    let message = body["body"].as_str().unwrap();
+                    assert!(message.contains("部分 AI Review 失败"));
+                    assert!(message.contains("- `bad-review` Bad Review"));
+                    assert!(message.contains("commit: `event123`"));
+                    assert!(message.contains("review_run_id: `rr-partial-auto`"));
+                    assert!(message.contains("runner 日志"));
+                    assert!(message.contains("gitlab-work-runner:ai-review-partial-failed"));
+                    assert!(body["position"].is_null());
+                    discussion_count.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::CREATED,
+                        Json(json!({
+                            "id": "discussion-partial",
+                            "notes": [{ "id": 101 }]
+                        })),
+                    )
+                }
+            }),
+        );
+    spawn_server_on(listener, app);
+    let base_url = format!("http://{}", addr);
+
+    let ruleset = Ruleset::from_toml(&format!(
+        r#"
+[[ai_reviews]]
+id = "bad-review"
+title = "Bad Review"
+base_url = "{}"
+api_key = "test-api-key"
+model = "bad-model"
+timeout_seconds = 10
+when_changed = ["src/**"]
+
+[[ai_reviews]]
+id = "good-review"
+title = "Good Review"
+base_url = "{}"
+api_key = "test-api-key"
+model = "good-model"
+timeout_seconds = 10
+when_changed = ["src/**"]
+"#,
+        base_url, base_url
+    ))
+    .unwrap();
+    let store = StateStore::connect("sqlite::memory:").await.unwrap();
+    store.migrate().await.unwrap();
+    let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset)
+        .with_review_run_id("rr-partial-auto".into());
+    let event = MergeRequestEvent {
+        project_id: 123,
+        mr_iid: 45,
+        commit_sha: "event123".into(),
+        action: "update".into(),
+        source_branch: "feature/review".into(),
+        target_branch: "main".into(),
+    };
+
+    let summary = service.review_merge_request(&event).await.unwrap();
+
+    assert_eq!(summary.findings, 0);
+    assert_eq!(summary.comments, 1);
+    assert!(!summary.skipped);
+    assert_eq!(ai_request_count.load(Ordering::SeqCst), 2);
+    assert_eq!(discussion_count.load(Ordering::SeqCst), 1);
+}
+
 fn test_ai_review_config(base_url: String) -> AiReviewConfig {
     AiReviewConfig {
         auto_enabled: true,
@@ -1139,9 +1269,15 @@ async fn ai_review_uses_builtin_read_file_context_tool() {
         )
         .route(
             "/api/v4/projects/123/merge_requests/45/discussions",
-            post(move || {
+            post(move |body: Bytes| {
                 let discussion_count = Arc::clone(&discussion_count_for_handler);
                 async move {
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    let message = body["body"].as_str().unwrap();
+                    assert!(message.contains("Context finding"));
+                    assert!(message.contains("Finding produced after reading context"));
+                    assert!(message.contains("gitlab-work-runner:rule=ai:ai-review"));
+                    assert_eq!(body["position"]["new_line"], 1);
                     discussion_count.fetch_add(1, Ordering::SeqCst);
                     (
                         StatusCode::CREATED,
@@ -1249,9 +1385,15 @@ async fn ai_review_timeout_does_not_block_merge_request_review() {
         )
         .route(
             "/api/v4/projects/123/merge_requests/45/discussions",
-            post(move || {
+            post(move |body: Bytes| {
                 let discussion_count = Arc::clone(&discussion_count_for_handler);
                 async move {
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    let message = body["body"].as_str().unwrap();
+                    assert!(message.contains("部分 AI Review 失败"));
+                    assert!(message.contains("- `ai-review` AI Review"));
+                    assert!(message.contains("commit: `event123`"));
+                    assert!(message.contains("review_run_id: `rr-timeout`"));
                     discussion_count.fetch_add(1, Ordering::SeqCst);
                     (
                         StatusCode::CREATED,
@@ -1282,7 +1424,8 @@ when_changed = ["src/**"]
     .unwrap();
     let store = StateStore::connect("sqlite::memory:").await.unwrap();
     store.migrate().await.unwrap();
-    let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset);
+    let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset)
+        .with_review_run_id("rr-timeout".into());
     let event = MergeRequestEvent {
         project_id: 123,
         mr_iid: 45,
@@ -1295,10 +1438,10 @@ when_changed = ["src/**"]
     let summary = service.review_merge_request(&event).await.unwrap();
 
     assert_eq!(summary.findings, 0);
-    assert_eq!(summary.comments, 0);
+    assert_eq!(summary.comments, 1);
     assert!(!summary.skipped);
     assert!((1..=2).contains(&ai_request_count.load(Ordering::SeqCst)));
-    assert_eq!(discussion_count.load(Ordering::SeqCst), 0);
+    assert_eq!(discussion_count.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -1471,6 +1614,158 @@ when_changed = ["does-not-match/**"]
     assert_eq!(summary.comments, 1);
     assert!(!summary.skipped);
     assert_eq!(ai_request_count.load(Ordering::SeqCst), 1);
+    assert_eq!(discussion_count.load(Ordering::SeqCst), 1);
+    assert_eq!(emoji_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn manual_note_posts_summary_when_one_ai_review_fails() {
+    let discussion_count = Arc::new(AtomicUsize::new(0));
+    let discussion_count_for_handler = Arc::clone(&discussion_count);
+    let emoji_count = Arc::new(AtomicUsize::new(0));
+    let emoji_count_for_handler = Arc::clone(&emoji_count);
+    let ai_request_count = Arc::new(AtomicUsize::new(0));
+    let ai_request_count_for_handler = Arc::clone(&ai_request_count);
+    let (listener, addr) = bind_test_listener().await;
+    let app = Router::new()
+        .route(
+            "/api/v4/projects/123/merge_requests/45/changes",
+            get(|| async {
+                Json(json!({
+                    "changes": [{
+                        "old_path": "src/lib.rs",
+                        "new_path": "src/lib.rs",
+                        "new_file": false,
+                        "renamed_file": false,
+                        "deleted_file": false,
+                        "diff": "@@ -1 +1 @@\n+pub fn value() {}\n"
+                    }],
+                    "diff_refs": {
+                        "base_sha": "base",
+                        "start_sha": "start",
+                        "head_sha": "manual-partial-ai-head"
+                    }
+                }))
+            }),
+        )
+        .route(
+            "/api/v4/projects/123/merge_requests/45/notes/989/award_emoji",
+            post(move |Query(query): Query<HashMap<String, String>>| {
+                let emoji_count = Arc::clone(&emoji_count_for_handler);
+                async move {
+                    assert_eq!(query.get("name").map(String::as_str), Some("eyes"));
+                    emoji_count.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::CREATED,
+                        Json(json!({
+                            "id": 1,
+                            "name": "eyes"
+                        })),
+                    )
+                }
+            }),
+        )
+        .route(
+            "/chat/completions",
+            post(move |body: Bytes| {
+                let ai_request_count = Arc::clone(&ai_request_count_for_handler);
+                async move {
+                    ai_request_count.fetch_add(1, Ordering::SeqCst);
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    match body["model"].as_str().unwrap() {
+                        "manual-bad-model" => Json(json!({
+                            "choices": [{
+                                "message": {
+                                    "content": "not json"
+                                }
+                            }]
+                        })),
+                        "manual-good-model" => Json(json!({
+                            "choices": [{
+                                "message": {
+                                    "content": serde_json::json!({
+                                        "findings": []
+                                    }).to_string()
+                                }
+                            }]
+                        })),
+                        other => panic!("unexpected model {other}"),
+                    }
+                }
+            }),
+        )
+        .route(
+            "/api/v4/projects/123/merge_requests/45/discussions",
+            post(move |body: Bytes| {
+                let discussion_count = Arc::clone(&discussion_count_for_handler);
+                async move {
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    let message = body["body"].as_str().unwrap();
+                    assert!(message.contains("部分 AI Review 失败"));
+                    assert!(message.contains("- `bad-review` Bad Review"));
+                    assert!(message.contains("commit: `event123`"));
+                    assert!(message.contains("review_run_id: `rr-partial-manual`"));
+                    assert!(message.contains("runner 日志"));
+                    assert!(message.contains("gitlab-work-runner:ai-review-partial-failed"));
+                    assert!(body["position"].is_null());
+                    discussion_count.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::CREATED,
+                        Json(json!({
+                            "id": "discussion-manual-partial",
+                            "notes": [{ "id": 102 }]
+                        })),
+                    )
+                }
+            }),
+        );
+    spawn_server_on(listener, app);
+    let base_url = format!("http://{}", addr);
+
+    let ruleset = Ruleset::from_toml(&format!(
+        r#"
+[[ai_reviews]]
+auto_enabled = false
+id = "bad-review"
+title = "Bad Review"
+base_url = "{}"
+api_key = "manual-test-api-key"
+model = "manual-bad-model"
+timeout_seconds = 10
+when_changed = ["does-not-match/**"]
+
+[[ai_reviews]]
+auto_enabled = false
+id = "good-review"
+title = "Good Review"
+base_url = "{}"
+api_key = "manual-test-api-key"
+model = "manual-good-model"
+timeout_seconds = 10
+when_changed = ["does-not-match/**"]
+"#,
+        base_url, base_url
+    ))
+    .unwrap();
+    let store = StateStore::connect("sqlite::memory:").await.unwrap();
+    store.migrate().await.unwrap();
+    let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset)
+        .with_review_run_id("rr-partial-manual".into());
+    let event = MergeRequestNoteEvent {
+        project_id: 123,
+        mr_iid: 45,
+        commit_sha: "event123".into(),
+        action: "create".into(),
+        note_id: 989,
+        note: "please run @bad-review @good-review".into(),
+    };
+
+    let summary = service.review_merge_request_note(&event).await.unwrap();
+
+    assert_eq!(summary.findings, 0);
+    assert_eq!(summary.comments, 1);
+    assert!(!summary.skipped);
+    assert_eq!(ai_request_count.load(Ordering::SeqCst), 2);
     assert_eq!(discussion_count.load(Ordering::SeqCst), 1);
     assert_eq!(emoji_count.load(Ordering::SeqCst), 1);
 }

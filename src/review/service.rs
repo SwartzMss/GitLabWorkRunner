@@ -5,7 +5,7 @@ use crate::{
     gitlab::{CreateDiscussionRequest, DiscussionPosition, GitLabChange, GitLabClient},
     rules::{AiReviewConfig, Finding, Ruleset, Severity},
     script_tasks::{
-        extract_zip_archive, ScriptTaskContext, ScriptTaskResult, ScriptTaskRunner,
+        extract_zip_archive, ArchiveLimits, ScriptTaskContext, ScriptTaskResult, ScriptTaskRunner,
         ScriptTaskStatus,
     },
     storage::{ReviewKey, StateStore, StoredComment},
@@ -26,6 +26,7 @@ pub struct ReviewService {
     store: StateStore,
     ruleset: Ruleset,
     review_run_id: Option<String>,
+    archive_limits: ArchiveLimits,
 }
 
 impl ReviewService {
@@ -35,11 +36,17 @@ impl ReviewService {
             store,
             ruleset,
             review_run_id: None,
+            archive_limits: ArchiveLimits::default(),
         }
     }
 
     pub fn with_review_run_id(mut self, review_run_id: String) -> Self {
         self.review_run_id = Some(review_run_id);
+        self
+    }
+
+    pub fn with_archive_limits(mut self, archive_limits: ArchiveLimits) -> Self {
+        self.archive_limits = archive_limits;
         self
     }
 
@@ -367,7 +374,14 @@ impl ReviewService {
                     );
                 }
                 Err(err) => {
+                    if matches!(err, AppError::Archive(_)) {
+                        return Err(err);
+                    }
                     summary.failed_reviews += 1;
+                    summary.failed_review_items.push(AiReviewFailureSummary {
+                        id: review.id.clone(),
+                        title: review.title.clone(),
+                    });
                     warn!(
                         project_id = event.project_id,
                         mr_iid = event.mr_iid,
@@ -379,7 +393,32 @@ impl ReviewService {
                 }
             }
         }
+        summary.comments += self
+            .publish_ai_review_partial_failure_summary(event, changes, &summary)
+            .await?;
         Ok(summary)
+    }
+
+    async fn publish_ai_review_partial_failure_summary(
+        &self,
+        event: &MergeRequestEvent,
+        changes: &crate::gitlab::MergeRequestChanges,
+        summary: &AiReviewRunSummary,
+    ) -> AppResult<usize> {
+        if summary.failed_review_items.is_empty() {
+            return Ok(0);
+        }
+        let draft = CommentDraft {
+            path: String::new(),
+            new_line: None,
+            body: build_ai_review_partial_failure_body(
+                &event.commit_sha,
+                self.review_run_id.as_deref().unwrap_or("unknown"),
+                &summary.failed_review_items,
+            ),
+        };
+        self.publish_comment_drafts(event, changes, &[draft], "ai:partial-failed")
+            .await
     }
 
     async fn publish_manual_ai_review_clean_comments(
@@ -551,9 +590,13 @@ impl ReviewService {
         }
         let archive = self
             .gitlab
-            .repository_archive(event.project_id, archive_sha)
+            .repository_archive(
+                event.project_id,
+                archive_sha,
+                self.archive_limits.max_archive_bytes,
+            )
             .await?;
-        let runner = ScriptTaskRunner::new();
+        let runner = ScriptTaskRunner::new().with_archive_limits(self.archive_limits.clone());
         let context = ScriptTaskContext {
             project_id: event.project_id,
             mr_iid: event.mr_iid,
@@ -660,6 +703,36 @@ fn build_ai_review_clean_body(review_id: &str) -> String {
     )
 }
 
+fn build_ai_review_partial_failure_body(
+    commit_sha: &str,
+    review_run_id: &str,
+    failures: &[AiReviewFailureSummary],
+) -> String {
+    let failed_reviews = failures
+        .iter()
+        .map(|failure| {
+            format!(
+                "- `{}` {}",
+                sanitize_comment_inline(&failure.id),
+                sanitize_comment_inline(&failure.title)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "**部分 AI Review 失败**\n\n以下 AI review 执行失败，本次 review 已继续处理其它任务。请查看 runner 日志定位具体原因。\n\n{}\n\ncommit: `{}`\nreview_run_id: `{}`\n\n<!-- gitlab-work-runner:ai-review-partial-failed review_run_id={} commit={} -->",
+        failed_reviews,
+        sanitize_comment_inline(commit_sha),
+        sanitize_comment_inline(review_run_id),
+        sanitize_comment_inline(review_run_id),
+        sanitize_comment_inline(commit_sha)
+    )
+}
+
+fn sanitize_comment_inline(value: &str) -> String {
+    value.replace('`', "'")
+}
+
 fn changed_paths(changes: &[GitLabChange]) -> Vec<String> {
     let mut paths = Vec::new();
     for change in changes {
@@ -739,7 +812,11 @@ impl ReviewService {
             .unwrap_or(&event.commit_sha);
         let archive = self
             .gitlab
-            .repository_archive(event.project_id, archive_sha)
+            .repository_archive(
+                event.project_id,
+                archive_sha,
+                self.archive_limits.max_archive_bytes,
+            )
             .await?;
         let work_dir = ai_review_context_work_dir(
             event.project_id,
@@ -753,7 +830,7 @@ impl ReviewService {
         }
         let source_dir = work_dir.join("source");
         fs::create_dir_all(&source_dir)?;
-        let extracted_files = extract_zip_archive(&archive, &source_dir)?;
+        let extracted_files = extract_zip_archive(&archive, &source_dir, &self.archive_limits)?;
         info!(
             project_id = event.project_id,
             mr_iid = event.mr_iid,
@@ -921,7 +998,14 @@ struct AiReviewRunSummary {
     comments: usize,
     successful_reviews: usize,
     failed_reviews: usize,
+    failed_review_items: Vec<AiReviewFailureSummary>,
     clean_review_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AiReviewFailureSummary {
+    id: String,
+    title: String,
 }
 
 #[cfg(test)]

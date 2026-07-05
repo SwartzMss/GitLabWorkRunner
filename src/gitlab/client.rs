@@ -167,11 +167,17 @@ impl GitLabClient {
         Ok(changes)
     }
 
-    pub async fn repository_archive(&self, project_id: i64, sha: &str) -> AppResult<Vec<u8>> {
+    pub async fn repository_archive(
+        &self,
+        project_id: i64,
+        sha: &str,
+        max_archive_bytes: usize,
+    ) -> AppResult<Vec<u8>> {
         info!(
             project_id,
             sha,
             gitlab_base_url = %self.base_url,
+            max_archive_bytes,
             "preparing to download repository archive from gitlab"
         );
         let url = format!(
@@ -183,6 +189,7 @@ impl GitLabClient {
             sha,
             request_url = %url,
             timeout_ms = self.timeout.as_millis(),
+            max_archive_bytes,
             "downloading repository archive from gitlab"
         );
         let started = Instant::now();
@@ -204,7 +211,7 @@ impl GitLabClient {
                     "download repository archive from gitlab",
                 )?;
                 let status = response.status();
-                let archive = read_ureq_bytes(response)?;
+                let archive = read_ureq_bytes_limited(response, max_archive_bytes)?;
                 Ok((status, archive))
             })
             .await?;
@@ -449,9 +456,17 @@ fn read_ureq_text(response: ureq::Response) -> AppResult<String> {
     Ok(response.into_string()?)
 }
 
-fn read_ureq_bytes(response: ureq::Response) -> AppResult<Vec<u8>> {
+fn read_ureq_bytes_limited(response: ureq::Response, max_bytes: usize) -> AppResult<Vec<u8>> {
+    let mut reader = response
+        .into_reader()
+        .take(max_bytes.saturating_add(1) as u64);
     let mut bytes = Vec::new();
-    response.into_reader().read_to_end(&mut bytes)?;
+    reader.read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(AppError::Archive(format!(
+            "repository archive download exceeded max_archive_bytes {max_bytes}"
+        )));
+    }
     Ok(bytes)
 }
 
@@ -572,5 +587,33 @@ mod tests {
         let err = client.merge_request_changes(1, 2).await.unwrap_err();
 
         assert!(err.to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn repository_archive_rejects_download_over_limit() {
+        let app = Router::new().route(
+            "/api/v4/projects/1/repository/archive.zip",
+            get(|| async { vec![b'a'; 5] }),
+        );
+        let base_url = spawn_server(app).await;
+        let client = GitLabClient::new(base_url, "token".into());
+
+        let err = client.repository_archive(1, "abc", 4).await.unwrap_err();
+
+        assert!(err.to_string().contains("max_archive_bytes"));
+    }
+
+    #[tokio::test]
+    async fn repository_archive_rejects_zero_byte_limit() {
+        let app = Router::new().route(
+            "/api/v4/projects/1/repository/archive.zip",
+            get(|| async { vec![b'a'; 1] }),
+        );
+        let base_url = spawn_server(app).await;
+        let client = GitLabClient::new(base_url, "token".into());
+
+        let err = client.repository_archive(1, "abc", 0).await.unwrap_err();
+
+        assert!(err.to_string().contains("max_archive_bytes"));
     }
 }

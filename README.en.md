@@ -139,11 +139,20 @@ database_url = "sqlite://gitlab-work-runner.db"
 [rules]
 file = "rules.toml"
 
+[archive]
+max_archive_bytes = 104857600      # 100 MiB
+max_extracted_files = 10000        # 10,000 files
+max_extracted_bytes = 209715200    # 200 MiB
+max_single_file_bytes = 10485760   # 10 MiB
+max_entry_path_bytes = 512         # 512 bytes
+
 ```
 
 `[gitlab].token` is the token used by the service when calling the GitLab API. It is different from the webhook `Secret token`. Prefer a Project Access Token or a dedicated bot user token with the `api` scope and at least the `Developer` project role. It must be able to read MR diffs, download repository archives, and publish MR discussions. Do not commit a real `config.toml` token to the repository.
 
 `[server].max_concurrent_reviews` controls how many review runs can execute at the same time in one process. The default is `4`. When the limit is reached, the runner does not start another background review and posts an MR-level comment asking the user to retry later because the review queue is busy. If the request came from an MR note, the service also awards `eyes` to the triggering note.
+
+`[archive]` controls hard limits for downloading and extracting GitLab repository archives. If `max_archive_bytes` is exceeded, the runner stops reading the archive and fails the current review. During extraction, exceeding `max_extracted_files`, `max_extracted_bytes`, `max_single_file_bytes`, or `max_entry_path_bytes` stops extraction and fails the current review. The existing MR failure notification path reports the failure; AI context tools or script tasks do not continue.
 
 ## AI Review Config
 
@@ -189,6 +198,7 @@ when_changed = ["**/*.rs", "**/*.toml", "**/*.c", "**/*.cc", "**/*.cpp", "**/*.h
 `[ai_review]` is the global AI Review prompt configuration. `system_prompt` replaces the built-in system prompt; `extra_instructions` is appended to the user prompt. If omitted, the built-in prompt is used.
 `[ai_review.context_tools]` configures built-in read-only context tools. They are disabled by default. When enabled, the service downloads the MR head archive and lets the model request `read_file`, `search_code`, or `list_files` through tool calls. The runner only returns text content inside the repository directory; it does not execute shell commands and skips `.env` and `.git`.
 `max_tool_calls` defaults to `30`, and `max_tool_result_bytes` defaults to `60000`.
+When context tools are enabled, logs include each tool call's tool name, argument summary, returned bytes, result truncation status, tool-call limit status, batch index/count, and cumulative tool-call count. This makes it clear whether the model actually called `read_file`, `search_code`, or `list_files`.
 `request_timeout_seconds` is the timeout for one AI API request. If omitted, it defaults to `timeout_seconds / 2` so one retry still fits inside the total review deadline.
 `second_pass_on_clean` defaults to `false`; set it to `true` to run one confirmation pass when the first AI Review finds nothing.
 AI Review requests Chat Completions `tool_calls` structured output by default and parses findings from `submit_review_findings` arguments. If no tool call is returned, it falls back to parsing JSON in `content`. Built-in context tools do not require MCP.
@@ -260,6 +270,8 @@ The active-review guard and global concurrency limit are process-local. For mult
 ## Failure Notifications
 
 If the whole review run fails with a non-recoverable error, such as fetching MR diff, downloading the archive, calling the GitLab API, or internal processing failure, the service posts an MR-level failure comment. The comment includes `commit`, `review_run_id`, and a truncated error summary. If posting the failure notification fails, the runner only logs WARN and does not retry.
+
+If one AI review subtask fails while other AI reviews or script tasks can continue, the service posts an MR-level "partial AI Review failure" summary before the run finishes. The comment lists failed `ai_review.id/title` values and includes `commit` and `review_run_id`, with a note to inspect runner logs.
 
 ## More Docs
 

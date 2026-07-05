@@ -1,4 +1,5 @@
 use crate::error::{AppError, AppResult};
+use crate::review::scripts::ArchiveLimits;
 use serde::Deserialize;
 use std::{fs, path::Path};
 
@@ -15,6 +16,8 @@ pub struct AppConfig {
     pub rules: RulesConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub archive: ArchiveLimits,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -135,6 +138,7 @@ file = "rules.toml"
         assert_eq!(config.logging.file, "logs/gitlab-work-runner.log");
         assert_eq!(config.logging.max_bytes, 10 * 1024 * 1024);
         assert_eq!(config.logging.max_files, 5);
+        assert_eq!(config.archive, ArchiveLimits::default());
     }
 
     #[test]
@@ -156,6 +160,7 @@ file = "rules.toml"
                 file: "rules.toml".into(),
             },
             logging: LoggingConfig::default(),
+            archive: ArchiveLimits::default(),
         };
 
         let err = config.gitlab_token().unwrap_err().to_string();
@@ -195,5 +200,49 @@ max_files = 3
         assert_eq!(config.logging.file, "runner.log");
         assert_eq!(config.logging.max_bytes, 1024);
         assert_eq!(config.logging.max_files, 3);
+    }
+
+    #[test]
+    fn loads_custom_archive_limits_config() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"
+[server]
+bind = "127.0.0.1:8080"
+webhook_secret = "secret"
+
+[gitlab]
+base_url = "https://gitlab.example.com"
+token = "glpat-test-token"
+
+[storage]
+database_url = "sqlite::memory:"
+
+[rules]
+file = "rules.toml"
+
+[archive]
+max_archive_bytes = 1
+max_extracted_files = 2
+max_extracted_bytes = 3
+max_single_file_bytes = 4
+max_entry_path_bytes = 5
+"#
+        )
+        .unwrap();
+
+        let config = AppConfig::from_path(file.path()).unwrap();
+
+        assert_eq!(
+            config.archive,
+            ArchiveLimits {
+                max_archive_bytes: 1,
+                max_extracted_files: 2,
+                max_extracted_bytes: 3,
+                max_single_file_bytes: 4,
+                max_entry_path_bytes: 5,
+            }
+        );
     }
 }
