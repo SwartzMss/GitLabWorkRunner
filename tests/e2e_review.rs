@@ -14,7 +14,7 @@ use gitlab_work_runner::{
     rules::Ruleset,
     rules::{AiReviewConfig, AiReviewContextTools},
     storage::StateStore,
-    webhook::{MergeRequestEvent, MergeRequestNoteEvent},
+    webhook::MergeRequestNoteEvent,
 };
 use serde_json::{json, Value};
 use std::{
@@ -32,6 +32,17 @@ use tokio::{
     time::sleep,
 };
 use zip::{write::SimpleFileOptions, ZipWriter};
+
+fn manual_note_event(note: &str) -> MergeRequestNoteEvent {
+    MergeRequestNoteEvent {
+        project_id: 123,
+        mr_iid: 45,
+        commit_sha: "abc123".into(),
+        action: "create".into(),
+        note_id: 987,
+        note: note.into(),
+    }
+}
 
 async fn spawn_server(app: Router) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -150,22 +161,14 @@ title = "AI Review"
 base_url = "{}"
 api_key = "test-api-key"
 model = "test-model"
-when_changed = ["src/**"]
 "#,
         base_url
     ))
     .unwrap();
     let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset);
-    let event = MergeRequestEvent {
-        project_id: 123,
-        mr_iid: 45,
-        commit_sha: "abc123".into(),
-        action: "update".into(),
-        source_branch: "feature/review".into(),
-        target_branch: "main".into(),
-    };
+    let event = manual_note_event("@ai-review");
 
-    let summary = service.review_merge_request(&event).await.unwrap();
+    let summary = service.review_merge_request_note(&event).await.unwrap();
 
     assert_eq!(summary.findings, 1);
     assert_eq!(summary.comments, 1);
@@ -268,22 +271,14 @@ title = "AI Review"
 base_url = "{}"
 api_key = "test-api-key"
 model = "test-model"
-when_changed = ["src/**"]
 "#,
         base_url
     ))
     .unwrap();
     let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset);
-    let event = MergeRequestEvent {
-        project_id: 123,
-        mr_iid: 45,
-        commit_sha: "abc123".into(),
-        action: "update".into(),
-        source_branch: "feature/review".into(),
-        target_branch: "main".into(),
-    };
+    let event = manual_note_event("@ai-review");
 
-    let summary = service.review_merge_request(&event).await.unwrap();
+    let summary = service.review_merge_request_note(&event).await.unwrap();
 
     assert_eq!(summary.findings, 2);
     assert_eq!(summary.comments, 1);
@@ -343,23 +338,27 @@ async fn skips_review_when_diff_refs_are_incomplete() {
 
     let store = StateStore::connect("sqlite::memory:").await.unwrap();
     store.migrate().await.unwrap();
-    let ruleset = Ruleset::from_toml("").unwrap();
+    let ruleset = Ruleset::from_toml(&format!(
+        r#"
+[[ai_reviews]]
+id = "ai-review"
+title = "AI Review"
+base_url = "{}"
+api_key = "test-api-key"
+model = "test-model"
+"#,
+        base_url
+    ))
+    .unwrap();
     let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset);
-    let event = MergeRequestEvent {
-        project_id: 123,
-        mr_iid: 45,
-        commit_sha: "abc123".into(),
-        action: "update".into(),
-        source_branch: "feature/review".into(),
-        target_branch: "main".into(),
-    };
+    let event = manual_note_event("@ai-review");
 
-    let summary = service.review_merge_request(&event).await.unwrap();
+    let summary = service.review_merge_request_note(&event).await.unwrap();
 
-    assert!(summary.skipped);
+    assert!(!summary.skipped);
     assert_eq!(summary.findings, 0);
-    assert_eq!(summary.comments, 1);
-    assert_eq!(discussion_count.load(Ordering::SeqCst), 1);
+    assert_eq!(summary.comments, 0);
+    assert_eq!(discussion_count.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -425,7 +424,6 @@ id = "check-script"
 title = "Script failure"
 command = "{}"
 timeout_seconds = 10
-when_changed = ["src/**"]
 "#,
         command.replace('\\', "\\\\").replace('"', "\\\"")
     ))
@@ -433,16 +431,9 @@ when_changed = ["src/**"]
     let store = StateStore::connect("sqlite::memory:").await.unwrap();
     store.migrate().await.unwrap();
     let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset);
-    let event = MergeRequestEvent {
-        project_id: 123,
-        mr_iid: 45,
-        commit_sha: "event123".into(),
-        action: "update".into(),
-        source_branch: "feature/review".into(),
-        target_branch: "main".into(),
-    };
+    let event = manual_note_event("@check-script");
 
-    let summary = service.review_merge_request(&event).await.unwrap();
+    let summary = service.review_merge_request_note(&event).await.unwrap();
 
     assert_eq!(summary.findings, 0);
     assert_eq!(summary.comments, 0);
@@ -548,7 +539,6 @@ base_url = "{}"
 api_key = "test-api-key"
 model = "test-model"
 timeout_seconds = 10
-when_changed = ["src/**"]
 "#,
         base_url
     ))
@@ -556,16 +546,9 @@ when_changed = ["src/**"]
     let store = StateStore::connect("sqlite::memory:").await.unwrap();
     store.migrate().await.unwrap();
     let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset);
-    let event = MergeRequestEvent {
-        project_id: 123,
-        mr_iid: 45,
-        commit_sha: "event123".into(),
-        action: "update".into(),
-        source_branch: "feature/review".into(),
-        target_branch: "main".into(),
-    };
+    let event = manual_note_event("@ai-review");
 
-    let summary = service.review_merge_request(&event).await.unwrap();
+    let summary = service.review_merge_request_note(&event).await.unwrap();
 
     assert_eq!(summary.findings, 1);
     assert_eq!(summary.comments, 1);
@@ -575,7 +558,7 @@ when_changed = ["src/**"]
 }
 
 #[tokio::test]
-async fn automatic_ai_review_posts_summary_when_one_review_fails() {
+async fn manual_ai_review_posts_summary_when_one_review_fails() {
     let discussion_count = Arc::new(AtomicUsize::new(0));
     let discussion_count_for_handler = Arc::clone(&discussion_count);
     let ai_request_count = Arc::new(AtomicUsize::new(0));
@@ -640,7 +623,7 @@ async fn automatic_ai_review_posts_summary_when_one_review_fails() {
                     let message = body["body"].as_str().unwrap();
                     assert!(message.contains("部分 AI Review 失败"));
                     assert!(message.contains("- `bad-review` Bad Review"));
-                    assert!(message.contains("commit: `event123`"));
+                    assert!(message.contains("commit: `abc123`"));
                     assert!(message.contains("review_run_id: `rr-partial-auto`"));
                     assert!(message.contains("runner 日志"));
                     assert!(message.contains("gitlab-work-runner:ai-review-partial-failed"));
@@ -668,7 +651,6 @@ base_url = "{}"
 api_key = "test-api-key"
 model = "bad-model"
 timeout_seconds = 10
-when_changed = ["src/**"]
 
 [[ai_reviews]]
 id = "good-review"
@@ -677,7 +659,6 @@ base_url = "{}"
 api_key = "test-api-key"
 model = "good-model"
 timeout_seconds = 10
-when_changed = ["src/**"]
 "#,
         base_url, base_url
     ))
@@ -686,16 +667,9 @@ when_changed = ["src/**"]
     store.migrate().await.unwrap();
     let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset)
         .with_review_run_id("rr-partial-auto".into());
-    let event = MergeRequestEvent {
-        project_id: 123,
-        mr_iid: 45,
-        commit_sha: "event123".into(),
-        action: "update".into(),
-        source_branch: "feature/review".into(),
-        target_branch: "main".into(),
-    };
+    let event = manual_note_event("@bad-review @good-review");
 
-    let summary = service.review_merge_request(&event).await.unwrap();
+    let summary = service.review_merge_request_note(&event).await.unwrap();
 
     assert_eq!(summary.findings, 0);
     assert_eq!(summary.comments, 1);
@@ -706,7 +680,6 @@ when_changed = ["src/**"]
 
 fn test_ai_review_config(base_url: String) -> AiReviewConfig {
     AiReviewConfig {
-        auto_enabled: true,
         id: "ai-review".into(),
         title: "AI Review".into(),
         base_url,
@@ -724,7 +697,6 @@ fn test_ai_review_config(base_url: String) -> AiReviewConfig {
         max_tool_calls: 8,
         max_tool_result_bytes: 60_000,
         context_tools: AiReviewContextTools::default(),
-        when_changed: vec![],
     }
 }
 
@@ -820,7 +792,6 @@ api_key = "test-api-key"
 model = "test-model"
 timeout_seconds = 10
 second_pass_on_clean = true
-when_changed = ["src/**"]
 "#,
         base_url
     ))
@@ -828,16 +799,9 @@ when_changed = ["src/**"]
     let store = StateStore::connect("sqlite::memory:").await.unwrap();
     store.migrate().await.unwrap();
     let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset);
-    let event = MergeRequestEvent {
-        project_id: 123,
-        mr_iid: 45,
-        commit_sha: "event123".into(),
-        action: "update".into(),
-        source_branch: "feature/review".into(),
-        target_branch: "main".into(),
-    };
+    let event = manual_note_event("@ai-review");
 
-    let summary = service.review_merge_request(&event).await.unwrap();
+    let summary = service.review_merge_request_note(&event).await.unwrap();
 
     assert_eq!(summary.findings, 1);
     assert_eq!(summary.comments, 1);
@@ -1305,7 +1269,6 @@ title = "AI Review"
 base_url = "{}"
 api_key = "test-api-key"
 model = "test-model"
-when_changed = ["src/**"]
 "#,
         base_url
     ))
@@ -1313,16 +1276,9 @@ when_changed = ["src/**"]
     let store = StateStore::connect("sqlite::memory:").await.unwrap();
     store.migrate().await.unwrap();
     let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset);
-    let event = MergeRequestEvent {
-        project_id: 123,
-        mr_iid: 45,
-        commit_sha: "event123".into(),
-        action: "update".into(),
-        source_branch: "feature/review".into(),
-        target_branch: "main".into(),
-    };
+    let event = manual_note_event("@ai-review");
 
-    let summary = service.review_merge_request(&event).await.unwrap();
+    let summary = service.review_merge_request_note(&event).await.unwrap();
 
     assert_eq!(ai_request_count.load(Ordering::SeqCst), 2);
     assert_eq!(discussion_count.load(Ordering::SeqCst), 1);
@@ -1392,7 +1348,7 @@ async fn ai_review_timeout_does_not_block_merge_request_review() {
                     let message = body["body"].as_str().unwrap();
                     assert!(message.contains("部分 AI Review 失败"));
                     assert!(message.contains("- `ai-review` AI Review"));
-                    assert!(message.contains("commit: `event123`"));
+                    assert!(message.contains("commit: `abc123`"));
                     assert!(message.contains("review_run_id: `rr-timeout`"));
                     discussion_count.fetch_add(1, Ordering::SeqCst);
                     (
@@ -1417,7 +1373,6 @@ base_url = "{}"
 api_key = "test-api-key"
 model = "test-model"
 timeout_seconds = 1
-when_changed = ["src/**"]
 "#,
         base_url
     ))
@@ -1426,16 +1381,9 @@ when_changed = ["src/**"]
     store.migrate().await.unwrap();
     let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset)
         .with_review_run_id("rr-timeout".into());
-    let event = MergeRequestEvent {
-        project_id: 123,
-        mr_iid: 45,
-        commit_sha: "event123".into(),
-        action: "update".into(),
-        source_branch: "feature/review".into(),
-        target_branch: "main".into(),
-    };
+    let event = manual_note_event("@ai-review");
 
-    let summary = service.review_merge_request(&event).await.unwrap();
+    let summary = service.review_merge_request_note(&event).await.unwrap();
 
     assert_eq!(summary.findings, 0);
     assert_eq!(summary.comments, 1);
@@ -1581,21 +1529,17 @@ async fn manual_note_runs_ai_review() {
     let ruleset = Ruleset::from_toml(&format!(
         r#"
 [[ai_reviews]]
-auto_enabled = false
 id = "ai-review"
 title = "AI Review"
 base_url = "{}"
 api_key = "manual-test-api-key"
 model = "manual-test-model"
 timeout_seconds = 10
-when_changed = ["does-not-match/**"]
 "#,
         base_url
     ))
     .unwrap();
-    assert!(ruleset
-        .ai_reviews_for_changes(&["src/lib.rs".into()])
-        .is_empty());
+    assert_eq!(ruleset.ai_reviews_by_ids(&["ai-review".into()]).len(), 1);
     let store = StateStore::connect("sqlite::memory:").await.unwrap();
     store.migrate().await.unwrap();
     let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset);
@@ -1725,24 +1669,20 @@ async fn manual_note_posts_summary_when_one_ai_review_fails() {
     let ruleset = Ruleset::from_toml(&format!(
         r#"
 [[ai_reviews]]
-auto_enabled = false
 id = "bad-review"
 title = "Bad Review"
 base_url = "{}"
 api_key = "manual-test-api-key"
 model = "manual-bad-model"
 timeout_seconds = 10
-when_changed = ["does-not-match/**"]
 
 [[ai_reviews]]
-auto_enabled = false
 id = "good-review"
 title = "Good Review"
 base_url = "{}"
 api_key = "manual-test-api-key"
 model = "manual-good-model"
 timeout_seconds = 10
-when_changed = ["does-not-match/**"]
 "#,
         base_url, base_url
     ))
@@ -1851,14 +1791,12 @@ async fn manual_note_posts_ai_review_completion_when_no_findings() {
     let ruleset = Ruleset::from_toml(&format!(
         r#"
 [[ai_reviews]]
-auto_enabled = false
 id = "ai-review"
 title = "AI Review"
 base_url = "{}"
 api_key = "manual-test-api-key"
 model = "manual-test-model"
 timeout_seconds = 10
-when_changed = ["does-not-match/**"]
 "#,
         base_url
     ))
@@ -1969,7 +1907,6 @@ id = "comment-script"
 title = "TODO marker check"
 command = "{}"
 timeout_seconds = 10
-when_changed = ["src/**"]
 "#,
         command.replace('\\', "\\\\").replace('"', "\\\"")
     ))
@@ -1977,16 +1914,9 @@ when_changed = ["src/**"]
     let store = StateStore::connect("sqlite::memory:").await.unwrap();
     store.migrate().await.unwrap();
     let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset);
-    let event = MergeRequestEvent {
-        project_id: 123,
-        mr_iid: 45,
-        commit_sha: "event123".into(),
-        action: "update".into(),
-        source_branch: "feature/review".into(),
-        target_branch: "main".into(),
-    };
+    let event = manual_note_event("@comment-script");
 
-    let summary = service.review_merge_request(&event).await.unwrap();
+    let summary = service.review_merge_request_note(&event).await.unwrap();
 
     assert_eq!(summary.findings, 0);
     assert_eq!(summary.comments, 1);
@@ -2075,19 +2005,18 @@ async fn manual_note_runs_disabled_script_task() {
     let ruleset = Ruleset::from_toml(&format!(
         r#"
 [[script_tasks]]
-auto_enabled = false
 id = "manual-script"
 title = "Manual TODO marker check"
 command = "{}"
 timeout_seconds = 10
-when_changed = ["does-not-match/**"]
 "#,
         command.replace('\\', "\\\\").replace('"', "\\\"")
     ))
     .unwrap();
-    assert!(ruleset
-        .script_tasks_for_changes(&["src/lib.rs".into()])
-        .is_empty());
+    assert_eq!(
+        ruleset.script_tasks_by_ids(&["manual-script".into()]).len(),
+        1
+    );
     let store = StateStore::connect("sqlite::memory:").await.unwrap();
     store.migrate().await.unwrap();
     let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset);

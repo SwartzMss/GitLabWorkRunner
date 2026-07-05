@@ -2,15 +2,16 @@ use crate::{
     ai_review::run_ai_review_with_context,
     comments::{build_comment_drafts, CommentDraft},
     error::{AppError, AppResult},
-    gitlab::{CreateDiscussionRequest, DiscussionPosition, GitLabChange, GitLabClient},
+    gitlab::{CreateDiscussionRequest, DiscussionPosition, GitLabClient},
     rules::{AiReviewConfig, Finding, Ruleset, Severity},
     script_tasks::{
         extract_zip_archive, ArchiveLimits, ScriptTaskContext, ScriptTaskResult, ScriptTaskRunner,
         ScriptTaskStatus,
     },
-    storage::{ReviewKey, StateStore, StoredComment},
-    webhook::MergeRequestEvent,
-    webhook::MergeRequestNoteEvent,
+    storage::{
+        ReviewRequestStart, StateStore, StoredComment, StoredFinding, TaskRunFinish, TaskRunStart,
+    },
+    webhook::{MergeRequestEvent, MergeRequestNoteEvent},
 };
 use std::{
     collections::BTreeSet,
@@ -50,137 +51,8 @@ impl ReviewService {
         self
     }
 
-    pub async fn review_merge_request(
-        &self,
-        event: &MergeRequestEvent,
-    ) -> AppResult<ReviewSummary> {
-        info!(
-            project_id = event.project_id,
-            mr_iid = event.mr_iid,
-            commit_sha = %event.commit_sha,
-            action = %event.action,
-            source_branch = %event.source_branch,
-            target_branch = %event.target_branch,
-            ruleset_hash = %self.ruleset.hash(),
-            "review started"
-        );
-
-        let key = ReviewKey {
-            project_id: event.project_id,
-            mr_iid: event.mr_iid,
-            commit_sha: &event.commit_sha,
-            ruleset_hash: self.ruleset.hash(),
-        };
-        info!(
-            project_id = event.project_id,
-            mr_iid = event.mr_iid,
-            commit_sha = %event.commit_sha,
-            ruleset_hash = %self.ruleset.hash(),
-            "checking processed review state"
-        );
-        if self.store.has_processed(&key).await? {
-            info!(
-                project_id = event.project_id,
-                mr_iid = event.mr_iid,
-                commit_sha = %event.commit_sha,
-                ruleset_hash = %self.ruleset.hash(),
-                "review skipped because commit and ruleset were already processed"
-            );
-            return Ok(ReviewSummary {
-                skipped: true,
-                findings: 0,
-                comments: 0,
-            });
-        }
-
-        info!(
-            project_id = event.project_id,
-            mr_iid = event.mr_iid,
-            commit_sha = %event.commit_sha,
-            "fetching merge request diff before review tasks"
-        );
-        let changes = self
-            .gitlab
-            .merge_request_changes(event.project_id, event.mr_iid)
-            .await?;
-        info!(
-            project_id = event.project_id,
-            mr_iid = event.mr_iid,
-            commit_sha = %event.commit_sha,
-            changed_files = changes.changes.len(),
-            changed_paths = changed_paths(&changes.changes).len(),
-            base_sha = ?changes.diff_refs.base_sha,
-            start_sha = ?changes.diff_refs.start_sha,
-            head_sha = ?changes.diff_refs.head_sha,
-            "merge request diff fetched"
-        );
-
-        if !changes.diff_refs.is_complete() {
-            warn!(
-                project_id = event.project_id,
-                mr_iid = event.mr_iid,
-                commit_sha = %event.commit_sha,
-                base_sha = ?changes.diff_refs.base_sha,
-                start_sha = ?changes.diff_refs.start_sha,
-                head_sha = ?changes.diff_refs.head_sha,
-                "review skipped because gitlab diff refs are incomplete"
-            );
-            let created = self
-                .gitlab
-                .create_discussion(
-                    event.project_id,
-                    event.mr_iid,
-                    &CreateDiscussionRequest {
-                        body: incomplete_diff_refs_body(),
-                        position: None,
-                    },
-                )
-                .await?;
-            self.store
-                .record_comment(&StoredComment {
-                    project_id: event.project_id,
-                    mr_iid: event.mr_iid,
-                    commit_sha: &event.commit_sha,
-                    ruleset_hash: self.ruleset.hash(),
-                    rule_id: "incomplete-diff-refs",
-                    path: "",
-                    new_line: None,
-                    discussion_id: Some(&created.id),
-                    note_id: created.notes.first().map(|note| note.id),
-                })
-                .await?;
-            self.store.mark_processed(&key, "skipped").await?;
-            return Ok(ReviewSummary {
-                skipped: true,
-                findings: 0,
-                comments: 1,
-            });
-        }
-
-        let mut ai_finding_count = 0_usize;
-        let mut published = 0_usize;
-
-        let (ai_findings, ai_comments) = self.run_ai_reviews(event, &changes).await?;
-        ai_finding_count += ai_findings;
-        published += ai_comments;
-
-        published += self.run_script_tasks(event, &changes).await?;
-
-        self.store.mark_processed(&key, "success").await?;
-        info!(
-            project_id = event.project_id,
-            mr_iid = event.mr_iid,
-            commit_sha = %event.commit_sha,
-            ruleset_hash = %self.ruleset.hash(),
-            findings = ai_finding_count,
-            comments = published,
-            "review completed"
-        );
-        Ok(ReviewSummary {
-            skipped: false,
-            findings: ai_finding_count,
-            comments: published,
-        })
+    fn review_run_id(&self) -> &str {
+        self.review_run_id.as_deref().unwrap_or("unknown")
     }
 
     pub async fn review_merge_request_note(
@@ -205,6 +77,61 @@ impl ReviewService {
             });
         }
 
+        let review_run_id = self.review_run_id();
+        let requested_ids_json =
+            serde_json::to_string(&requested_ids).unwrap_or_else(|_| "[]".into());
+        self.store
+            .start_review_request(&ReviewRequestStart {
+                review_run_id,
+                trigger_type: "manual_note",
+                project_id: event.project_id,
+                mr_iid: event.mr_iid,
+                commit_sha: &event.commit_sha,
+                note_id: Some(event.note_id),
+                requested_ids_json: &requested_ids_json,
+                selected_ai_reviews: ai_reviews.len(),
+                selected_script_tasks: tasks.len(),
+            })
+            .await?;
+
+        let result = self
+            .review_merge_request_note_inner(event, tasks, ai_reviews, requested_ids)
+            .await;
+        match &result {
+            Ok(summary) => {
+                self.store
+                    .finish_review_request(
+                        review_run_id,
+                        "completed",
+                        summary.findings,
+                        summary.comments,
+                    )
+                    .await?;
+            }
+            Err(err) => {
+                self.store
+                    .finish_review_request(review_run_id, "failed", 0, 0)
+                    .await?;
+                warn!(
+                    review_run_id,
+                    project_id = event.project_id,
+                    mr_iid = event.mr_iid,
+                    note_id = event.note_id,
+                    error = %err,
+                    "manual review request failed"
+                );
+            }
+        }
+        result
+    }
+
+    async fn review_merge_request_note_inner(
+        &self,
+        event: &MergeRequestNoteEvent,
+        tasks: Vec<crate::rules::ScriptTaskConfig>,
+        ai_reviews: Vec<AiReviewConfig>,
+        requested_ids: Vec<String>,
+    ) -> AppResult<ReviewSummary> {
         info!(
             project_id = event.project_id,
             mr_iid = event.mr_iid,
@@ -294,27 +221,6 @@ impl ReviewService {
             .await
     }
 
-    async fn run_ai_reviews(
-        &self,
-        event: &MergeRequestEvent,
-        changes: &crate::gitlab::MergeRequestChanges,
-    ) -> AppResult<(usize, usize)> {
-        let changed_paths = changed_paths(&changes.changes);
-        let reviews = self.ruleset.ai_reviews_for_changes(&changed_paths);
-        info!(
-            project_id = event.project_id,
-            mr_iid = event.mr_iid,
-            commit_sha = %event.commit_sha,
-            changed_paths = changed_paths.len(),
-            selected_ai_reviews = reviews.len(),
-            "automatic AI reviews selected"
-        );
-        let summary = self
-            .run_selected_ai_reviews(event, changes, reviews)
-            .await?;
-        Ok((summary.findings, summary.comments))
-    }
-
     async fn run_selected_ai_reviews(
         &self,
         event: &MergeRequestEvent,
@@ -342,6 +248,14 @@ impl ReviewService {
 
         let mut summary = AiReviewRunSummary::default();
         for review in reviews {
+            self.store
+                .start_task_run(&TaskRunStart {
+                    review_run_id: self.review_run_id(),
+                    task_type: "ai_review",
+                    task_id: &review.id,
+                    title: &review.title,
+                })
+                .await?;
             info!(
                 project_id = event.project_id,
                 mr_iid = event.mr_iid,
@@ -360,8 +274,22 @@ impl ReviewService {
                     if review_findings == 0 {
                         summary.clean_review_ids.push(review.id.clone());
                     }
-                    summary.comments += self
+                    self.record_findings("ai_review", &review.id, &findings)
+                        .await?;
+                    let comments = self
                         .publish_line_findings(event, changes, &findings)
+                        .await?;
+                    summary.comments += comments;
+                    self.store
+                        .finish_task_run(&TaskRunFinish {
+                            review_run_id: self.review_run_id(),
+                            task_type: "ai_review",
+                            task_id: &review.id,
+                            status: "completed",
+                            findings: review_findings,
+                            comments,
+                            error: None,
+                        })
                         .await?;
                     info!(
                         project_id = event.project_id,
@@ -374,6 +302,17 @@ impl ReviewService {
                     );
                 }
                 Err(err) => {
+                    self.store
+                        .finish_task_run(&TaskRunFinish {
+                            review_run_id: self.review_run_id(),
+                            task_type: "ai_review",
+                            task_id: &review.id,
+                            status: "failed",
+                            findings: 0,
+                            comments: 0,
+                            error: Some(&err.to_string()),
+                        })
+                        .await?;
                     if matches!(err, AppError::Archive(_)) {
                         return Err(err);
                     }
@@ -397,6 +336,30 @@ impl ReviewService {
             .publish_ai_review_partial_failure_summary(event, changes, &summary)
             .await?;
         Ok(summary)
+    }
+
+    async fn record_findings(
+        &self,
+        task_type: &str,
+        task_id: &str,
+        findings: &[Finding],
+    ) -> AppResult<()> {
+        for finding in findings {
+            self.store
+                .record_finding(&StoredFinding {
+                    review_run_id: self.review_run_id(),
+                    task_type,
+                    task_id,
+                    rule_id: &finding.rule_id,
+                    severity: severity_name(&finding.severity),
+                    path: &finding.path,
+                    new_line: finding.new_line.map(i64::from),
+                    title: &finding.title,
+                    message: &finding.message,
+                })
+                .await?;
+        }
+        Ok(())
     }
 
     async fn publish_ai_review_partial_failure_summary(
@@ -517,10 +480,10 @@ impl ReviewService {
             );
             self.store
                 .record_comment(&StoredComment {
+                    review_run_id: self.review_run_id(),
                     project_id: event.project_id,
                     mr_iid: event.mr_iid,
                     commit_sha: &event.commit_sha,
-                    ruleset_hash: self.ruleset.hash(),
                     rule_id: record_rule_id,
                     path: &draft.path,
                     new_line: draft.new_line.map(i64::from),
@@ -539,24 +502,6 @@ impl ReviewService {
             published += 1;
         }
         Ok(published)
-    }
-
-    async fn run_script_tasks(
-        &self,
-        event: &MergeRequestEvent,
-        changes: &crate::gitlab::MergeRequestChanges,
-    ) -> AppResult<usize> {
-        let changed_paths = changed_paths(&changes.changes);
-        let tasks = self.ruleset.script_tasks_for_changes(&changed_paths);
-        info!(
-            project_id = event.project_id,
-            mr_iid = event.mr_iid,
-            commit_sha = %event.commit_sha,
-            changed_paths = changed_paths.len(),
-            selected_script_tasks = tasks.len(),
-            "automatic script tasks selected"
-        );
-        self.run_selected_script_tasks(event, changes, tasks).await
     }
 
     async fn run_selected_script_tasks(
@@ -611,12 +556,59 @@ impl ReviewService {
                 script_task_id = %task.id,
                 "script task selected"
             );
-            let result = runner.run(&task, &context, &archive).await?;
+            self.store
+                .start_task_run(&TaskRunStart {
+                    review_run_id: self.review_run_id(),
+                    task_type: "script_task",
+                    task_id: &task.id,
+                    title: &task.title,
+                })
+                .await?;
+            let result = match runner.run(&task, &context, &archive).await {
+                Ok(result) => result,
+                Err(err) => {
+                    self.store
+                        .finish_task_run(&TaskRunFinish {
+                            review_run_id: self.review_run_id(),
+                            task_type: "script_task",
+                            task_id: &task.id,
+                            status: "failed",
+                            findings: 0,
+                            comments: 0,
+                            error: Some(&err.to_string()),
+                        })
+                        .await?;
+                    return Err(err);
+                }
+            };
             if result.status == ScriptTaskStatus::IssueFound {
-                published += self
+                let (comments, findings) = self
                     .publish_script_task_result(event, changes, &result)
                     .await?;
+                published += comments;
+                self.store
+                    .finish_task_run(&TaskRunFinish {
+                        review_run_id: self.review_run_id(),
+                        task_type: "script_task",
+                        task_id: &task.id,
+                        status: "completed",
+                        findings,
+                        comments,
+                        error: None,
+                    })
+                    .await?;
             } else {
+                self.store
+                    .finish_task_run(&TaskRunFinish {
+                        review_run_id: self.review_run_id(),
+                        task_type: "script_task",
+                        task_id: &task.id,
+                        status: "completed",
+                        findings: 0,
+                        comments: 0,
+                        error: None,
+                    })
+                    .await?;
                 info!(
                     project_id = event.project_id,
                     mr_iid = event.mr_iid,
@@ -642,7 +634,7 @@ impl ReviewService {
         event: &MergeRequestEvent,
         changes: &crate::gitlab::MergeRequestChanges,
         result: &ScriptTaskResult,
-    ) -> AppResult<usize> {
+    ) -> AppResult<(usize, usize)> {
         let result_text = match fs::read_to_string(&result.result_path) {
             Ok(text) => text,
             Err(err) => {
@@ -659,6 +651,8 @@ impl ReviewService {
             }
         };
         let findings = parse_script_result_findings(result, &result_text);
+        self.record_findings("script_task", &result.id, &findings)
+            .await?;
         info!(
             project_id = event.project_id,
             mr_iid = event.mr_iid,
@@ -670,7 +664,10 @@ impl ReviewService {
             "script task result parsed"
         );
         if !findings.is_empty() && changes.diff_refs.is_complete() {
-            return self.publish_line_findings(event, changes, &findings).await;
+            let comments = self
+                .publish_line_findings(event, changes, &findings)
+                .await?;
+            return Ok((comments, findings.len()));
         }
 
         info!(
@@ -688,13 +685,11 @@ impl ReviewService {
             new_line: None,
             body,
         };
-        self.publish_comment_drafts(event, changes, &[draft], "script")
-            .await
+        let comments = self
+            .publish_comment_drafts(event, changes, &[draft], "script")
+            .await?;
+        Ok((comments, findings.len()))
     }
-}
-
-fn incomplete_diff_refs_body() -> String {
-    "**[警告] Review 已跳过**\n\n当前 MR 的 diff 信息不完整，无法可靠发布行级评论。请先解决冲突或刷新 MR 后重新触发检查。\n\n<!-- gitlab-work-runner:rule=incomplete-diff-refs -->".into()
 }
 
 fn build_ai_review_clean_body(review_id: &str) -> String {
@@ -733,17 +728,12 @@ fn sanitize_comment_inline(value: &str) -> String {
     value.replace('`', "'")
 }
 
-fn changed_paths(changes: &[GitLabChange]) -> Vec<String> {
-    let mut paths = Vec::new();
-    for change in changes {
-        paths.push(change.new_path.clone());
-        if change.old_path != change.new_path {
-            paths.push(change.old_path.clone());
-        }
+fn severity_name(severity: &Severity) -> &'static str {
+    match severity {
+        Severity::Info => "info",
+        Severity::Warning => "warning",
+        Severity::Error => "error",
     }
-    paths.sort();
-    paths.dedup();
-    paths
 }
 
 async fn run_ai_review_with_deadline<F>(

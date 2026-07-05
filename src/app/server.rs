@@ -123,6 +123,19 @@ async fn gitlab_webhook(
             return (StatusCode::BAD_REQUEST, err.to_string()).into_response();
         }
     };
+    if let GitLabWebhookEvent::MergeRequest(event) = &event {
+        info!(
+            review_run_id = %review_run_id,
+            project_id = event.project_id,
+            mr_iid = event.mr_iid,
+            commit_sha = %event.commit_sha,
+            action = %event.action,
+            source_branch = %event.source_branch,
+            target_branch = %event.target_branch,
+            "gitlab merge request event ignored because automatic reviews are disabled"
+        );
+        return webhook_response::ignored(review_run_id, "merge_request_events_disabled");
+    }
     let gitlab_token = match state.config.gitlab_token() {
         Ok(token) => token,
         Err(err) => {
@@ -192,7 +205,18 @@ async fn gitlab_webhook(
         }
     };
 
-    let active_review_guard = if event_requests_review(&event, &ruleset) {
+    if !event_requests_review(&event, &ruleset) {
+        info!(
+            review_run_id = %review_run_id,
+            project_id = response_summary.project_id,
+            mr_iid = response_summary.mr_iid,
+            commit_sha = %response_summary.commit_sha,
+            "gitlab webhook ignored because it did not request any configured manual review"
+        );
+        return webhook_response::ignored(review_run_id, "no_matching_manual_review");
+    }
+
+    let active_review_guard = {
         let active_key = ActiveReviewKey {
             project_id: response_summary.project_id,
             mr_iid: response_summary.mr_iid,
@@ -278,41 +302,20 @@ async fn gitlab_webhook(
                     GitLabClient::new(state.config.gitlab.base_url.clone(), gitlab_token.clone());
                 let notifier = ReviewNotifier::new(gitlab);
                 let notification_span = info_span!("review_run", review_run_id = %review_run_id);
-                match &event {
-                    GitLabWebhookEvent::MergeRequestNote(event) => {
-                        let event = event.clone();
-                        tokio::spawn(
-                            async move {
-                                notifier
-                                    .notify_review_note_queue_busy(
-                                        event,
-                                        active_count,
-                                        max_concurrent_reviews,
-                                    )
-                                    .await;
-                            }
-                            .instrument(notification_span),
-                        );
-                    }
-                    GitLabWebhookEvent::MergeRequest(_) => {
-                        let commit_sha = response_summary.commit_sha.clone();
-                        let project_id = response_summary.project_id;
-                        let mr_iid = response_summary.mr_iid;
-                        tokio::spawn(
-                            async move {
-                                notifier
-                                    .notify_review_queue_busy(
-                                        project_id,
-                                        mr_iid,
-                                        commit_sha,
-                                        active_count,
-                                        max_concurrent_reviews,
-                                    )
-                                    .await;
-                            }
-                            .instrument(notification_span),
-                        );
-                    }
+                if let GitLabWebhookEvent::MergeRequestNote(event) = &event {
+                    let event = event.clone();
+                    tokio::spawn(
+                        async move {
+                            notifier
+                                .notify_review_note_queue_busy(
+                                    event,
+                                    active_count,
+                                    max_concurrent_reviews,
+                                )
+                                .await;
+                        }
+                        .instrument(notification_span),
+                    );
                 }
                 return webhook_response::review_queue_busy(
                     review_run_id,
@@ -321,8 +324,6 @@ async fn gitlab_webhook(
                 );
             }
         }
-    } else {
-        None
     };
 
     let gitlab = GitLabClient::new(state.config.gitlab.base_url.clone(), gitlab_token);
@@ -359,7 +360,7 @@ async fn run_webhook_review(
     _active_review_guard: Option<ActiveReviewGuard>,
 ) {
     let result = match &event {
-        GitLabWebhookEvent::MergeRequest(event) => service.review_merge_request(event).await,
+        GitLabWebhookEvent::MergeRequest(_) => return,
         GitLabWebhookEvent::MergeRequestNote(event) => {
             service.review_merge_request_note(event).await
         }
@@ -402,7 +403,7 @@ async fn run_webhook_review(
 
 fn event_requests_review(event: &GitLabWebhookEvent, ruleset: &Ruleset) -> bool {
     match event {
-        GitLabWebhookEvent::MergeRequest(_) => true,
+        GitLabWebhookEvent::MergeRequest(_) => false,
         GitLabWebhookEvent::MergeRequestNote(event) => {
             let requested_ids = manual_script_task_ids(&event.note);
             !requested_ids.is_empty()

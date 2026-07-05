@@ -20,6 +20,19 @@ pub(crate) fn accepted(review_run_id: String) -> axum::response::Response {
         .into_response()
 }
 
+pub(crate) fn ignored(review_run_id: String, reason: &str) -> axum::response::Response {
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "accepted": false,
+            "skipped": true,
+            "reason": reason,
+            "review_run_id": review_run_id
+        })),
+    )
+        .into_response()
+}
+
 pub(crate) fn review_already_running(
     review_run_id: String,
     active_review_run_id: String,
