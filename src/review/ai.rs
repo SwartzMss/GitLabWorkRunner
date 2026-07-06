@@ -163,6 +163,25 @@ async fn run_ai_review_single(
                             )));
                             continue 'request_mode;
                         }
+                        if attempt < AI_HTTP_ATTEMPTS
+                            && is_retryable_ai_http_response(status, &response_body_preview)
+                        {
+                            let err = AppError::AiReview(format!(
+                                "AI review API returned retryable HTTP status {}: {}",
+                                status, response_body_preview
+                            ));
+                            warn!(
+                                ai_review_id = %config.id,
+                                model = %config.model,
+                                attempt,
+                                status,
+                                elapsed_ms = attempt_started.elapsed().as_millis(),
+                                error = %err,
+                                "AI review API request failed, retrying"
+                            );
+                            last_error = Some(err);
+                            continue;
+                        }
                         return Err(AppError::AiReview(format!(
                             "AI review API returned HTTP status {}: {}",
                             status, response_body_preview
@@ -318,6 +337,20 @@ fn is_tool_call_rejection(status: u16, body: &str) -> bool {
         || normalized.contains("tools")
         || normalized.contains("tool_choice")
         || normalized.contains("function")
+}
+
+fn is_retryable_ai_http_response(status: u16, body: &str) -> bool {
+    if matches!(status, 408 | 429 | 502 | 503 | 504) {
+        return true;
+    }
+    if status < 500 {
+        return false;
+    }
+    let normalized = body.to_ascii_lowercase();
+    normalized.contains("requesttimeout")
+        || normalized.contains("request timed out")
+        || normalized.contains("timed out")
+        || normalized.contains("timeout")
 }
 
 struct AiReviewCompletion<'a> {
