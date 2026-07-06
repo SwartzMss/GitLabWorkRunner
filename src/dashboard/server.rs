@@ -157,7 +157,9 @@ fn dashboard_error(err: crate::error::AppError) -> axum::response::Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{ReviewRequestStart, StateStore, StoredComment, StoredFinding};
+    use crate::storage::{
+        ReviewRequestStart, StateStore, StoredComment, StoredFinding, TaskRunFinish, TaskRunStart,
+    };
     use axum::body::{to_bytes, Body};
     use std::fs;
     use tower::ServiceExt;
@@ -278,5 +280,229 @@ mod tests {
         assert_eq!(body["comments"][0]["review_run_id"], "rr-dashboard");
         assert_eq!(body["comments"][0]["project_label"], "platform/runner");
         assert_eq!(body["comments"][0]["note_id"], 99);
+    }
+
+    #[tokio::test]
+    async fn dashboard_api_filters_by_project_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("dashboard-filter.db");
+        let database_url = format!("sqlite://{}", db_path.display());
+        let writer = StateStore::connect(&database_url).await.unwrap();
+        writer.migrate().await.unwrap();
+        writer
+            .start_review_request(&ReviewRequestStart {
+                review_run_id: "rr-runner",
+                trigger_type: "manual_note",
+                project_id: 123,
+                project_name: Some("Runner"),
+                project_path_with_namespace: Some("platform/runner"),
+                mr_iid: 45,
+                commit_sha: "abc123",
+                note_id: Some(987),
+                requested_ids_json: r#"["ai-review"]"#,
+                selected_ai_reviews: 1,
+                selected_script_tasks: 0,
+            })
+            .await
+            .unwrap();
+        writer
+            .finish_review_request("rr-runner", "completed", 1, 1)
+            .await
+            .unwrap();
+        writer
+            .record_finding(&StoredFinding {
+                review_run_id: "rr-runner",
+                task_type: "ai_review",
+                task_id: "ai-review",
+                rule_id: "ai:ai-review",
+                severity: "warning",
+                path: "src/lib.rs",
+                new_line: Some(7),
+                title: "Finding title",
+                message: "Finding message",
+            })
+            .await
+            .unwrap();
+        writer
+            .record_comment(&StoredComment {
+                review_run_id: "rr-runner",
+                project_id: 123,
+                mr_iid: 45,
+                commit_sha: "abc123",
+                rule_id: "ai:ai-review",
+                path: "src/lib.rs",
+                new_line: Some(7),
+                discussion_id: Some("discussion-1"),
+                note_id: Some(99),
+            })
+            .await
+            .unwrap();
+        writer
+            .start_review_request(&ReviewRequestStart {
+                review_run_id: "rr-other",
+                trigger_type: "manual_note",
+                project_id: 456,
+                project_name: Some("Other"),
+                project_path_with_namespace: Some("platform/other"),
+                mr_iid: 12,
+                commit_sha: "def456",
+                note_id: Some(654),
+                requested_ids_json: r#"["ai-review"]"#,
+                selected_ai_reviews: 1,
+                selected_script_tasks: 0,
+            })
+            .await
+            .unwrap();
+        writer
+            .finish_review_request("rr-other", "completed", 0, 0)
+            .await
+            .unwrap();
+        drop(writer);
+
+        let store = DashboardStore::connect(&database_url).await.unwrap();
+        let app = router(store);
+
+        let response = axum::http::Request::builder()
+            .uri("/api/runs?project=runner")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(response).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["runs"].as_array().unwrap().len(), 1);
+        assert_eq!(body["runs"][0]["review_run_id"], "rr-runner");
+
+        let response = axum::http::Request::builder()
+            .uri("/api/findings?project=platform/runner")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(response).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["findings"].as_array().unwrap().len(), 1);
+        assert_eq!(body["findings"][0]["project_label"], "platform/runner");
+
+        let response = axum::http::Request::builder()
+            .uri("/api/comments?project=123")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(response).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["comments"].as_array().unwrap().len(), 1);
+        assert_eq!(body["comments"][0]["project_label"], "platform/runner");
+    }
+
+    #[tokio::test]
+    async fn dashboard_treats_completed_run_with_failed_task_as_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("dashboard-effective-status.db");
+        let database_url = format!("sqlite://{}", db_path.display());
+        let writer = StateStore::connect(&database_url).await.unwrap();
+        writer.migrate().await.unwrap();
+        writer
+            .start_review_request(&ReviewRequestStart {
+                review_run_id: "rr-partial",
+                trigger_type: "manual_note",
+                project_id: 123,
+                project_name: Some("Runner"),
+                project_path_with_namespace: Some("platform/runner"),
+                mr_iid: 45,
+                commit_sha: "abc123",
+                note_id: Some(987),
+                requested_ids_json: r#"["ai-review","strict-ai-review"]"#,
+                selected_ai_reviews: 2,
+                selected_script_tasks: 0,
+            })
+            .await
+            .unwrap();
+        writer
+            .start_task_run(&TaskRunStart {
+                review_run_id: "rr-partial",
+                task_type: "ai_review",
+                task_id: "ai-review",
+                title: "AI Review",
+            })
+            .await
+            .unwrap();
+        writer
+            .finish_task_run(&TaskRunFinish {
+                review_run_id: "rr-partial",
+                task_type: "ai_review",
+                task_id: "ai-review",
+                status: "completed",
+                findings: 0,
+                comments: 0,
+                error: None,
+            })
+            .await
+            .unwrap();
+        writer
+            .start_task_run(&TaskRunStart {
+                review_run_id: "rr-partial",
+                task_type: "ai_review",
+                task_id: "strict-ai-review",
+                title: "Strict AI Review",
+            })
+            .await
+            .unwrap();
+        writer
+            .finish_task_run(&TaskRunFinish {
+                review_run_id: "rr-partial",
+                task_type: "ai_review",
+                task_id: "strict-ai-review",
+                status: "failed",
+                findings: 0,
+                comments: 0,
+                error: Some("AI request timed out"),
+            })
+            .await
+            .unwrap();
+        writer
+            .finish_review_request("rr-partial", "completed", 0, 1)
+            .await
+            .unwrap();
+        drop(writer);
+
+        let store = DashboardStore::connect(&database_url).await.unwrap();
+        let app = router(store);
+
+        let response = axum::http::Request::builder()
+            .uri("/api/summary")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(response).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["completed_runs"], 0);
+        assert_eq!(body["failed_runs"], 1);
+
+        let response = axum::http::Request::builder()
+            .uri("/api/runs?status=failed")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(response).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["runs"].as_array().unwrap().len(), 1);
+        assert_eq!(body["runs"][0]["status"], "failed");
+        assert_eq!(body["runs"][0]["completed_task_runs"], 1);
+        assert_eq!(body["runs"][0]["total_task_runs"], 2);
+
+        let response = axum::http::Request::builder()
+            .uri("/api/merge-requests")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(response).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["merge_requests"][0]["failed_runs"], 1);
+        assert_eq!(body["merge_requests"][0]["last_status"], "failed");
     }
 }

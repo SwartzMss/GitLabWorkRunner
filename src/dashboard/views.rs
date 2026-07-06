@@ -137,7 +137,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         <div class="metrics" id="metrics"></div>
         <div class="filter-panel" id="filters">
           <label>状态<select id="status"><option value="">全部状态</option><option value="running">运行中</option><option value="completed">已完成</option><option value="failed">失败</option></select></label>
-          <label>项目 ID<input id="project" placeholder="输入项目 ID"></label>
+          <label>项目<input id="project" placeholder="输入项目名称、路径或 ID"></label>
           <label>MR IID<input id="mr" placeholder="输入 MR IID"></label>
           <button class="primary" id="apply">应用</button>
           <button id="reset">重置</button>
@@ -167,6 +167,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     const short = (value, n = 8) => value ? String(value).slice(0, n) : "";
     const pad = (value) => String(value).padStart(2, "0");
     const fmtDateTime = (date) => `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+    const fmtClockTime = (date) => `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
     const fmtTime = (value) => {
       if (!value) return "";
       const date = new Date(value);
@@ -198,7 +199,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     function params(includeStatus = true) {
       const search = new URLSearchParams();
       if (includeStatus && $("status").value) search.set("status", $("status").value);
-      if ($("project").value) search.set("project_id", $("project").value);
+      if ($("project").value) search.set("project", $("project").value);
       if ($("mr").value) search.set("mr_iid", $("mr").value);
       return search.toString();
     }
@@ -208,7 +209,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     }
 
     async function load() {
-      $("localNow").textContent = fmtDateTime(new Date());
+      $("localNow").textContent = fmtClockTime(new Date());
       const runParams = params(true);
       const listParams = params(false);
       const [summary, findingSummary, runs, projects, mrs, findings, comments] = await Promise.all([
@@ -318,15 +319,16 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     function projectsTable(items) {
       return `<table><thead><tr><th>项目</th><th>运行数</th><th>运行中</th><th>失败</th><th>成功率</th><th>最近 Review</th></tr></thead><tbody>${items.length ? items.map((project) => {
         const rate = pct(project.total_runs - project.failed_runs, project.total_runs);
-        return row([`<button class="link" data-project="${esc(project.project_id)}">${esc(projectLabel(project))}</button>`, esc(project.total_runs), esc(project.running_runs), esc(project.failed_runs), `${rate}% <span class="progress"><span style="width:${rate}%"></span></span>`, relative(project.last_review_at)], `class="clickable" data-project="${esc(project.project_id)}"`);
+        const label = projectLabel(project);
+        return row([`<button class="link" data-project="${esc(label)}">${esc(label)}</button>`, esc(project.total_runs), esc(project.running_runs), esc(project.failed_runs), `${rate}% <span class="progress"><span style="width:${rate}%"></span></span>`, relative(project.last_review_at)], `class="clickable" data-project="${esc(label)}"`);
       }).join("") : empty(6)}</tbody></table>`;
     }
 
     function mrsTable(items) {
       return `<table><thead><tr><th>MR</th><th>项目</th><th>状态</th><th>运行数</th><th>问题</th><th>最近 Review</th></tr></thead><tbody>${items.length ? items.map((mr) => row([
-        `<button class="link" data-project="${esc(mr.project_id)}" data-mr="${esc(mr.mr_iid)}">!${esc(mr.mr_iid)}</button>`, esc(projectLabel(mr)), badge(mr.last_status), esc(mr.total_runs),
+        `<button class="link" data-project="${esc(projectLabel(mr))}" data-mr="${esc(mr.mr_iid)}">!${esc(mr.mr_iid)}</button>`, esc(projectLabel(mr)), badge(mr.last_status), esc(mr.total_runs),
         mr.total_findings ? `<span style="color:var(--red)">${mr.total_findings}</span>` : `<span style="color:var(--green)">0</span>`, relative(mr.last_review_at)
-      ], `class="clickable" data-project="${esc(mr.project_id)}" data-mr="${esc(mr.mr_iid)}"`)).join("") : empty(6)}</tbody></table>`;
+      ], `class="clickable" data-project="${esc(projectLabel(mr))}" data-mr="${esc(mr.mr_iid)}"`)).join("") : empty(6)}</tbody></table>`;
     }
 
     function serviceStatusPanel() {
@@ -415,6 +417,7 @@ mod tests {
         assert!(DASHBOARD_HTML.contains(r#"<html lang="zh-CN">"#));
         assert!(DASHBOARD_HTML.contains("仪表盘"));
         assert!(DASHBOARD_HTML.contains("项目"));
+        assert!(DASHBOARD_HTML.contains("fmtClockTime(new Date())"));
         assert!(!DASHBOARD_HTML.contains("UTC --"));
         assert!(!DASHBOARD_HTML.contains("Dashboard</div>"));
     }

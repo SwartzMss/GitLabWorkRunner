@@ -18,6 +18,7 @@ pub struct DashboardStore {
 #[derive(Clone, Debug, Deserialize)]
 pub struct RunListParams {
     pub status: Option<String>,
+    pub project: Option<String>,
     pub project_id: Option<i64>,
     pub mr_iid: Option<i64>,
     pub limit: Option<i64>,
@@ -26,6 +27,7 @@ pub struct RunListParams {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct DashboardListParams {
+    pub project: Option<String>,
     pub project_id: Option<i64>,
     pub mr_iid: Option<i64>,
     pub limit: Option<i64>,
@@ -219,15 +221,28 @@ impl DashboardStore {
             r#"
 select
     count(*) as total_runs,
-    sum(case when status = 'running' then 1 else 0 end) as running_runs,
-    sum(case when status = 'completed' then 1 else 0 end) as completed_runs,
-    sum(case when status = 'failed' then 1 else 0 end) as failed_runs,
+    sum(case when effective_status = 'running' then 1 else 0 end) as running_runs,
+    sum(case when effective_status = 'completed' then 1 else 0 end) as completed_runs,
+    sum(case when effective_status = 'failed' then 1 else 0 end) as failed_runs,
     count(distinct project_id) as total_projects,
     count(distinct project_id || ':' || mr_iid) as total_merge_requests,
     coalesce(sum(findings), 0) as total_findings,
     coalesce(sum(comments), 0) as total_comments,
     max(started_at) as last_review_at
-from review_requests
+from (
+    select rr.*,
+        case
+            when rr.status = 'running' then 'running'
+            when rr.status = 'completed'
+                and not exists (
+                    select 1 from review_task_runs task
+                    where task.review_run_id = rr.review_run_id and task.status <> 'completed'
+                )
+                then 'completed'
+            else 'failed'
+        end as effective_status
+    from review_requests rr
+) runs
 "#,
         )
         .fetch_one(&self.pool)
@@ -273,7 +288,18 @@ from review_findings
 select
     rr.review_run_id, rr.trigger_type, rr.project_id, rr.mr_iid, rr.commit_sha, rr.note_id, rr.requested_ids_json,
     coalesce(nullif(rr.project_path_with_namespace, ''), nullif(rr.project_name, ''), '#' || rr.project_id) as project_label,
-    rr.selected_ai_reviews, rr.selected_script_tasks, rr.status, rr.findings, rr.comments, rr.started_at, rr.finished_at,
+    rr.selected_ai_reviews, rr.selected_script_tasks,
+    case
+        when rr.status = 'running' then 'running'
+        when rr.status = 'completed'
+            and not exists (
+                select 1 from review_task_runs task
+                where task.review_run_id = rr.review_run_id and task.status <> 'completed'
+            )
+            then 'completed'
+        else 'failed'
+    end as status,
+    rr.findings, rr.comments, rr.started_at, rr.finished_at,
     cast((julianday(coalesce(rr.finished_at, datetime('now'))) - julianday(rr.started_at)) * 86400000 as integer) as duration_ms,
     coalesce((select count(*) from review_task_runs task where task.review_run_id = rr.review_run_id), 0) as total_task_runs,
     coalesce((select count(*) from review_task_runs task where task.review_run_id = rr.review_run_id and task.status = 'completed'), 0) as completed_task_runs
@@ -296,7 +322,18 @@ where 1 = 1
 select
     rr.review_run_id, rr.trigger_type, rr.project_id, rr.mr_iid, rr.commit_sha, rr.note_id, rr.requested_ids_json,
     coalesce(nullif(rr.project_path_with_namespace, ''), nullif(rr.project_name, ''), '#' || rr.project_id) as project_label,
-    rr.selected_ai_reviews, rr.selected_script_tasks, rr.status, rr.findings, rr.comments, rr.started_at, rr.finished_at,
+    rr.selected_ai_reviews, rr.selected_script_tasks,
+    case
+        when rr.status = 'running' then 'running'
+        when rr.status = 'completed'
+            and not exists (
+                select 1 from review_task_runs task
+                where task.review_run_id = rr.review_run_id and task.status <> 'completed'
+            )
+            then 'completed'
+        else 'failed'
+    end as status,
+    rr.findings, rr.comments, rr.started_at, rr.finished_at,
     cast((julianday(coalesce(rr.finished_at, datetime('now'))) - julianday(rr.started_at)) * 86400000 as integer) as duration_ms,
     coalesce((select count(*) from review_task_runs task where task.review_run_id = rr.review_run_id), 0) as total_task_runs,
     coalesce((select count(*) from review_task_runs task where task.review_run_id = rr.review_run_id and task.status = 'completed'), 0) as completed_task_runs
@@ -336,7 +373,13 @@ select
     ) as project_label,
     count(*) as total_runs,
     sum(case when status = 'running' then 1 else 0 end) as running_runs,
-    sum(case when status = 'failed' then 1 else 0 end) as failed_runs,
+    sum(case when status <> 'running' and not (
+        status = 'completed'
+        and not exists (
+            select 1 from review_task_runs task
+            where task.review_run_id = grouped.review_run_id and task.status <> 'completed'
+        )
+    ) then 1 else 0 end) as failed_runs,
     count(distinct mr_iid) as total_merge_requests,
     coalesce(sum(findings), 0) as total_findings,
     coalesce(sum(comments), 0) as total_comments,
@@ -379,7 +422,13 @@ select
     mr_iid,
     count(*) as total_runs,
     sum(case when status = 'running' then 1 else 0 end) as running_runs,
-    sum(case when status = 'failed' then 1 else 0 end) as failed_runs,
+    sum(case when status <> 'running' and not (
+        status = 'completed'
+        and not exists (
+            select 1 from review_task_runs task
+            where task.review_run_id = grouped.review_run_id and task.status <> 'completed'
+        )
+    ) then 1 else 0 end) as failed_runs,
     coalesce(sum(findings), 0) as total_findings,
     coalesce(sum(comments), 0) as total_comments,
     (
@@ -389,7 +438,17 @@ select
         limit 1
     ) as last_commit_sha,
     (
-        select status from review_requests latest
+        select case
+            when latest.status = 'running' then 'running'
+            when latest.status = 'completed'
+                and not exists (
+                    select 1 from review_task_runs task
+                    where task.review_run_id = latest.review_run_id and task.status <> 'completed'
+                )
+                then 'completed'
+            else 'failed'
+        end
+        from review_requests latest
         where latest.project_id = grouped.project_id and latest.mr_iid = grouped.mr_iid
         order by started_at desc
         limit 1
@@ -548,17 +607,37 @@ limit 500
 
 fn push_run_filters(builder: &mut QueryBuilder<'_, Sqlite>, params: &RunListParams) {
     if let Some(status) = params.status.as_deref().filter(|status| !status.is_empty()) {
-        builder.push(" and status = ");
+        builder.push(" and ");
+        push_effective_status_expr(builder, "rr");
+        builder.push(" = ");
         builder.push_bind(status.to_owned());
     }
     if let Some(project_id) = params.project_id {
         builder.push(" and project_id = ");
         builder.push_bind(project_id);
     }
+    if let Some(project) = params
+        .project
+        .as_deref()
+        .filter(|project| !project.is_empty())
+    {
+        push_project_filter(builder, "rr", project);
+    }
     if let Some(mr_iid) = params.mr_iid {
         builder.push(" and mr_iid = ");
         builder.push_bind(mr_iid);
     }
+}
+
+fn push_effective_status_expr(builder: &mut QueryBuilder<'_, Sqlite>, table_alias: &str) {
+    builder.push("case when ");
+    builder.push(table_alias);
+    builder.push(".status = 'running' then 'running' when ");
+    builder.push(table_alias);
+    builder.push(".status = 'completed' and not exists (select 1 from review_task_runs task where task.review_run_id = ");
+    builder.push(table_alias);
+    builder
+        .push(".review_run_id and task.status <> 'completed') then 'completed' else 'failed' end");
 }
 
 fn push_dashboard_list_filters(
@@ -569,10 +648,39 @@ fn push_dashboard_list_filters(
         builder.push(" and request.project_id = ");
         builder.push_bind(project_id);
     }
+    if let Some(project) = params
+        .project
+        .as_deref()
+        .filter(|project| !project.is_empty())
+    {
+        push_project_filter(builder, "request", project);
+    }
     if let Some(mr_iid) = params.mr_iid {
         builder.push(" and request.mr_iid = ");
         builder.push_bind(mr_iid);
     }
+}
+
+fn push_project_filter(builder: &mut QueryBuilder<'_, Sqlite>, table_alias: &str, project: &str) {
+    let project_id_text = project.strip_prefix('#').unwrap_or(project);
+    if let Ok(project_id) = project_id_text.parse::<i64>() {
+        builder.push(" and ");
+        builder.push(table_alias);
+        builder.push(".project_id = ");
+        builder.push_bind(project_id);
+        return;
+    }
+
+    let pattern = format!("%{}%", project.to_lowercase());
+    builder.push(" and (lower(coalesce(");
+    builder.push(table_alias);
+    builder.push(".project_path_with_namespace, '')) like ");
+    builder.push_bind(pattern.clone());
+    builder.push(" or lower(coalesce(");
+    builder.push(table_alias);
+    builder.push(".project_name, '')) like ");
+    builder.push_bind(pattern);
+    builder.push(")");
 }
 
 fn row_to_run(row: SqliteRow) -> DashboardRun {

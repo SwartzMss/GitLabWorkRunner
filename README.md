@@ -188,7 +188,7 @@ API：
 GET /api/summary
 GET /api/finding-summary
 GET /api/runs
-GET /api/runs?status=failed&project_id=1&mr_iid=2
+GET /api/runs?status=failed&project=group/project&mr_iid=2
 GET /api/runs/<review_run_id>
 GET /api/projects
 GET /api/merge-requests
