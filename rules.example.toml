@@ -24,8 +24,8 @@ title = "AI Review"
 base_url = "https://api.openai.com/v1"
 api_key = "<your-ai-api-key>"
 model = "gpt-4.1-mini"
-timeout_seconds = 900
-request_timeout_seconds = 180
+timeout_seconds = 1200
+request_timeout_seconds = 420
 max_diff_bytes = 60000
 second_pass_on_clean = false
 # AI Review requests Chat Completions tool_calls by default and falls back to JSON content parsing when needed.

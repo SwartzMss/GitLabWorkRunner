@@ -405,6 +405,9 @@ fn event_requests_review(event: &GitLabWebhookEvent, ruleset: &Ruleset) -> bool 
     match event {
         GitLabWebhookEvent::MergeRequest(_) => false,
         GitLabWebhookEvent::MergeRequestNote(event) => {
+            if !event.is_create_action() {
+                return false;
+            }
             let requested_ids = manual_script_task_ids(&event.note);
             !requested_ids.is_empty()
                 && (!ruleset.script_tasks_by_ids(&requested_ids).is_empty()

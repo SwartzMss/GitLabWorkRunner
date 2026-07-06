@@ -31,6 +31,12 @@ pub struct MergeRequestNoteEvent {
     pub note: String,
 }
 
+impl MergeRequestNoteEvent {
+    pub(crate) fn is_create_action(&self) -> bool {
+        self.action.trim().eq_ignore_ascii_case("create")
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct GitLabWebhookPayload {
     object_kind: String,

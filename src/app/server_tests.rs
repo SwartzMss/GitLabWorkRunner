@@ -71,6 +71,63 @@ async fn merge_request_webhook_is_ignored_without_review_work() {
 }
 
 #[tokio::test]
+async fn non_create_merge_request_note_is_ignored_even_with_manual_command() {
+    let rules_file = NamedTempFile::new().unwrap();
+    let command = if cfg!(windows) {
+        "echo ok"
+    } else {
+        "printf ok"
+    };
+    std::fs::write(
+        rules_file.path(),
+        format!(
+            r#"
+[[script_tasks]]
+id = "check"
+title = "Check"
+command = "{}"
+timeout_seconds = 10
+"#,
+            command.replace('\\', "\\\\").replace('"', "\\\"")
+        ),
+    )
+    .unwrap();
+
+    let state = test_state("http://127.0.0.1:1".into(), &rules_file, 4).await;
+    let mut headers = HeaderMap::new();
+    headers.insert("X-Gitlab-Token", HeaderValue::from_static("secret"));
+
+    let response = gitlab_webhook(
+        State(state),
+        headers,
+        Bytes::from_static(
+            br#"{
+                "object_kind": "note",
+                "project_id": 123,
+                "object_attributes": {
+                    "id": 987,
+                    "note": "@check",
+                    "noteable_type": "MergeRequest",
+                    "action": "delete"
+                },
+                "merge_request": {
+                    "iid": 45,
+                    "last_commit": { "id": "abc123" }
+                }
+            }"#,
+        ),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["accepted"], false);
+    assert_eq!(body["reason"], "no_matching_manual_review");
+}
+
+#[tokio::test]
 async fn duplicate_running_commit_note_gets_acknowledgement_comment() {
     let rules_file = NamedTempFile::new().unwrap();
     let command = if cfg!(windows) {

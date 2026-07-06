@@ -59,6 +59,21 @@ impl ReviewService {
         &self,
         event: &MergeRequestNoteEvent,
     ) -> AppResult<ReviewSummary> {
+        if !event.is_create_action() {
+            info!(
+                project_id = event.project_id,
+                mr_iid = event.mr_iid,
+                note_id = event.note_id,
+                action = %event.action,
+                "merge request note ignored because manual reviews only run for create actions"
+            );
+            return Ok(ReviewSummary {
+                skipped: true,
+                findings: 0,
+                comments: 0,
+            });
+        }
+
         let requested_ids = manual_script_task_ids(&event.note);
         let tasks = self.ruleset.script_tasks_by_ids(&requested_ids);
         let ai_reviews = self.ruleset.ai_reviews_by_ids(&requested_ids);
