@@ -2,7 +2,7 @@ use crate::error::AppResult;
 use chrono::Utc;
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
-    SqlitePool,
+    Row, SqlitePool,
 };
 use std::str::FromStr;
 use tracing::info;
@@ -19,6 +19,8 @@ pub struct ReviewRequestStart<'a> {
     pub review_run_id: &'a str,
     pub trigger_type: &'a str,
     pub project_id: i64,
+    pub project_name: Option<&'a str>,
+    pub project_path_with_namespace: Option<&'a str>,
     pub mr_iid: i64,
     pub commit_sha: &'a str,
     pub note_id: Option<i64>,
@@ -110,6 +112,10 @@ create table if not exists review_requests (
         )
         .execute(&self.pool)
         .await?;
+        self.ensure_column("review_requests", "project_name", "text")
+            .await?;
+        self.ensure_column("review_requests", "project_path_with_namespace", "text")
+            .await?;
         sqlx::query(
             r#"
 create table if not exists review_task_runs (
@@ -191,22 +197,44 @@ create table if not exists review_notifications (
         Ok(())
     }
 
+    async fn ensure_column(&self, table: &str, column: &str, definition: &str) -> AppResult<()> {
+        let pragma = format!("pragma table_info({table})");
+        let exists = sqlx::query(&pragma)
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .any(|row| {
+                let name: String = row.get("name");
+                name == column
+            });
+        if !exists {
+            let sql = format!("alter table {table} add column {column} {definition}");
+            sqlx::query(&sql).execute(&self.pool).await?;
+        }
+        Ok(())
+    }
+
     pub async fn start_review_request(&self, request: &ReviewRequestStart<'_>) -> AppResult<()> {
         let now = now_rfc3339();
         sqlx::query(
             r#"
 insert into review_requests
-(review_run_id, trigger_type, project_id, mr_iid, commit_sha, note_id, requested_ids_json,
+(review_run_id, trigger_type, project_id, project_name, project_path_with_namespace,
+ mr_iid, commit_sha, note_id, requested_ids_json,
  selected_ai_reviews, selected_script_tasks, status, findings, comments, timezone, started_at)
-values (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', 0, 0, ?, ?)
+values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', 0, 0, ?, ?)
 on conflict(review_run_id) do update set
     status = 'running',
+    project_name = excluded.project_name,
+    project_path_with_namespace = excluded.project_path_with_namespace,
     finished_at = null
 "#,
         )
         .bind(request.review_run_id)
         .bind(request.trigger_type)
         .bind(request.project_id)
+        .bind(request.project_name)
+        .bind(request.project_path_with_namespace)
         .bind(request.mr_iid)
         .bind(request.commit_sha)
         .bind(request.note_id)
@@ -381,6 +409,8 @@ mod tests {
                 review_run_id: "rr-1",
                 trigger_type: "manual_note",
                 project_id: 1,
+                project_name: Some("Runner"),
+                project_path_with_namespace: Some("platform/runner"),
                 mr_iid: 2,
                 commit_sha: "abc",
                 note_id: Some(9),
@@ -394,9 +424,11 @@ mod tests {
             .finish_review_request("rr-1", "completed", 3, 2)
             .await
             .unwrap();
-        let count: i64 =
-            sqlx::query_scalar("select count(*) from review_requests where review_run_id = ?")
+        let count: i64 = sqlx::query_scalar(
+            "select count(*) from review_requests where review_run_id = ? and project_path_with_namespace = ?",
+        )
                 .bind("rr-1")
+                .bind("platform/runner")
                 .fetch_one(&store.pool)
                 .await
                 .unwrap();

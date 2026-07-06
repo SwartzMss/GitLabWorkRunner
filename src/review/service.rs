@@ -85,6 +85,8 @@ impl ReviewService {
                 review_run_id,
                 trigger_type: "manual_note",
                 project_id: event.project_id,
+                project_name: event.project_name.as_deref(),
+                project_path_with_namespace: event.project_path_with_namespace.as_deref(),
                 mr_iid: event.mr_iid,
                 commit_sha: &event.commit_sha,
                 note_id: Some(event.note_id),
@@ -169,6 +171,8 @@ impl ReviewService {
             .await?;
         let mr_event = MergeRequestEvent {
             project_id: event.project_id,
+            project_name: event.project_name.clone(),
+            project_path_with_namespace: event.project_path_with_namespace.clone(),
             mr_iid: event.mr_iid,
             commit_sha: event.commit_sha.clone(),
             action: format!("manual-note-{}", event.note_id),

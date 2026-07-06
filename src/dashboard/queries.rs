@@ -51,6 +51,7 @@ pub struct DashboardRun {
     pub review_run_id: String,
     pub trigger_type: String,
     pub project_id: i64,
+    pub project_label: String,
     pub mr_iid: i64,
     pub commit_sha: String,
     pub note_id: Option<i64>,
@@ -78,6 +79,7 @@ pub struct FindingSeveritySummary {
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct DashboardProject {
     pub project_id: i64,
+    pub project_label: String,
     pub total_runs: i64,
     pub running_runs: i64,
     pub failed_runs: i64,
@@ -90,6 +92,7 @@ pub struct DashboardProject {
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct DashboardMergeRequest {
     pub project_id: i64,
+    pub project_label: String,
     pub mr_iid: i64,
     pub total_runs: i64,
     pub running_runs: i64,
@@ -118,6 +121,7 @@ pub struct DashboardTaskRun {
 pub struct DashboardFinding {
     pub review_run_id: String,
     pub project_id: i64,
+    pub project_label: String,
     pub mr_iid: i64,
     pub commit_sha: String,
     pub task_type: String,
@@ -135,6 +139,7 @@ pub struct DashboardFinding {
 pub struct DashboardComment {
     pub review_run_id: String,
     pub project_id: i64,
+    pub project_label: String,
     pub mr_iid: i64,
     pub commit_sha: String,
     pub rule_id: String,
@@ -190,7 +195,23 @@ impl DashboardStore {
                 )));
             }
         }
+        for column in ["project_name", "project_path_with_namespace"] {
+            if !self.column_exists("review_requests", column).await? {
+                return Err(AppError::Storage(format!(
+                    "dashboard database is missing required column `review_requests.{column}`; start gitlab-work-runner once to run migrations"
+                )));
+            }
+        }
         Ok(())
+    }
+
+    async fn column_exists(&self, table: &str, column: &str) -> AppResult<bool> {
+        let pragma = format!("pragma table_info({table})");
+        let rows = sqlx::query(&pragma).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().any(|row| {
+            let name: String = row.get("name");
+            name == column
+        }))
     }
 
     pub async fn summary(&self) -> AppResult<DashboardSummary> {
@@ -251,6 +272,7 @@ from review_findings
             r#"
 select
     rr.review_run_id, rr.trigger_type, rr.project_id, rr.mr_iid, rr.commit_sha, rr.note_id, rr.requested_ids_json,
+    coalesce(nullif(rr.project_path_with_namespace, ''), nullif(rr.project_name, ''), '#' || rr.project_id) as project_label,
     rr.selected_ai_reviews, rr.selected_script_tasks, rr.status, rr.findings, rr.comments, rr.started_at, rr.finished_at,
     cast((julianday(coalesce(rr.finished_at, datetime('now'))) - julianday(rr.started_at)) * 86400000 as integer) as duration_ms,
     coalesce((select count(*) from review_task_runs task where task.review_run_id = rr.review_run_id), 0) as total_task_runs,
@@ -273,6 +295,7 @@ where 1 = 1
             r#"
 select
     rr.review_run_id, rr.trigger_type, rr.project_id, rr.mr_iid, rr.commit_sha, rr.note_id, rr.requested_ids_json,
+    coalesce(nullif(rr.project_path_with_namespace, ''), nullif(rr.project_name, ''), '#' || rr.project_id) as project_label,
     rr.selected_ai_reviews, rr.selected_script_tasks, rr.status, rr.findings, rr.comments, rr.started_at, rr.finished_at,
     cast((julianday(coalesce(rr.finished_at, datetime('now'))) - julianday(rr.started_at)) * 86400000 as integer) as duration_ms,
     coalesce((select count(*) from review_task_runs task where task.review_run_id = rr.review_run_id), 0) as total_task_runs,
@@ -304,6 +327,13 @@ where review_run_id = ?
             r#"
 select
     project_id,
+    (
+        select coalesce(nullif(latest.project_path_with_namespace, ''), nullif(latest.project_name, ''), '#' || latest.project_id)
+        from review_requests latest
+        where latest.project_id = grouped.project_id
+        order by started_at desc
+        limit 1
+    ) as project_label,
     count(*) as total_runs,
     sum(case when status = 'running' then 1 else 0 end) as running_runs,
     sum(case when status = 'failed' then 1 else 0 end) as failed_runs,
@@ -311,7 +341,7 @@ select
     coalesce(sum(findings), 0) as total_findings,
     coalesce(sum(comments), 0) as total_comments,
     max(started_at) as last_review_at
-from review_requests
+from review_requests grouped
 group by project_id
 order by last_review_at desc
 "#,
@@ -322,6 +352,7 @@ order by last_review_at desc
             .into_iter()
             .map(|row| DashboardProject {
                 project_id: row.get("project_id"),
+                project_label: row.get("project_label"),
                 total_runs: row.get("total_runs"),
                 running_runs: row.get::<Option<i64>, _>("running_runs").unwrap_or(0),
                 failed_runs: row.get::<Option<i64>, _>("failed_runs").unwrap_or(0),
@@ -338,6 +369,13 @@ order by last_review_at desc
             r#"
 select
     project_id,
+    (
+        select coalesce(nullif(latest.project_path_with_namespace, ''), nullif(latest.project_name, ''), '#' || latest.project_id)
+        from review_requests latest
+        where latest.project_id = grouped.project_id and latest.mr_iid = grouped.mr_iid
+        order by started_at desc
+        limit 1
+    ) as project_label,
     mr_iid,
     count(*) as total_runs,
     sum(case when status = 'running' then 1 else 0 end) as running_runs,
@@ -369,6 +407,7 @@ limit 300
             .into_iter()
             .map(|row| DashboardMergeRequest {
                 project_id: row.get("project_id"),
+                project_label: row.get("project_label"),
                 mr_iid: row.get("mr_iid"),
                 total_runs: row.get("total_runs"),
                 running_runs: row.get::<Option<i64>, _>("running_runs").unwrap_or(0),
@@ -389,7 +428,9 @@ limit 300
         let mut builder: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
             r#"
 select
-    finding.review_run_id, request.project_id, request.mr_iid, request.commit_sha,
+    finding.review_run_id, request.project_id,
+    coalesce(nullif(request.project_path_with_namespace, ''), nullif(request.project_name, ''), '#' || request.project_id) as project_label,
+    request.mr_iid, request.commit_sha,
     finding.task_type, finding.task_id, finding.rule_id, finding.severity, finding.path,
     finding.new_line, finding.title, finding.message, finding.created_at
 from review_findings finding
@@ -413,7 +454,9 @@ where 1 = 1
         let mut builder: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
             r#"
 select
-    comment.review_run_id, request.project_id, request.mr_iid, request.commit_sha,
+    comment.review_run_id, request.project_id,
+    coalesce(nullif(request.project_path_with_namespace, ''), nullif(request.project_name, ''), '#' || request.project_id) as project_label,
+    request.mr_iid, request.commit_sha,
     comment.rule_id, comment.path, comment.new_line, comment.discussion_id, comment.note_id,
     comment.created_at
 from review_comment_records comment
@@ -462,7 +505,9 @@ order by started_at asc, id asc
         let rows = sqlx::query(
             r#"
 select
-    finding.review_run_id, request.project_id, request.mr_iid, request.commit_sha,
+    finding.review_run_id, request.project_id,
+    coalesce(nullif(request.project_path_with_namespace, ''), nullif(request.project_name, ''), '#' || request.project_id) as project_label,
+    request.mr_iid, request.commit_sha,
     finding.task_type, finding.task_id, finding.rule_id, finding.severity, finding.path,
     finding.new_line, finding.title, finding.message, finding.created_at
 from review_findings finding
@@ -482,7 +527,9 @@ limit 500
         let rows = sqlx::query(
             r#"
 select
-    comment.review_run_id, request.project_id, request.mr_iid, request.commit_sha,
+    comment.review_run_id, request.project_id,
+    coalesce(nullif(request.project_path_with_namespace, ''), nullif(request.project_name, ''), '#' || request.project_id) as project_label,
+    request.mr_iid, request.commit_sha,
     comment.rule_id, comment.path, comment.new_line, comment.discussion_id, comment.note_id,
     comment.created_at
 from review_comment_records comment
@@ -533,6 +580,7 @@ fn row_to_run(row: SqliteRow) -> DashboardRun {
         review_run_id: row.get("review_run_id"),
         trigger_type: row.get("trigger_type"),
         project_id: row.get("project_id"),
+        project_label: row.get("project_label"),
         mr_iid: row.get("mr_iid"),
         commit_sha: row.get("commit_sha"),
         note_id: row.get("note_id"),
@@ -554,6 +602,7 @@ fn row_to_finding(row: SqliteRow) -> DashboardFinding {
     DashboardFinding {
         review_run_id: row.get("review_run_id"),
         project_id: row.get("project_id"),
+        project_label: row.get("project_label"),
         mr_iid: row.get("mr_iid"),
         commit_sha: row.get("commit_sha"),
         task_type: row.get("task_type"),
@@ -572,6 +621,7 @@ fn row_to_comment(row: SqliteRow) -> DashboardComment {
     DashboardComment {
         review_run_id: row.get("review_run_id"),
         project_id: row.get("project_id"),
+        project_label: row.get("project_label"),
         mr_iid: row.get("mr_iid"),
         commit_sha: row.get("commit_sha"),
         rule_id: row.get("rule_id"),

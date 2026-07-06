@@ -174,6 +174,8 @@ mod tests {
                 review_run_id: "rr-dashboard",
                 trigger_type: "manual_note",
                 project_id: 123,
+                project_name: Some("Runner"),
+                project_path_with_namespace: Some("platform/runner"),
                 mr_iid: 45,
                 commit_sha: "abc123",
                 note_id: Some(987),
@@ -240,6 +242,17 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["runs"][0]["review_run_id"], "rr-dashboard");
+        assert_eq!(body["runs"][0]["project_label"], "platform/runner");
+
+        let response = axum::http::Request::builder()
+            .uri("/api/projects")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(response).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["projects"][0]["project_label"], "platform/runner");
 
         let response = axum::http::Request::builder()
             .uri("/api/findings")
@@ -251,6 +264,7 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["findings"][0]["review_run_id"], "rr-dashboard");
         assert_eq!(body["findings"][0]["project_id"], 123);
+        assert_eq!(body["findings"][0]["project_label"], "platform/runner");
         assert_eq!(body["findings"][0]["mr_iid"], 45);
 
         let response = axum::http::Request::builder()
@@ -262,6 +276,7 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["comments"][0]["review_run_id"], "rr-dashboard");
+        assert_eq!(body["comments"][0]["project_label"], "platform/runner");
         assert_eq!(body["comments"][0]["note_id"], 99);
     }
 }

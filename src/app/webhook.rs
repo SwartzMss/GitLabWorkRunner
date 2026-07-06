@@ -10,6 +10,8 @@ pub enum GitLabWebhookEvent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MergeRequestEvent {
     pub project_id: i64,
+    pub project_name: Option<String>,
+    pub project_path_with_namespace: Option<String>,
     pub mr_iid: i64,
     pub commit_sha: String,
     pub action: String,
@@ -20,6 +22,8 @@ pub struct MergeRequestEvent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MergeRequestNoteEvent {
     pub project_id: i64,
+    pub project_name: Option<String>,
+    pub project_path_with_namespace: Option<String>,
     pub mr_iid: i64,
     pub commit_sha: String,
     pub action: String,
@@ -37,6 +41,10 @@ struct GitLabWebhookPayload {
 #[derive(Debug, Deserialize)]
 struct ProjectPayload {
     id: i64,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    path_with_namespace: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -111,6 +119,8 @@ pub fn parse_merge_request_event(body: &[u8]) -> AppResult<Option<MergeRequestEv
     }
     Ok(Some(MergeRequestEvent {
         project_id: payload.project.id,
+        project_name: payload.project.name,
+        project_path_with_namespace: payload.project.path_with_namespace,
         mr_iid: payload.object_attributes.iid,
         commit_sha: payload.object_attributes.last_commit.id,
         action: payload.object_attributes.action,
@@ -127,8 +137,9 @@ pub fn parse_merge_request_note_event(body: &[u8]) -> AppResult<Option<MergeRequ
     let Some(merge_request) = payload.merge_request else {
         return Ok(None);
     };
-    let project_id = payload
-        .project
+    let project = payload.project;
+    let project_id = project
+        .as_ref()
         .map(|project| project.id)
         .or(payload.project_id)
         .ok_or_else(|| AppError::Webhook("note hook missing project id".into()))?;
@@ -138,6 +149,8 @@ pub fn parse_merge_request_note_event(body: &[u8]) -> AppResult<Option<MergeRequ
         .unwrap_or_default();
     Ok(Some(MergeRequestNoteEvent {
         project_id,
+        project_name: project.as_ref().and_then(|project| project.name.clone()),
+        project_path_with_namespace: project.and_then(|project| project.path_with_namespace),
         mr_iid: merge_request.iid,
         commit_sha,
         action: payload.object_attributes.action.unwrap_or_default(),
@@ -167,6 +180,11 @@ mod tests {
         let event = parse_merge_request_event(body).unwrap().unwrap();
 
         assert_eq!(event.project_id, 123);
+        assert_eq!(event.project_name.as_deref(), Some("runner"));
+        assert_eq!(
+            event.project_path_with_namespace.as_deref(),
+            Some("platform/runner")
+        );
         assert_eq!(event.mr_iid, 45);
         assert_eq!(event.commit_sha, "abc123");
         assert_eq!(event.source_branch, "feature/review");
@@ -177,7 +195,11 @@ mod tests {
     fn parses_merge_request_note_event() {
         let body = br#"{
             "object_kind": "note",
-            "project_id": 123,
+            "project": {
+                "id": 123,
+                "name": "runner",
+                "path_with_namespace": "platform/runner"
+            },
             "object_attributes": {
                 "id": 987,
                 "note": "@check-todo-tbd",
@@ -196,6 +218,8 @@ mod tests {
             event,
             GitLabWebhookEvent::MergeRequestNote(MergeRequestNoteEvent {
                 project_id: 123,
+                project_name: Some("runner".into()),
+                project_path_with_namespace: Some("platform/runner".into()),
                 mr_iid: 45,
                 commit_sha: "abc123".into(),
                 action: "create".into(),

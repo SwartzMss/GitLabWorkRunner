@@ -1,9 +1,9 @@
 pub const DASHBOARD_HTML: &str = r##"<!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>GitLab Work Runner Dashboard</title>
+  <title>GitLab Work Runner 仪表盘</title>
   <style>
     :root {
       color-scheme: light;
@@ -110,37 +110,37 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     <aside>
       <div class="brand">
         <div class="brand-mark">GL</div>
-        <div><div class="brand-title">GitLab Work Runner</div><div class="brand-subtitle">MR Review Automation</div></div>
+        <div><div class="brand-title">GitLab Work Runner</div><div class="brand-subtitle">MR Review 自动化</div></div>
       </div>
       <nav id="nav">
-        <div class="nav-item active" data-view="dashboard"><span class="nav-icon">⌂</span>Dashboard</div>
-        <div class="nav-item" data-view="projects"><span class="nav-icon">□</span>Projects</div>
-        <div class="nav-item" data-view="mrs"><span class="nav-icon">⌘</span>Merge Requests</div>
-        <div class="nav-item" data-view="runs"><span class="nav-icon">▷</span>Review Runs</div>
-        <div class="nav-item" data-view="findings"><span class="nav-icon">◌</span>Findings</div>
-        <div class="nav-item" data-view="comments"><span class="nav-icon">◍</span>Comments</div>
-        <div class="nav-item" data-view="system"><span class="nav-icon">▣</span>System</div>
+        <div class="nav-item active" data-view="dashboard"><span class="nav-icon">⌂</span>仪表盘</div>
+        <div class="nav-item" data-view="projects"><span class="nav-icon">□</span>项目</div>
+        <div class="nav-item" data-view="mrs"><span class="nav-icon">⌘</span>合并请求</div>
+        <div class="nav-item" data-view="runs"><span class="nav-icon">▷</span>Review 运行</div>
+        <div class="nav-item" data-view="findings"><span class="nav-icon">◌</span>问题</div>
+        <div class="nav-item" data-view="comments"><span class="nav-icon">◍</span>评论</div>
+        <div class="nav-item" data-view="system"><span class="nav-icon">▣</span>系统</div>
       </nav>
       <div class="aside-footer">
         <strong>GitLab Work Runner</strong>
-        <div>Dashboard</div>
-        <a href="https://github.com/SwartzMss/GitLabWorkRunner" target="_blank" rel="noreferrer">View on GitHub ↗</a>
+        <div>仪表盘</div>
+        <a href="https://github.com/SwartzMss/GitLabWorkRunner" target="_blank" rel="noreferrer">在 GitHub 查看 ↗</a>
       </div>
     </aside>
     <div class="shell">
       <header>
         <div class="menu">≡</div>
-        <div class="top-actions"><div class="healthy">✓ Healthy</div><button id="refresh" title="Refresh">↻</button><div id="utcNow">UTC --</div></div>
+        <div class="top-actions"><div class="healthy">✓ 健康</div><button id="refresh" title="刷新">↻</button><div id="localNow">--</div></div>
       </header>
       <main>
-        <div><h1 id="pageTitle">Dashboard</h1><div class="subtitle" id="pageSubtitle">Overview of review automation and system activity</div></div>
+        <div><h1 id="pageTitle">仪表盘</h1><div class="subtitle" id="pageSubtitle">Review 自动化与系统活动概览</div></div>
         <div class="metrics" id="metrics"></div>
         <div class="filter-panel" id="filters">
-          <label>Status<select id="status"><option value="">All Status</option><option value="running">Running</option><option value="completed">Completed</option><option value="failed">Failed</option></select></label>
-          <label>Project ID<input id="project" placeholder="Enter project ID"></label>
-          <label>MR IID<input id="mr" placeholder="Enter MR IID"></label>
-          <button class="primary" id="apply">Apply</button>
-          <button id="reset">Reset</button>
+          <label>状态<select id="status"><option value="">全部状态</option><option value="running">运行中</option><option value="completed">已完成</option><option value="failed">失败</option></select></label>
+          <label>项目 ID<input id="project" placeholder="输入项目 ID"></label>
+          <label>MR IID<input id="mr" placeholder="输入 MR IID"></label>
+          <button class="primary" id="apply">应用</button>
+          <button id="reset">重置</button>
         </div>
         <div id="content"></div>
       </main>
@@ -150,13 +150,13 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     const $ = (id) => document.getElementById(id);
     const state = { view: "dashboard", summary: null, findingSummary: null, runs: [], projects: [], mrs: [], findings: [], comments: [] };
     const titles = {
-      dashboard: ["Dashboard", "Overview of review automation and system activity"],
-      projects: ["Projects", "Review activity grouped by GitLab project"],
-      mrs: ["Merge Requests", "Review activity grouped by merge request"],
-      runs: ["Review Runs", "Manual review executions and task results"],
-      findings: ["Findings", "Parsed AI and script findings"],
-      comments: ["Comments", "Comments posted back to GitLab"],
-      system: ["System", "Dashboard service and storage status"]
+      dashboard: ["仪表盘", "Review 自动化与系统活动概览"],
+      projects: ["项目", "按 GitLab 项目汇总的 Review 活动"],
+      mrs: ["合并请求", "按合并请求汇总的 Review 活动"],
+      runs: ["Review 运行", "手动 Review 执行与任务结果"],
+      findings: ["问题", "AI 与脚本解析出的结果"],
+      comments: ["评论", "已回写到 GitLab 的评论"],
+      system: ["系统", "仪表盘服务与存储状态"]
     };
     const json = async (url) => {
       const response = await fetch(url);
@@ -165,23 +165,33 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     };
     const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (ch) => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[ch]));
     const short = (value, n = 8) => value ? String(value).slice(0, n) : "";
-    const fmtTime = (value) => value ? String(value).replace("T", " ").replace("+00:00", "").replace("Z", "") : "";
+    const pad = (value) => String(value).padStart(2, "0");
+    const fmtDateTime = (date) => `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+    const fmtTime = (value) => {
+      if (!value) return "";
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? String(value) : fmtDateTime(date);
+    };
     const relative = (value) => {
       if (!value) return "-";
       const seconds = Math.max(0, Math.round((Date.now() - new Date(value).getTime()) / 1000));
-      if (seconds < 60) return `${seconds}s ago`;
-      if (seconds < 3600) return `${Math.round(seconds / 60)} min ago`;
-      if (seconds < 86400) return `${Math.round(seconds / 3600)} hr ago`;
-      return `${Math.round(seconds / 86400)} days ago`;
+      if (seconds < 60) return `${seconds} 秒前`;
+      if (seconds < 3600) return `${Math.round(seconds / 60)} 分钟前`;
+      if (seconds < 86400) return `${Math.round(seconds / 3600)} 小时前`;
+      return `${Math.round(seconds / 86400)} 天前`;
     };
     const fmtMs = (value) => {
       if (value == null) return "-";
       const seconds = Math.max(0, Math.round(value / 1000));
-      if (seconds < 60) return `${seconds}s`;
-      return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+      if (seconds < 60) return `${seconds} 秒`;
+      return `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
     };
-    const badge = (status) => `<span class="badge ${esc(status || "unknown")}">${esc(status || "-")}</span>`;
-    const empty = (cols, text = "No data") => `<tr><td class="empty" colspan="${cols}">${text}</td></tr>`;
+    const statusText = (status) => ({ running: "运行中", completed: "已完成", failed: "失败", error: "错误" }[status] || status || "-");
+    const severityText = (severity) => ({ error: "严重", warning: "主要", info: "提示" }[severity] || severity || "-");
+    const badge = (status) => `<span class="badge ${esc(status || "unknown")}">${esc(statusText(status))}</span>`;
+    const severityBadge = (severity) => `<span class="badge ${esc(severity || "unknown")}">${esc(severityText(severity))}</span>`;
+    const projectLabel = (item) => item.project_label || `#${item.project_id}`;
+    const empty = (cols, text = "暂无数据") => `<tr><td class="empty" colspan="${cols}">${text}</td></tr>`;
     const row = (cells, attrs = "") => `<tr ${attrs}>${cells.map((cell) => `<td>${cell ?? ""}</td>`).join("")}</tr>`;
     const pct = (part, total) => total ? ((part / total) * 100).toFixed(1) : "0.0";
 
@@ -198,7 +208,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     }
 
     async function load() {
-      $("utcNow").textContent = `UTC ${new Date().toISOString().slice(0, 19).replace("T", " ")}`;
+      $("localNow").textContent = fmtDateTime(new Date());
       const runParams = params(true);
       const listParams = params(false);
       const [summary, findingSummary, runs, projects, mrs, findings, comments] = await Promise.all([
@@ -237,43 +247,43 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       const successRate = pct(summary.completed_runs || 0, summary.total_runs || 0);
       const failureRate = pct(summary.failed_runs || 0, summary.total_runs || 0);
       $("metrics").innerHTML = [
-        ["▶", "blue", "Total Runs", summary.total_runs || 0, "All time review runs", spark("#315bea")],
-        ["◷", "sky", "Running", summary.running_runs || 0, "Currently running", spark("#1479d6")],
-        ["✓", "green", "Completed", summary.completed_runs || 0, `Success rate&nbsp; <span style="color:#17975d">${successRate}%</span>`, spark("#17975d")],
-        ["×", "red", "Failed", summary.failed_runs || 0, `Failure rate&nbsp; <span style="color:#dc3f3f">${failureRate}%</span>`, spark("#dc3f3f")],
+        ["▶", "blue", "总运行数", summary.total_runs || 0, "全部 Review 运行", spark("#315bea")],
+        ["◷", "sky", "运行中", summary.running_runs || 0, "当前正在执行", spark("#1479d6")],
+        ["✓", "green", "已完成", summary.completed_runs || 0, `成功率&nbsp; <span style="color:#17975d">${successRate}%</span>`, spark("#17975d")],
+        ["×", "red", "失败", summary.failed_runs || 0, `失败率&nbsp; <span style="color:#dc3f3f">${failureRate}%</span>`, spark("#dc3f3f")],
       ].map(([icon, color, label, value, sub, graph]) => `<div class="metric-card"><div class="metric-icon ${color}">${icon}</div><div><div class="metric-label">${label}</div><div class="metric-value">${value}</div><div class="metric-sub">${sub}</div></div>${graph}</div>`).join("");
     }
 
     function renderDashboard() {
       return `<div class="content-grid">
         <section class="panel">
-          <div class="panel-header"><div class="panel-title">☷ Recent Review Runs</div><button class="link" data-view-link="runs">View all runs →</button></div>
+          <div class="panel-header"><div class="panel-title">☷ 最近 Review 运行</div><button class="link" data-view-link="runs">查看全部运行 →</button></div>
           ${runsTable(state.runs.slice(0, 8))}
         </section>
         <div class="side-stack">${serviceStatusPanel()}${findingSummaryPanel()}</div>
       </div>
       <div class="bottom-grid" style="margin-top:20px">
-        <section class="panel"><div class="panel-header"><div class="panel-title">□ Projects Overview</div><button class="link" data-view-link="projects">Open projects →</button></div>${projectsTable(state.projects.slice(0, 8))}</section>
-        <section class="panel"><div class="panel-header"><div class="panel-title">⌘ Merge Requests Overview</div><button class="link" data-view-link="mrs">Open MRs →</button></div>${mrsTable(state.mrs.slice(0, 8))}</section>
+        <section class="panel"><div class="panel-header"><div class="panel-title">□ 项目概览</div><button class="link" data-view-link="projects">打开项目 →</button></div>${projectsTable(state.projects.slice(0, 8))}</section>
+        <section class="panel"><div class="panel-header"><div class="panel-title">⌘ 合并请求概览</div><button class="link" data-view-link="mrs">打开 MR →</button></div>${mrsTable(state.mrs.slice(0, 8))}</section>
       </div>`;
     }
 
     function renderRunsPage() {
-      return `<section class="panel"><div class="panel-header"><div class="panel-title">▷ Review Runs</div><span>${state.runs.length} rows</span></div>${runsTable(state.runs)}</section>`;
+      return `<section class="panel"><div class="panel-header"><div class="panel-title">▷ Review 运行</div><span>${state.runs.length} 行</span></div>${runsTable(state.runs)}</section>`;
     }
 
     function renderProjectsPage() {
-      return `<section class="panel"><div class="panel-header"><div class="panel-title">□ Projects</div><span>${state.projects.length} projects</span></div>${projectsTable(state.projects)}</section>`;
+      return `<section class="panel"><div class="panel-header"><div class="panel-title">□ 项目</div><span>${state.projects.length} 个项目</span></div>${projectsTable(state.projects)}</section>`;
     }
 
     function renderMrsPage() {
-      return `<section class="panel"><div class="panel-header"><div class="panel-title">⌘ Merge Requests</div><span>${state.mrs.length} merge requests</span></div>${mrsTable(state.mrs)}</section>`;
+      return `<section class="panel"><div class="panel-header"><div class="panel-title">⌘ 合并请求</div><span>${state.mrs.length} 个合并请求</span></div>${mrsTable(state.mrs)}</section>`;
     }
 
     function renderFindingsPage() {
-      return `<section class="panel"><div class="panel-header"><div class="panel-title">◌ Findings</div><span>${state.findings.length} rows</span></div>
-        <table><thead><tr><th>Created</th><th>Severity</th><th>Project</th><th>MR</th><th>Path</th><th>Title</th><th>Run ID</th></tr></thead><tbody>${state.findings.length ? state.findings.map((finding) => row([
-          fmtTime(finding.created_at), badge(finding.severity), esc(finding.project_id), `!${esc(finding.mr_iid)}`,
+      return `<section class="panel"><div class="panel-header"><div class="panel-title">◌ 问题</div><span>${state.findings.length} 行</span></div>
+        <table><thead><tr><th>创建时间</th><th>级别</th><th>项目</th><th>MR</th><th>路径</th><th>标题</th><th>运行 ID</th></tr></thead><tbody>${state.findings.length ? state.findings.map((finding) => row([
+          fmtTime(finding.created_at), severityBadge(finding.severity), esc(projectLabel(finding)), `!${esc(finding.mr_iid)}`,
           `${esc(finding.path)}${finding.new_line ? `:${esc(finding.new_line)}` : ""}`,
           `<div class="wrap"><strong>${esc(finding.title)}</strong><br><span class="subtitle">${esc(finding.message)}</span></div>`,
           `<button class="link" data-run="${esc(finding.review_run_id)}">${esc(short(finding.review_run_id, 12))}</button>`
@@ -282,9 +292,9 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     }
 
     function renderCommentsPage() {
-      return `<section class="panel"><div class="panel-header"><div class="panel-title">◍ Comments</div><span>${state.comments.length} rows</span></div>
-        <table><thead><tr><th>Created</th><th>Project</th><th>MR</th><th>Path</th><th>Rule</th><th>Discussion</th><th>Run ID</th></tr></thead><tbody>${state.comments.length ? state.comments.map((comment) => row([
-          fmtTime(comment.created_at), esc(comment.project_id), `!${esc(comment.mr_iid)}`,
+      return `<section class="panel"><div class="panel-header"><div class="panel-title">◍ 评论</div><span>${state.comments.length} 行</span></div>
+        <table><thead><tr><th>创建时间</th><th>项目</th><th>MR</th><th>路径</th><th>规则</th><th>Discussion</th><th>运行 ID</th></tr></thead><tbody>${state.comments.length ? state.comments.map((comment) => row([
+          fmtTime(comment.created_at), esc(projectLabel(comment)), `!${esc(comment.mr_iid)}`,
           `${esc(comment.path)}${comment.new_line ? `:${esc(comment.new_line)}` : ""}`,
           esc(comment.rule_id), esc(comment.discussion_id || comment.note_id || "-"),
           `<button class="link" data-run="${esc(comment.review_run_id)}">${esc(short(comment.review_run_id, 12))}</button>`
@@ -297,35 +307,35 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     }
 
     function runsTable(items) {
-      return `<table><thead><tr><th>Started</th><th>Status</th><th>Project</th><th>MR</th><th>Commit</th><th>Tasks</th><th>Findings</th><th>Comments</th><th>Duration</th><th>Run ID</th></tr></thead><tbody>${items.length ? items.map((run) => {
+      return `<table><thead><tr><th>开始时间</th><th>状态</th><th>项目</th><th>MR</th><th>Commit</th><th>任务</th><th>问题</th><th>评论</th><th>耗时</th><th>运行 ID</th></tr></thead><tbody>${items.length ? items.map((run) => {
         const totalTasks = run.total_task_runs || run.selected_ai_reviews + run.selected_script_tasks;
         const completedTasks = run.completed_task_runs || (run.status === "completed" ? totalTasks : 0);
         const findingColor = run.findings > 0 ? (run.status === "failed" ? "var(--red)" : "var(--amber)") : "var(--green)";
-        return row([fmtTime(run.started_at), badge(run.status), esc(run.project_id), `!${esc(run.mr_iid)}`, `<code>${esc(short(run.commit_sha))}</code>`, `${completedTasks}/${totalTasks}`, `<span style="color:${findingColor}">${run.findings || "-"}</span>`, esc(run.comments), fmtMs(run.duration_ms), `<code>${esc(short(run.review_run_id, 12))}</code>`], `class="clickable" data-run="${esc(run.review_run_id)}"`);
+        return row([fmtTime(run.started_at), badge(run.status), esc(projectLabel(run)), `!${esc(run.mr_iid)}`, `<code>${esc(short(run.commit_sha))}</code>`, `${completedTasks}/${totalTasks}`, `<span style="color:${findingColor}">${run.findings || "-"}</span>`, esc(run.comments), fmtMs(run.duration_ms), `<code>${esc(short(run.review_run_id, 12))}</code>`], `class="clickable" data-run="${esc(run.review_run_id)}"`);
       }).join("") : empty(10)}</tbody></table>`;
     }
 
     function projectsTable(items) {
-      return `<table><thead><tr><th>Project</th><th>Runs</th><th>Running</th><th>Failed</th><th>Success Rate</th><th>Last Review</th></tr></thead><tbody>${items.length ? items.map((project) => {
+      return `<table><thead><tr><th>项目</th><th>运行数</th><th>运行中</th><th>失败</th><th>成功率</th><th>最近 Review</th></tr></thead><tbody>${items.length ? items.map((project) => {
         const rate = pct(project.total_runs - project.failed_runs, project.total_runs);
-        return row([`<button class="link" data-project="${esc(project.project_id)}">${esc(project.project_id)}</button>`, esc(project.total_runs), esc(project.running_runs), esc(project.failed_runs), `${rate}% <span class="progress"><span style="width:${rate}%"></span></span>`, relative(project.last_review_at)], `class="clickable" data-project="${esc(project.project_id)}"`);
+        return row([`<button class="link" data-project="${esc(project.project_id)}">${esc(projectLabel(project))}</button>`, esc(project.total_runs), esc(project.running_runs), esc(project.failed_runs), `${rate}% <span class="progress"><span style="width:${rate}%"></span></span>`, relative(project.last_review_at)], `class="clickable" data-project="${esc(project.project_id)}"`);
       }).join("") : empty(6)}</tbody></table>`;
     }
 
     function mrsTable(items) {
-      return `<table><thead><tr><th>MR</th><th>Project</th><th>Status</th><th>Runs</th><th>Findings</th><th>Last Review</th></tr></thead><tbody>${items.length ? items.map((mr) => row([
-        `<button class="link" data-project="${esc(mr.project_id)}" data-mr="${esc(mr.mr_iid)}">!${esc(mr.mr_iid)}</button>`, esc(mr.project_id), badge(mr.last_status), esc(mr.total_runs),
+      return `<table><thead><tr><th>MR</th><th>项目</th><th>状态</th><th>运行数</th><th>问题</th><th>最近 Review</th></tr></thead><tbody>${items.length ? items.map((mr) => row([
+        `<button class="link" data-project="${esc(mr.project_id)}" data-mr="${esc(mr.mr_iid)}">!${esc(mr.mr_iid)}</button>`, esc(projectLabel(mr)), badge(mr.last_status), esc(mr.total_runs),
         mr.total_findings ? `<span style="color:var(--red)">${mr.total_findings}</span>` : `<span style="color:var(--green)">0</span>`, relative(mr.last_review_at)
       ], `class="clickable" data-project="${esc(mr.project_id)}" data-mr="${esc(mr.mr_iid)}"`)).join("") : empty(6)}</tbody></table>`;
     }
 
     function serviceStatusPanel() {
       const summary = state.summary || {};
-      return `<section class="panel"><div class="panel-header"><div class="panel-title">✓ Service Status</div></div><div class="status-list">
-        <div class="status-row"><span>Dashboard Service</span><span class="status-pill">Healthy</span></div>
-        <div class="status-row"><span>Database</span><span class="status-pill">Healthy</span></div>
-        <div class="status-row"><span>Last Review</span><span>${relative(summary.last_review_at)}</span></div>
-        <div class="status-row"><span>Last Error</span><span>${summary.failed_runs > 0 ? `${summary.failed_runs} failed runs` : "-"}</span></div>
+      return `<section class="panel"><div class="panel-header"><div class="panel-title">✓ 服务状态</div></div><div class="status-list">
+        <div class="status-row"><span>仪表盘服务</span><span class="status-pill">健康</span></div>
+        <div class="status-row"><span>数据库</span><span class="status-pill">健康</span></div>
+        <div class="status-row"><span>最近 Review</span><span>${relative(summary.last_review_at)}</span></div>
+        <div class="status-row"><span>最近错误</span><span>${summary.failed_runs > 0 ? `${summary.failed_runs} 次失败运行` : "-"}</span></div>
       </div></section>`;
     }
 
@@ -335,12 +345,12 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       const error = total ? (summary.error / total) * 360 : 0;
       const warning = error + (total ? (summary.warning / total) * 360 : 0);
       const info = warning + (total ? (summary.info / total) * 360 : 0);
-      return `<section class="panel"><div class="panel-header"><div class="panel-title">◌ Findings Summary</div></div><div class="finding-body">
-        <div class="donut" style="--error:${error}deg;--warning:${warning}deg;--info:${info}deg"><div class="donut-center"><div>${total}</div><span>Total</span></div></div>
+      return `<section class="panel"><div class="panel-header"><div class="panel-title">◌ 问题汇总</div></div><div class="finding-body">
+        <div class="donut" style="--error:${error}deg;--warning:${warning}deg;--info:${info}deg"><div class="donut-center"><div>${total}</div><span>总数</span></div></div>
         <div class="legend">
-          <div class="legend-row"><span class="dot error"></span><span>Critical</span><span>${summary.error} (${pct(summary.error, total)}%)</span></div>
-          <div class="legend-row"><span class="dot warning"></span><span>Major</span><span>${summary.warning} (${pct(summary.warning, total)}%)</span></div>
-          <div class="legend-row"><span class="dot info"></span><span>Info</span><span>${summary.info} (${pct(summary.info, total)}%)</span></div>
+          <div class="legend-row"><span class="dot error"></span><span>严重</span><span>${summary.error} (${pct(summary.error, total)}%)</span></div>
+          <div class="legend-row"><span class="dot warning"></span><span>主要</span><span>${summary.warning} (${pct(summary.warning, total)}%)</span></div>
+          <div class="legend-row"><span class="dot info"></span><span>提示</span><span>${summary.info} (${pct(summary.info, total)}%)</span></div>
         </div>
       </div></section>`;
     }
@@ -348,16 +358,16 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     async function openRunDetail(reviewRunId) {
       const detail = await json(`/api/runs/${encodeURIComponent(reviewRunId)}`);
       $("content").innerHTML = `<div class="detail-grid">
-        <section class="panel"><div class="panel-header"><div class="panel-title">Review Run Detail</div><button class="link" id="backToRuns">Back to runs</button></div><div class="detail-list">
-          <div class="detail-row"><span>Run ID</span><code>${esc(detail.run.review_run_id)}</code></div>
-          <div class="detail-row"><span>Status</span>${badge(detail.run.status)}</div>
-          <div class="detail-row"><span>Project / MR</span><span>${esc(detail.run.project_id)} / !${esc(detail.run.mr_iid)}</span></div>
+        <section class="panel"><div class="panel-header"><div class="panel-title">Review 运行详情</div><button class="link" id="backToRuns">返回运行列表</button></div><div class="detail-list">
+          <div class="detail-row"><span>运行 ID</span><code>${esc(detail.run.review_run_id)}</code></div>
+          <div class="detail-row"><span>状态</span>${badge(detail.run.status)}</div>
+          <div class="detail-row"><span>项目 / MR</span><span>${esc(projectLabel(detail.run))} / !${esc(detail.run.mr_iid)}</span></div>
           <div class="detail-row"><span>Commit</span><code>${esc(detail.run.commit_sha)}</code></div>
-          <div class="detail-row"><span>Findings / Comments</span><span>${esc(detail.run.findings)} / ${esc(detail.run.comments)}</span></div>
+          <div class="detail-row"><span>问题 / 评论</span><span>${esc(detail.run.findings)} / ${esc(detail.run.comments)}</span></div>
         </div></section>
-        <section class="panel"><div class="panel-header"><div class="panel-title">Tasks</div></div><table><thead><tr><th>Type</th><th>ID</th><th>Status</th><th>Findings</th><th>Comments</th><th>Error</th></tr></thead><tbody>${detail.tasks.length ? detail.tasks.map((task) => row([esc(task.task_type), esc(task.task_id), badge(task.status), esc(task.findings), esc(task.comments), `<span class="wrap">${esc(task.error || "-")}</span>`])).join("") : empty(6)}</tbody></table></section>
-        <section class="panel"><div class="panel-header"><div class="panel-title">Findings</div></div><table><thead><tr><th>Severity</th><th>Path</th><th>Title</th><th>Message</th></tr></thead><tbody>${detail.findings.length ? detail.findings.map((finding) => row([badge(finding.severity), `${esc(finding.path)}${finding.new_line ? `:${esc(finding.new_line)}` : ""}`, esc(finding.title), `<span class="wrap">${esc(finding.message)}</span>`])).join("") : empty(4)}</tbody></table></section>
-        <section class="panel"><div class="panel-header"><div class="panel-title">Comments</div></div><table><thead><tr><th>Rule</th><th>Path</th><th>Discussion</th><th>Note</th></tr></thead><tbody>${detail.comments.length ? detail.comments.map((comment) => row([esc(comment.rule_id), `${esc(comment.path)}${comment.new_line ? `:${esc(comment.new_line)}` : ""}`, esc(comment.discussion_id || "-"), esc(comment.note_id || "-")])).join("") : empty(4)}</tbody></table></section>
+        <section class="panel"><div class="panel-header"><div class="panel-title">任务</div></div><table><thead><tr><th>类型</th><th>ID</th><th>状态</th><th>问题</th><th>评论</th><th>错误</th></tr></thead><tbody>${detail.tasks.length ? detail.tasks.map((task) => row([esc(task.task_type), esc(task.task_id), badge(task.status), esc(task.findings), esc(task.comments), `<span class="wrap">${esc(task.error || "-")}</span>`])).join("") : empty(6)}</tbody></table></section>
+        <section class="panel"><div class="panel-header"><div class="panel-title">问题</div></div><table><thead><tr><th>级别</th><th>路径</th><th>标题</th><th>消息</th></tr></thead><tbody>${detail.findings.length ? detail.findings.map((finding) => row([severityBadge(finding.severity), `${esc(finding.path)}${finding.new_line ? `:${esc(finding.new_line)}` : ""}`, esc(finding.title), `<span class="wrap">${esc(finding.message)}</span>`])).join("") : empty(4)}</tbody></table></section>
+        <section class="panel"><div class="panel-header"><div class="panel-title">评论</div></div><table><thead><tr><th>规则</th><th>路径</th><th>Discussion</th><th>Note</th></tr></thead><tbody>${detail.comments.length ? detail.comments.map((comment) => row([esc(comment.rule_id), `${esc(comment.path)}${comment.new_line ? `:${esc(comment.new_line)}` : ""}`, esc(comment.discussion_id || "-"), esc(comment.note_id || "-")])).join("") : empty(4)}</tbody></table></section>
       </div>`;
       $("backToRuns").addEventListener("click", () => setView("runs"));
     }
@@ -381,7 +391,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     }
 
     function showError(err) {
-      $("content").innerHTML = `<section class="panel"><div class="empty">Load failed: ${esc(err.message)}</div></section>`;
+      $("content").innerHTML = `<section class="panel"><div class="empty">加载失败：${esc(err.message)}</div></section>`;
     }
 
     document.querySelectorAll(".nav-item").forEach((item) => item.addEventListener("click", () => setView(item.dataset.view)));
@@ -395,3 +405,17 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
 </body>
 </html>
 "##;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dashboard_shell_is_localized_for_chinese_users() {
+        assert!(DASHBOARD_HTML.contains(r#"<html lang="zh-CN">"#));
+        assert!(DASHBOARD_HTML.contains("仪表盘"));
+        assert!(DASHBOARD_HTML.contains("项目"));
+        assert!(!DASHBOARD_HTML.contains("UTC --"));
+        assert!(!DASHBOARD_HTML.contains("Dashboard</div>"));
+    }
+}

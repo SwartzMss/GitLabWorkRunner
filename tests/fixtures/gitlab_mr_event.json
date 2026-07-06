@@ -1,7 +1,9 @@
 {
   "object_kind": "merge_request",
   "project": {
-    "id": 123
+    "id": 123,
+    "name": "runner",
+    "path_with_namespace": "platform/runner"
   },
   "object_attributes": {
     "iid": 45,
