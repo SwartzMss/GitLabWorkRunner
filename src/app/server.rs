@@ -127,14 +127,19 @@ async fn gitlab_webhook(
         info!(
             review_run_id = %review_run_id,
             project_id = event.project_id,
+            project_name = event.project_name.as_deref(),
+            project_path_with_namespace = event.project_path_with_namespace.as_deref(),
             mr_iid = event.mr_iid,
             commit_sha = %event.commit_sha,
             action = %event.action,
             source_branch = %event.source_branch,
             target_branch = %event.target_branch,
-            "gitlab merge request event ignored because automatic reviews are disabled"
+            "gitlab merge request event ignored because only manual mr note triggers are supported"
         );
-        return webhook_response::ignored(review_run_id, "merge_request_events_disabled");
+        return webhook_response::ignored(
+            review_run_id,
+            "merge_request_events_manual_triggers_only",
+        );
     }
     let gitlab_token = match state.config.gitlab_token() {
         Ok(token) => token,
@@ -172,6 +177,8 @@ async fn gitlab_webhook(
             info!(
                 review_run_id = %review_run_id,
                 project_id = event.project_id,
+                project_name = event.project_name.as_deref(),
+                project_path_with_namespace = event.project_path_with_namespace.as_deref(),
                 mr_iid = event.mr_iid,
                 commit_sha = %event.commit_sha,
                 action = %event.action,
@@ -182,6 +189,8 @@ async fn gitlab_webhook(
             WebhookReviewSummary {
                 review_run_id: review_run_id.clone(),
                 project_id: event.project_id,
+                project_name: event.project_name.clone(),
+                project_path_with_namespace: event.project_path_with_namespace.clone(),
                 mr_iid: event.mr_iid,
                 commit_sha: event.commit_sha.clone(),
             }
@@ -190,6 +199,8 @@ async fn gitlab_webhook(
             info!(
                 review_run_id = %review_run_id,
                 project_id = event.project_id,
+                project_name = event.project_name.as_deref(),
+                project_path_with_namespace = event.project_path_with_namespace.as_deref(),
                 mr_iid = event.mr_iid,
                 commit_sha = %event.commit_sha,
                 action = %event.action,
@@ -199,6 +210,8 @@ async fn gitlab_webhook(
             WebhookReviewSummary {
                 review_run_id: review_run_id.clone(),
                 project_id: event.project_id,
+                project_name: event.project_name.clone(),
+                project_path_with_namespace: event.project_path_with_namespace.clone(),
                 mr_iid: event.mr_iid,
                 commit_sha: event.commit_sha.clone(),
             }
@@ -209,6 +222,8 @@ async fn gitlab_webhook(
         info!(
             review_run_id = %review_run_id,
             project_id = response_summary.project_id,
+            project_name = response_summary.project_name.as_deref(),
+            project_path_with_namespace = response_summary.project_path_with_namespace.as_deref(),
             mr_iid = response_summary.mr_iid,
             commit_sha = %response_summary.commit_sha,
             "gitlab webhook ignored because it did not request any configured manual review"

@@ -5,6 +5,8 @@ use serde_json::json;
 pub(crate) struct WebhookReviewSummary {
     pub(crate) review_run_id: String,
     pub(crate) project_id: i64,
+    pub(crate) project_name: Option<String>,
+    pub(crate) project_path_with_namespace: Option<String>,
     pub(crate) mr_iid: i64,
     pub(crate) commit_sha: String,
 }

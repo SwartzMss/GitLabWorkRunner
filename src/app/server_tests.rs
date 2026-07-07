@@ -66,7 +66,7 @@ async fn merge_request_webhook_is_ignored_without_review_work() {
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(body["accepted"], false);
-    assert_eq!(body["reason"], "merge_request_events_disabled");
+    assert_eq!(body["reason"], "merge_request_events_manual_triggers_only");
     assert!(!body["review_run_id"].as_str().unwrap().is_empty());
 }
 
@@ -597,7 +597,7 @@ timeout_seconds = 10
     let body = to_bytes(busy.into_body(), usize::MAX).await.unwrap();
     let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(body["accepted"], false);
-    assert_eq!(body["reason"], "merge_request_events_disabled");
+    assert_eq!(body["reason"], "merge_request_events_manual_triggers_only");
 
     assert_eq!(change_count.load(Ordering::SeqCst), 1);
     assert_eq!(busy_comment_count.load(Ordering::SeqCst), 0);
