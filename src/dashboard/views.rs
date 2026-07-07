@@ -352,7 +352,6 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
           <div class="detail-row"><span>Commit</span><code>${esc(detail.run.commit_sha)}</code></div>
           <div class="detail-row"><span>问题</span><span>${esc(detail.run.findings)}</span></div>
         </div></section>
-        <section class="panel"><div class="panel-header"><div class="panel-title">任务</div></div><table><thead><tr><th>类型</th><th>ID</th><th>状态</th><th>问题</th><th>错误</th></tr></thead><tbody>${detail.tasks.length ? detail.tasks.map((task) => row([esc(task.task_type), esc(task.task_id), badge(task.status), esc(task.findings), `<span class="wrap">${esc(task.error || "-")}</span>`])).join("") : empty(5)}</tbody></table></section>
         <section class="panel"><div class="panel-header"><div class="panel-title">问题</div></div><table><thead><tr><th>级别</th><th>路径</th><th>标题</th><th>消息</th></tr></thead><tbody>${detail.findings.length ? detail.findings.map((finding) => row([severityBadge(finding.severity), `${esc(finding.path)}${finding.new_line ? `:${esc(finding.new_line)}` : ""}`, esc(finding.title), `<span class="wrap">${esc(finding.message)}</span>`])).join("") : empty(4)}</tbody></table></section>
       </div>`;
       $("backToRuns").addEventListener("click", () => setView("runs"));
@@ -414,5 +413,12 @@ mod tests {
         assert!(!DASHBOARD_HTML.contains("renderCommentsPage"));
         assert!(!DASHBOARD_HTML.contains("/api/comments"));
         assert!(!DASHBOARD_HTML.contains("评论"));
+    }
+
+    #[test]
+    fn run_detail_focuses_on_findings_without_task_table() {
+        assert!(DASHBOARD_HTML.contains("detail.findings"));
+        assert!(!DASHBOARD_HTML.contains("detail.tasks"));
+        assert!(!DASHBOARD_HTML.contains(r#"<div class="panel-title">任务</div>"#));
     }
 }
