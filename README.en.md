@@ -2,7 +2,7 @@
 
 Language: [简体中文](README.md) | **English**
 
-GitLabWorkRunner is a Rust service for automated GitLab Merge Request review. It receives GitLab webhooks, fetches MR changes, runs `[[ai_reviews]]` by default, and publishes the result back to GitLab MR Discussions.
+GitLabWorkRunner is a Rust service for manual GitLab Merge Request review. It is triggered by GitLab MR comments, fetches MR changes, runs `[[ai_reviews]]` or script tasks, and publishes the result back to GitLab MR Discussions.
 
 It is not a GitLab Runner replacement and does not automatically run CI scripts from the target repository. The default example enables AI Review configuration and keeps a disabled script task example for later use.
 
@@ -10,7 +10,7 @@ It is not a GitLab Runner replacement and does not automatically run CI scripts 
 
 ```mermaid
 flowchart LR
-    A["GitLab MR Webhook"] --> B["GitLabWorkRunner"]
+    A["GitLab MR Comment Webhook"] --> B["GitLabWorkRunner"]
     B --> C["Fetch MR diff"]
     C --> D["Parse added lines"]
     D --> F["AI Review"]
@@ -18,10 +18,10 @@ flowchart LR
     F --> H["Build comments"]
     E --> H
     H --> I["GitLab MR Discussion"]
-    B --> J["SQLite dedupe state"]
+    B --> J["SQLite run statistics"]
 ```
 
-A normal automatic review looks like this:
+A manual review request looks like this:
 
 ```mermaid
 sequenceDiagram
@@ -30,26 +30,26 @@ sequenceDiagram
     participant DB as SQLite
     participant AI as OpenAI-compatible API
 
-    GitLab->>Runner: Merge request event
-    Runner->>DB: Check commit + ruleset dedupe key
+    GitLab->>Runner: MR note event with @id
+    Runner->>DB: Record review_run_id and run status
     Runner->>GitLab: Fetch MR changes / diff refs
     Runner->>Runner: Build AI Review input and locate added lines
     Runner-->>AI: Send MR diff, optionally with read-only context tools
     Runner->>GitLab: Publish line-level or MR-level comments
-    Runner->>DB: Store processed state and comment metadata
+    Runner->>DB: Store tasks, findings, comments, and final status
 ```
 
 See [docs/design.md](docs/design.md) for more design detail.
 
 ## Features
 
-- Automatic review from GitLab Merge Request webhooks.
+- Manual review from GitLab Merge Request Note webhooks.
 - Line-level comments only on added lines in the MR diff.
 - `[[ai_reviews]]`: OpenAI-compatible `POST /chat/completions` review.
 - Chat Completions `tool_calls` structured output and built-in read-only context tools: `read_file`, `search_code`, and `list_files`.
 - Manual AI Review triggers from MR comments, such as `@ai-review`.
 - If the same `project_id + mr_iid + commit_sha` is already running, duplicate triggers are skipped. For MR comment triggers, the service awards an `eyes` emoji and posts a comment saying the commit is already being reviewed.
-- SQLite dedupe state to avoid repeating automatic comments for the same commit and ruleset.
+- Each review run, subtask, finding, and published comment is written to structured SQLite tables with RFC3339 UTC timestamps.
 - Optional capability: `[[script_tasks]]` local script tasks over the MR head snapshot, disabled by default.
 
 ## Quick Start
@@ -154,9 +154,53 @@ max_entry_path_bytes = 512         # 512 bytes
 
 `[archive]` controls hard limits for downloading and extracting GitLab repository archives. If `max_archive_bytes` is exceeded, the runner stops reading the archive and fails the current review. During extraction, exceeding `max_extracted_files`, `max_extracted_bytes`, `max_single_file_bytes`, or `max_entry_path_bytes` stops extraction and fails the current review. The existing MR failure notification path reports the failure; AI context tools or script tasks do not continue.
 
+## Dashboard
+
+The dashboard is a separate binary and does not share the webhook runner's HTTP port. The runner writes SQLite statistics tables, and the dashboard reads the same database in read-only workflows.
+
+By default it reads the same `config.toml`: `[storage].database_url` selects the SQLite database, and `[dashboard].bind` selects the dashboard HTTP bind address. If no `config.toml` is provided, it falls back to local defaults: listen on `127.0.0.1:8082` and read `gitlab-work-runner.db` in the current directory.
+
+Config example:
+
+```toml
+[storage]
+database_url = "sqlite://gitlab-work-runner.db"
+
+[dashboard]
+bind = "127.0.0.1:8082"
+```
+
+Start:
+
+```powershell
+.\gitlab-work-runner-dashboard.exe
+```
+
+Open:
+
+```text
+http://127.0.0.1:8082/dashboard
+```
+
+API:
+
+```text
+GET /api/summary
+GET /api/finding-summary
+GET /api/runs
+GET /api/runs?status=failed&project=group/project&mr_iid=2
+GET /api/runs/<review_run_id>
+GET /api/projects
+GET /api/merge-requests
+GET /api/findings
+GET /api/comments
+```
+
+The dashboard process does not run migrations. If the database or statistics tables do not exist, start `gitlab-work-runner.exe` once first to run migrations.
+
 ## AI Review Config
 
-The recommended setup is AI Review-first. `rules.toml` should keep `[ai_review]` and `[[ai_reviews]]`; script tasks can stay configured with `auto_enabled = false` and be enabled or triggered manually later.
+Only manual MR comment-triggered reviews are currently supported. MR update events are accepted and ignored instead of entering the review queue. Keep `[ai_review]` and `[[ai_reviews]]` in `rules.toml`; script tasks can stay configured and be triggered manually from comments when deterministic local checks are needed.
 
 Recommended `rules.toml` example:
 
@@ -177,7 +221,6 @@ search_code = false
 list_files = false
 
 [[ai_reviews]]
-auto_enabled = false
 id = "ai-review"
 title = "AI Review"
 base_url = "https://api.openai.com/v1"
@@ -190,10 +233,9 @@ second_pass_on_clean = false
 batch_review = true
 max_batch_diff_bytes = 15000
 max_batches = 10
-when_changed = ["**/*.rs", "**/*.toml", "**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp"]
 ```
 
-`auto_enabled` defaults to `true`; set it to `false` to skip automatic execution while still allowing manual MR comment triggers such as `@ai-review`. The example uses `false`, which fits a comment-driven workflow. Set it to `true` if MR updates should run AI Review automatically.
+Posting a standalone `@ai-review` in an MR comment triggers the entry whose `id = "ai-review"`. MR update events are accepted and ignored; they do not enter the review queue.
 
 `[ai_review]` is the global AI Review prompt configuration. `system_prompt` replaces the built-in system prompt; `extra_instructions` is appended to the user prompt. If omitted, the built-in prompt is used.
 `[ai_review.context_tools]` configures built-in read-only context tools. They are disabled by default. When enabled, the service downloads the MR head archive and lets the model request `read_file`, `search_code`, or `list_files` through tool calls. The runner only returns text content inside the repository directory; it does not execute shell commands and skips `.env` and `.git`.
@@ -214,15 +256,11 @@ Script tasks are still supported, but disabled by default. Keep the config now a
 
 ```toml
 [[script_tasks]]
-auto_enabled = false
 id = "check-todo-tbd"
 title = "TODO/TBD marker check"
 command = "python examples/scripts/check_todo_tbd.py"
 timeout_seconds = 30
-when_changed = ["**/*.rs"]
 ```
-
-`auto_enabled` defaults to `true`; set it to `false` to skip automatic execution while still allowing manual MR comment triggers such as `@check-todo-tbd`.
 
 `@check-todo-tbd` matches `id = "check-todo-tbd"` inside `[[script_tasks]]`.
 
@@ -246,7 +284,7 @@ After enabling GitLab webhook `Comments`, add standalone commands in an MR comme
 @ai-review
 ```
 
-Manual triggers do not use the completed automatic review dedupe key. The same commit can be triggered again after the current run finishes. If the same `project_id + mr_iid + commit_sha` is still running, a new trigger is skipped; the service awards `eyes` to the triggering note and posts an MR comment asking the user to retry later. If the global number of running reviews has reached `[server].max_concurrent_reviews`, the trigger is also skipped and the MR receives a queue-busy comment.
+The same commit can be triggered again after the current run finishes. If the same `project_id + mr_iid + commit_sha` is still running, a new trigger is skipped; the service awards `eyes` to the triggering note and posts an MR comment asking the user to retry later. If the global number of running reviews has reached `[server].max_concurrent_reviews`, the trigger is also skipped and the MR receives a queue-busy comment.
 
 If optional script tasks are configured, they can also be triggered by their id:
 
