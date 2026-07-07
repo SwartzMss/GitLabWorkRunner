@@ -159,7 +159,10 @@ pub fn parse_merge_request_note_event(body: &[u8]) -> AppResult<Option<MergeRequ
         project_path_with_namespace: project.and_then(|project| project.path_with_namespace),
         mr_iid: merge_request.iid,
         commit_sha,
-        action: payload.object_attributes.action.unwrap_or_default(),
+        action: payload
+            .object_attributes
+            .action
+            .unwrap_or_else(|| "create".into()),
         note_id: payload.object_attributes.id,
         note: payload.object_attributes.note,
     }))
@@ -233,6 +236,29 @@ mod tests {
                 note: "@check-todo-tbd".into(),
             })
         );
+    }
+
+    #[test]
+    fn treats_merge_request_note_without_action_as_create() {
+        let body = br#"{
+            "object_kind": "note",
+            "event_type": "note",
+            "project_id": 123,
+            "object_attributes": {
+                "id": 987,
+                "note": "@ai-review",
+                "noteable_type": "MergeRequest"
+            },
+            "merge_request": {
+                "iid": 45,
+                "last_commit": { "id": "abc123" }
+            }
+        }"#;
+
+        let event = parse_merge_request_note_event(body).unwrap().unwrap();
+
+        assert!(event.is_create_action());
+        assert_eq!(event.action, "create");
     }
 
     #[test]
