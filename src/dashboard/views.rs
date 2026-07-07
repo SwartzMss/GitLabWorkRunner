@@ -45,9 +45,10 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     h1 { margin: 0; font-size: 26px; letter-spacing: 0; }
     h2 { margin: 0; font-size: 16px; letter-spacing: 0; }
     .subtitle { color: var(--muted); font-size: 14px; margin-top: 6px; }
-    .metrics { display: grid; grid-template-columns: repeat(4, minmax(180px, 1fr)); gap: 18px; }
+    .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 18px; }
     .metric-card, .panel, .filter-panel { background: #fff; border: 1px solid var(--border); border-radius: 9px; box-shadow: 0 8px 20px rgba(15, 23, 42, .03); }
-    .metric-card { min-height: 126px; padding: 24px 22px; display: grid; grid-template-columns: 58px 1fr 96px; gap: 18px; align-items: center; }
+    .metric-card { min-height: 126px; padding: 24px 22px; display: grid; grid-template-columns: 58px minmax(0, 1fr) auto; gap: 18px; align-items: center; }
+    .metric-card > div { min-width: 0; }
     .metric-icon { width: 56px; height: 56px; border-radius: 14px; color: #fff; display: grid; place-items: center; font-size: 26px; font-weight: 800; }
     .metric-icon.blue { background: linear-gradient(135deg, #5867f1, #315bea); }
     .metric-icon.sky { background: linear-gradient(135deg, #1aa4f5, #1479d6); }
@@ -62,7 +63,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     select, input { height: 38px; border: 1px solid #cfd7e6; border-radius: 6px; background: #fff; padding: 0 12px; color: #1f2a44; }
     .content-grid { display: grid; grid-template-columns: minmax(0, 1fr) 430px; gap: 20px; }
     .bottom-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-    .panel-header { height: 56px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #e5eaf2; padding: 0 20px; }
+    .panel-header { min-height: 56px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid #e5eaf2; padding: 12px 20px; flex-wrap: wrap; }
     .panel-title { display: inline-flex; align-items: center; gap: 10px; font-weight: 750; }
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
     th, td { padding: 12px 20px; border-bottom: 1px solid #edf1f6; text-align: left; white-space: nowrap; vertical-align: top; }
@@ -96,12 +97,25 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     .empty { padding: 20px; color: var(--muted); }
     .wrap { white-space: normal; max-width: 520px; }
     .hidden { display: none !important; }
+    @media (max-width: 1500px) {
+      table { display: block; overflow-x: auto; }
+    }
     @media (max-width: 1200px) {
       .app { grid-template-columns: 1fr; }
       aside { display: none; }
       .content-grid, .bottom-grid, .metrics, .filter-panel { grid-template-columns: 1fr; }
       header, main { padding-left: 16px; padding-right: 16px; }
-      table { display: block; overflow-x: auto; }
+    }
+    @media (max-width: 720px) {
+      header { height: auto; min-height: 64px; padding-top: 12px; padding-bottom: 12px; }
+      .top-actions { gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
+      main { padding-top: 20px; }
+      .metric-card { grid-template-columns: 48px minmax(0, 1fr); padding: 18px; gap: 14px; min-height: 104px; }
+      .metric-icon { width: 46px; height: 46px; border-radius: 10px; font-size: 22px; }
+      .spark { display: none; }
+      .filter-panel { padding: 14px; }
+      .finding-body { grid-template-columns: 1fr; justify-items: start; }
+      .status-row, .detail-row { align-items: flex-start; }
     }
   </style>
 </head>
@@ -420,5 +434,15 @@ mod tests {
         assert!(DASHBOARD_HTML.contains("detail.findings"));
         assert!(!DASHBOARD_HTML.contains("detail.tasks"));
         assert!(!DASHBOARD_HTML.contains(r#"<div class="panel-title">任务</div>"#));
+    }
+
+    #[test]
+    fn dashboard_css_has_responsive_card_and_table_layouts() {
+        assert!(DASHBOARD_HTML.contains("repeat(auto-fit, minmax(260px, 1fr))"));
+        assert!(DASHBOARD_HTML.contains("@media (max-width: 1500px)"));
+        assert!(DASHBOARD_HTML.contains("table { display: block; overflow-x: auto; }"));
+        assert!(DASHBOARD_HTML.contains("@media (max-width: 720px)"));
+        assert!(DASHBOARD_HTML.contains("grid-template-columns: 48px minmax(0, 1fr);"));
+        assert!(DASHBOARD_HTML.contains(".spark { display: none; }"));
     }
 }
