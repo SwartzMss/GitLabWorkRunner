@@ -118,7 +118,6 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         <div class="nav-item" data-view="mrs"><span class="nav-icon">⌘</span>合并请求</div>
         <div class="nav-item" data-view="runs"><span class="nav-icon">▷</span>Review 运行</div>
         <div class="nav-item" data-view="findings"><span class="nav-icon">◌</span>问题</div>
-        <div class="nav-item" data-view="comments"><span class="nav-icon">◍</span>评论</div>
         <div class="nav-item" data-view="system"><span class="nav-icon">▣</span>系统</div>
       </nav>
       <div class="aside-footer">
@@ -148,14 +147,13 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
   </div>
   <script>
     const $ = (id) => document.getElementById(id);
-    const state = { view: "dashboard", summary: null, findingSummary: null, runs: [], projects: [], mrs: [], findings: [], comments: [] };
+    const state = { view: "dashboard", summary: null, findingSummary: null, runs: [], projects: [], mrs: [], findings: [] };
     const titles = {
       dashboard: ["仪表盘", "Review 自动化与系统活动概览"],
       projects: ["项目", "按 GitLab 项目汇总的 Review 活动"],
       mrs: ["合并请求", "按合并请求汇总的 Review 活动"],
       runs: ["Review 运行", "手动 Review 执行与任务结果"],
       findings: ["问题", "AI 与脚本解析出的结果"],
-      comments: ["评论", "已回写到 GitLab 的评论"],
       system: ["系统", "仪表盘服务与存储状态"]
     };
     const json = async (url) => {
@@ -212,14 +210,13 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       $("localNow").textContent = fmtClockTime(new Date());
       const runParams = params(true);
       const listParams = params(false);
-      const [summary, findingSummary, runs, projects, mrs, findings, comments] = await Promise.all([
+      const [summary, findingSummary, runs, projects, mrs, findings] = await Promise.all([
         json("/api/summary"),
         json("/api/finding-summary"),
         json(`/api/runs?${runParams}`),
         json("/api/projects"),
         json("/api/merge-requests"),
         json(`/api/findings?${listParams}`),
-        json(`/api/comments?${listParams}`),
       ]);
       state.summary = summary;
       state.findingSummary = findingSummary;
@@ -227,7 +224,6 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       state.projects = projects.projects;
       state.mrs = mrs.merge_requests;
       state.findings = findings.findings;
-      state.comments = comments.comments;
       render();
     }
 
@@ -238,7 +234,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       document.querySelectorAll(".nav-item").forEach((item) => item.classList.toggle("active", item.dataset.view === state.view));
       renderMetrics();
       $("filters").classList.toggle("hidden", state.view === "system");
-      const renderers = { dashboard: renderDashboard, projects: renderProjectsPage, mrs: renderMrsPage, runs: renderRunsPage, findings: renderFindingsPage, comments: renderCommentsPage, system: renderSystemPage };
+      const renderers = { dashboard: renderDashboard, projects: renderProjectsPage, mrs: renderMrsPage, runs: renderRunsPage, findings: renderFindingsPage, system: renderSystemPage };
       $("content").innerHTML = renderers[state.view]();
       bindContentClicks();
     }
@@ -292,28 +288,17 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       </section>`;
     }
 
-    function renderCommentsPage() {
-      return `<section class="panel"><div class="panel-header"><div class="panel-title">◍ 评论</div><span>${state.comments.length} 行</span></div>
-        <table><thead><tr><th>创建时间</th><th>项目</th><th>MR</th><th>路径</th><th>规则</th><th>Discussion</th><th>运行 ID</th></tr></thead><tbody>${state.comments.length ? state.comments.map((comment) => row([
-          fmtTime(comment.created_at), esc(projectLabel(comment)), `!${esc(comment.mr_iid)}`,
-          `${esc(comment.path)}${comment.new_line ? `:${esc(comment.new_line)}` : ""}`,
-          esc(comment.rule_id), esc(comment.discussion_id || comment.note_id || "-"),
-          `<button class="link" data-run="${esc(comment.review_run_id)}">${esc(short(comment.review_run_id, 12))}</button>`
-        ], `class="clickable" data-run="${esc(comment.review_run_id)}"`)).join("") : empty(7)}</tbody></table>
-      </section>`;
-    }
-
     function renderSystemPage() {
       return `<div class="content-grid"><section class="panel">${serviceStatusPanel()}</section><section class="panel">${findingSummaryPanel()}</section></div>`;
     }
 
     function runsTable(items) {
-      return `<table><thead><tr><th>开始时间</th><th>状态</th><th>项目</th><th>MR</th><th>Commit</th><th>任务</th><th>问题</th><th>评论</th><th>耗时</th><th>运行 ID</th></tr></thead><tbody>${items.length ? items.map((run) => {
+      return `<table><thead><tr><th>开始时间</th><th>状态</th><th>项目</th><th>MR</th><th>Commit</th><th>任务</th><th>问题</th><th>耗时</th><th>运行 ID</th></tr></thead><tbody>${items.length ? items.map((run) => {
         const totalTasks = run.total_task_runs || run.selected_ai_reviews + run.selected_script_tasks;
         const completedTasks = run.completed_task_runs || (run.status === "completed" ? totalTasks : 0);
         const findingColor = run.findings > 0 ? (run.status === "failed" ? "var(--red)" : "var(--amber)") : "var(--green)";
-        return row([fmtTime(run.started_at), badge(run.status), esc(projectLabel(run)), `!${esc(run.mr_iid)}`, `<code>${esc(short(run.commit_sha))}</code>`, `${completedTasks}/${totalTasks}`, `<span style="color:${findingColor}">${run.findings || "-"}</span>`, esc(run.comments), fmtMs(run.duration_ms), `<code>${esc(short(run.review_run_id, 12))}</code>`], `class="clickable" data-run="${esc(run.review_run_id)}"`);
-      }).join("") : empty(10)}</tbody></table>`;
+        return row([fmtTime(run.started_at), badge(run.status), esc(projectLabel(run)), `!${esc(run.mr_iid)}`, `<code>${esc(short(run.commit_sha))}</code>`, `${completedTasks}/${totalTasks}`, `<span style="color:${findingColor}">${run.findings || "-"}</span>`, fmtMs(run.duration_ms), `<code>${esc(short(run.review_run_id, 12))}</code>`], `class="clickable" data-run="${esc(run.review_run_id)}"`);
+      }).join("") : empty(9)}</tbody></table>`;
     }
 
     function projectsTable(items) {
@@ -365,11 +350,10 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
           <div class="detail-row"><span>状态</span>${badge(detail.run.status)}</div>
           <div class="detail-row"><span>项目 / MR</span><span>${esc(projectLabel(detail.run))} / !${esc(detail.run.mr_iid)}</span></div>
           <div class="detail-row"><span>Commit</span><code>${esc(detail.run.commit_sha)}</code></div>
-          <div class="detail-row"><span>问题 / 评论</span><span>${esc(detail.run.findings)} / ${esc(detail.run.comments)}</span></div>
+          <div class="detail-row"><span>问题</span><span>${esc(detail.run.findings)}</span></div>
         </div></section>
-        <section class="panel"><div class="panel-header"><div class="panel-title">任务</div></div><table><thead><tr><th>类型</th><th>ID</th><th>状态</th><th>问题</th><th>评论</th><th>错误</th></tr></thead><tbody>${detail.tasks.length ? detail.tasks.map((task) => row([esc(task.task_type), esc(task.task_id), badge(task.status), esc(task.findings), esc(task.comments), `<span class="wrap">${esc(task.error || "-")}</span>`])).join("") : empty(6)}</tbody></table></section>
+        <section class="panel"><div class="panel-header"><div class="panel-title">任务</div></div><table><thead><tr><th>类型</th><th>ID</th><th>状态</th><th>问题</th><th>错误</th></tr></thead><tbody>${detail.tasks.length ? detail.tasks.map((task) => row([esc(task.task_type), esc(task.task_id), badge(task.status), esc(task.findings), `<span class="wrap">${esc(task.error || "-")}</span>`])).join("") : empty(5)}</tbody></table></section>
         <section class="panel"><div class="panel-header"><div class="panel-title">问题</div></div><table><thead><tr><th>级别</th><th>路径</th><th>标题</th><th>消息</th></tr></thead><tbody>${detail.findings.length ? detail.findings.map((finding) => row([severityBadge(finding.severity), `${esc(finding.path)}${finding.new_line ? `:${esc(finding.new_line)}` : ""}`, esc(finding.title), `<span class="wrap">${esc(finding.message)}</span>`])).join("") : empty(4)}</tbody></table></section>
-        <section class="panel"><div class="panel-header"><div class="panel-title">评论</div></div><table><thead><tr><th>规则</th><th>路径</th><th>Discussion</th><th>Note</th></tr></thead><tbody>${detail.comments.length ? detail.comments.map((comment) => row([esc(comment.rule_id), `${esc(comment.path)}${comment.new_line ? `:${esc(comment.new_line)}` : ""}`, esc(comment.discussion_id || "-"), esc(comment.note_id || "-")])).join("") : empty(4)}</tbody></table></section>
       </div>`;
       $("backToRuns").addEventListener("click", () => setView("runs"));
     }
@@ -420,5 +404,15 @@ mod tests {
         assert!(DASHBOARD_HTML.contains("fmtClockTime(new Date())"));
         assert!(!DASHBOARD_HTML.contains("UTC --"));
         assert!(!DASHBOARD_HTML.contains("Dashboard</div>"));
+    }
+
+    #[test]
+    fn dashboard_shell_keeps_findings_without_comments_ui() {
+        assert!(DASHBOARD_HTML.contains(r#"data-view="findings""#));
+        assert!(DASHBOARD_HTML.contains("问题"));
+        assert!(!DASHBOARD_HTML.contains(r#"data-view="comments""#));
+        assert!(!DASHBOARD_HTML.contains("renderCommentsPage"));
+        assert!(!DASHBOARD_HTML.contains("/api/comments"));
+        assert!(!DASHBOARD_HTML.contains("评论"));
     }
 }
