@@ -1,5 +1,7 @@
 # AI Review Design
 
+> Historical design note: this document records the original AI Review implementation plan. It is not the current behavior contract. The current service is manual MR comment-triggered; see `docs/design.md` and `docs/gitlab-webhook.md`.
+
 ## Goal
 
 Add native AI-powered merge request review to GitLabWorkRunner while preserving the existing rule, script task, GitLab comment, and deduplication model.

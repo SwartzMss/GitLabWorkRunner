@@ -1,156 +1,167 @@
-# GitLab MR 自动 Review 服务设计
+# GitLab MR Manual Review Service Design
 
-## 目标
+## Goal
 
-用 Rust 实现一个 GitLab 专用的 Merge Request 自动 Review 服务。第一版不做通用 CI Runner，也不复刻完整 reviewdog CLI，而是先跑通一个稳定闭环：
+GitLabWorkRunner is a GitLab-specific Merge Request review service. It receives GitLab webhooks, runs explicitly configured review tasks when a user requests them from an MR comment, and publishes findings back to GitLab MR Discussions.
 
-1. GitLab Webhook 触发 MR review。
-2. 服务校验事件并做去重。
-3. 通过 GitLab API 获取 MR diff。
-4. 解析 diff，建立文件、hunk、行号映射。
-5. 执行配置文件定义的 AI Review 和可选脚本任务。
-6. 在 GitLab MR Discussion 中发布行级或 MR 级评论。
-7. 记录已处理 commit、评论 note id 和 MR 状态，避免重复评论。
+The current service is comment-driven. Merge request events are accepted for visibility and webhook testing, but they are ignored with reason `merge_request_events_manual_triggers_only`; they do not enter the review queue.
 
-## 非目标
+The review loop is:
 
-第一版不实现以下能力：
+1. Receive a GitLab MR note event containing a standalone `@id`.
+2. Validate the webhook token.
+3. Resolve the requested `[[ai_reviews]]` and `[[script_tasks]]` entries by exact id.
+4. Guard against duplicate in-flight work for `project_id + mr_iid + commit_sha`.
+5. Fetch MR changes through the GitLab API.
+6. Parse the diff and map added lines.
+7. Run the selected AI reviews and optional script tasks.
+8. Publish line-level or MR-level comments.
+9. Store review runs, task runs, findings, and published comments in SQLite.
 
-- 不实现完整 GitLab Runner 协议。
-- 不自动执行用户仓库中的 CI 脚本；只执行 `rules.toml` 显式配置的脚本任务。
-- 不支持 GitHub、Bitbucket、Gitea 等其他平台。
-- 不兼容 reviewdog 的所有输入格式、reporter 和 linter adapter。
-- 不做容器沙箱、任务隔离、分布式调度。
-- 不提供通用 LLM 插件系统；当前只通过 `[[ai_reviews]]` 支持 OpenAI-compatible AI Review。
+## Non-Goals
 
-## 推荐方案
+- It is not a GitLab Runner replacement.
+- It does not automatically execute CI scripts from the target repository.
+- It does not support GitHub, Bitbucket, Gitea, or other review platforms.
+- It does not implement a container sandbox or distributed scheduler.
+- It does not provide a general LLM plugin system; AI review currently uses OpenAI-compatible Chat Completions.
 
-采用“Webhook 实时触发 + GitLab API 获取 Diff + SQLite 状态存储 + 配置化 Review 任务 + GitLab MR Discussion 输出”的服务化架构。
-
-这个方案比直接做插件系统更可控。AI Review 和脚本任务都放在 `rules.toml` 中：AI Review 调用 OpenAI-compatible API；复杂检查可以通过独立的 `script_tasks` 下载 MR head 快照后执行。脚本任务默认可以保持 `auto_enabled = false`，后续需要时再启用或手动触发。
-
-## 系统架构
+## Architecture
 
 ```text
-GitLab Merge Request / MR Note Event
+GitLab MR Note Event
   -> Webhook Server
-  -> Event Scheduler / Deduplicator
+  -> Manual Command Selector
+  -> Active Review Guard
   -> GitLab API Client
-  -> Diff Fetcher
   -> Diff Parser
   -> Review Engine
   -> Comment Builder
   -> GitLab Discussion Publisher
-  -> State Store
+  -> SQLite Store
 ```
 
-## 模块设计
-
-### Webhook Server
-
-职责：
-
-- 暴露 HTTP endpoint，例如 `POST /webhooks/gitlab`。
-- 校验 `X-Gitlab-Token`。
-- 接受 Merge Request event 和 MR comment note event。
-- 从 MR event payload 中提取 `project_id`、`merge_request.iid`、source branch、target branch、last commit sha、event action。
-- 从 MR note event payload 中提取 `project_id`、`merge_request.iid`、note id、note 内容和 last commit sha。
-- 返回快速响应，不在 HTTP 请求中长时间执行 review。
-
-第一版可以同步执行 review，但代码边界上要保留异步任务调度入口，便于后续接入队列。
-
-### Event Scheduler / Deduplicator
-
-职责：
-
-- 判断当前 MR commit 是否已经处理。
-- 对同一个 `project_id + mr_iid + commit_sha` 保证幂等。
-- 对单进程内运行中的 review run 做全局并发限制。
-- 支持可选轮询补偿任务，后续用于处理 Webhook 漏事件。
-
-第一版去重标准：
+Merge request events follow a shorter path:
 
 ```text
-project_id + mr_iid + commit_sha + ruleset_hash
+GitLab Merge Request Event
+  -> Webhook Server
+  -> ignored: merge_request_events_manual_triggers_only
 ```
 
-加入 `ruleset_hash` 是为了规则变更后可以重新 review 同一个 commit。
+## Webhook Server
 
-### GitLab API Client
+Responsibilities:
 
-职责：
+- Expose `POST /webhooks/gitlab`.
+- Validate `X-Gitlab-Token` against `[server].webhook_secret`.
+- Parse MR note events and merge request events.
+- For MR events, log project/MR/commit context and return ignored.
+- For MR note events, extract `project_id`, `mr_iid`, note id, note text, and current commit sha.
+- Return quickly while review work runs in the background.
 
-- 封装 GitLab REST API。
-- 获取 MR changes 或 diff refs。
-- 创建 MR discussion。
-- 更新标签或 MR 状态信息时保留扩展入口。
+GitLab 14.5 note payloads may omit `object_attributes.action`; missing action is treated as `create`. Explicit non-create note actions are ignored.
 
-第一版需要的 API：
+## Manual Command Selection
 
-- `GET /projects/:id/merge_requests/:merge_request_iid/changes`
-- `POST /projects/:id/merge_requests/:merge_request_iid/discussions`
+Manual commands are standalone tokens in MR comments:
 
-认证方式：
-
-- 使用 `config.toml` 中的 `[gitlab].token`。
-- token 需要 `api` scope。
-
-### Diff Fetcher
-
-职责：
-
-- 从 GitLab API 返回的 MR changes 中提取每个文件的 diff。
-- 记录 `old_path`、`new_path`、`new_file`、`renamed_file`、`deleted_file`。
-- 将 GitLab 返回结构转换成内部统一 diff model。
-
-第一版只处理文本 diff。二进制文件、删除文件可以跳过并记录日志。
-
-### Diff Parser
-
-职责：
-
-- 解析 unified diff。
-- 建立 hunk 和行号映射。
-- 支持定位新增行，用于发布 GitLab 行级评论。
-
-核心数据结构：
-
-```rust
-struct DiffFile {
-    old_path: String,
-    new_path: String,
-    hunks: Vec<DiffHunk>,
-}
-
-struct DiffHunk {
-    old_start: u32,
-    old_lines: u32,
-    new_start: u32,
-    new_lines: u32,
-    lines: Vec<DiffLine>,
-}
-
-struct DiffLine {
-    kind: DiffLineKind,
-    old_line: Option<u32>,
-    new_line: Option<u32>,
-    content: String,
-}
-
-enum DiffLineKind {
-    Context,
-    Added,
-    Removed,
-}
+```text
+@ai-review
+@check-todo-tbd
 ```
 
-AI Review 和脚本任务只对当前 MR diff 中能够定位的新增行发布行级评论，避免对历史代码产生噪音。
+Selection rules:
 
-### Review Finding
+- `@id` matches `[[ai_reviews]].id` and `[[script_tasks]].id`.
+- Unknown ids are ignored.
+- Issue, wiki, work item, and other non-MR comments are ignored.
+- A single comment may request multiple configured tasks.
+- The same commit can be triggered again after the current run finishes.
 
-AI Review 和脚本任务都会转换成统一的 finding：
+The current implementation does not perform an additional GitLab role check for the comment author. Any user who can comment on the MR and knows a configured `@id` can request that task.
 
-匹配结果结构：
+## Active Review Guard
+
+The service keeps an in-process active key:
+
+```text
+project_id + mr_iid + commit_sha
+```
+
+If the same key is already running, the new request is skipped. For MR note triggers, the service adds an `eyes` emoji to the triggering note and posts an MR-level comment telling the user that the current commit is already being reviewed.
+
+`[server].max_concurrent_reviews` limits total in-process review runs. When the limit is reached, the new request is skipped and the MR receives a queue-busy comment.
+
+The guard is process-local. Multi-instance deployments need a shared lock in SQLite/PostgreSQL or another coordination layer.
+
+## GitLab API Client
+
+Required GitLab REST API calls:
+
+```text
+GET /projects/:id/merge_requests/:merge_request_iid/changes
+GET /projects/:id/repository/archive.zip
+POST /projects/:id/merge_requests/:merge_request_iid/discussions
+```
+
+The service uses `[gitlab].token`, not the webhook secret, for API calls. The token needs `api` scope and permission to read MR diffs, download repository archives, and publish MR discussions.
+
+## Diff Parser
+
+The parser reads GitLab MR diffs and builds mappings for changed files, hunks, and added lines. Review findings are only published as line-level comments when they point to an added line in the current MR diff. Findings that cannot be positioned are published as MR-level summaries when appropriate.
+
+## AI Review
+
+AI reviews are configured with `[[ai_reviews]]` in `rules.toml`.
+
+The runner sends MR diff content to an OpenAI-compatible `POST /chat/completions` endpoint. It requests structured `tool_calls` output through `submit_review_findings` and falls back to parsing JSON from assistant content when needed.
+
+Optional read-only context tools can be enabled under `[ai_review.context_tools]`:
+
+- `read_file(path)`
+- `search_code(query, glob?)`
+- `list_files(glob?)`
+
+When these tools are enabled, the service downloads the MR head archive and exposes only repository-local text content. It does not execute shell commands and rejects or skips unsafe paths such as `.env`, `.git`, absolute paths, and `..` traversal.
+
+## Script Tasks
+
+Script tasks are configured with `[[script_tasks]]`. They are optional and are triggered manually by their `@id`.
+
+Example:
+
+```toml
+[[script_tasks]]
+id = "check-todo-tbd"
+title = "TODO/TBD marker check"
+command = "python examples/scripts/check_todo_tbd.py"
+timeout_seconds = 30
+```
+
+The script receives:
+
+```text
+<MR head source directory> <result.txt path>
+```
+
+Exit behavior:
+
+- `exit 0`: check passed.
+- `exit 1`: findings were written to `result.txt`; the service reads them and publishes comments.
+- Other exit codes, missing exit status, or timeout: task failure; the service keeps logs and does not publish task findings.
+
+Recommended `result.txt` line format:
+
+```text
+src/config.rs:5: //TODO aa
+```
+
+Script commands run from the runner executable directory, not from the target repository.
+
+## Comment Builder
+
+Findings are normalized into a common shape:
 
 ```rust
 struct Finding {
@@ -163,171 +174,33 @@ struct Finding {
 }
 ```
 
-### Script Task Runner
+The comment builder groups multiple findings on the same file and line, adds stable hidden markers, and falls back to MR-level comments when GitLab cannot position a line-level discussion.
 
-职责：
+## SQLite Store
 
-- 读取 `rules.toml` 中的 `[[script_tasks]]`。
-- 自动触发时，只选择 `auto_enabled = true` 且匹配 `when_changed` 的任务。
-- 手动触发时，根据 MR 评论中的 `@task_id` 精确选择任务，允许执行 `auto_enabled = false` 的任务，并忽略 `when_changed`。
-- 通过 GitLab archive API 下载 MR 当前 head commit。
-- 解压到 `work/script_tasks/<project_id>/<mr_iid>/<commit_sha>/<task_id>/source`。
-- 在 runner 可执行文件所在目录执行 `command`，相对脚本路径不绑定目标 GitLab 仓库。
-- 将 stdout 和 stderr 合并写入 `run.log`，用于查看脚本运行过程。
-- 将 `result.txt` 路径作为第二个参数传给脚本，脚本将检测结果写入该文件。
-- 由 Rust 进程控制 timeout，超时后 kill 子进程。
-- 任务完成后删除 `source/`，保留 `run.log` 和 `result.txt` 便于排查。
-- `exit 0` 表示检测通过；`exit 1` 表示检测发现问题并发布 MR 评论；其他退出码、无退出码或 timeout 表示脚本执行异常，只记录日志并保留 `run.log` / `result.txt`。
+The store records:
 
-第一版脚本任务格式：
+- review runs
+- task runs
+- findings
+- published comments
 
-```toml
-[[script_tasks]]
-auto_enabled = true
-id = "check-todo-tbd"
-title = "TODO/TBD marker check"
-command = "python examples/scripts/check_todo_tbd.py"
-timeout_seconds = 30
-when_changed = ["**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.rs"]
-```
+Timestamps are stored as RFC3339 UTC strings. The dashboard reads these tables to display summaries, run lists, findings, and audit data.
 
-字段说明：
+## Work Directory Cleanup
 
-- `auto_enabled`: 单条任务自动触发开关，默认 `true`；`false` 时仍可通过 MR 评论 `@id` 手动触发。
-- `id`: 任务唯一标识。
-- `title`: MR 评论标题。
-- `command`: 在 runner 可执行文件所在目录执行的命令；相对路径基于该目录解析。
-- `timeout_seconds`: 超时时间，默认 60 秒。
-- `when_changed`: 可选 glob 列表；为空时每个 MR 都执行。
+Downloaded archive zip bytes stay in memory and are not written to disk. When repository context is needed, the archive is extracted under `work/`:
 
-脚本输出协议：
+- AI context tools: `work/ai_review_context/.../<review_run_id>/source`
+- Script tasks: `work/script_tasks/.../<task_id>/source`
 
-- `exit 0`: 检测通过。
-- 第一个参数: MR head 代码快照根目录。
-- 第二个参数: `result.txt` 路径。
-- stdout/stderr: 运行过程日志，写入 `run.log`。
-- `result.txt`: 检测结果摘要；推荐每条结果使用 `仓库相对路径:行号:提示内容`。
-- `exit 0`: 检测通过。
-- `exit 1`: 检测发现问题，读取 `result.txt` 并发布 MR 评论。
-- 其他退出码或无退出码: 脚本执行异常，保留 `run.log` / `result.txt`，不发 MR 评论。
-- timeout: 脚本执行异常，kill 子进程，保留 `run.log` / `result.txt`，不发 MR 评论。
+After completion or failure, AI Review deletes the current context run directory. Script tasks delete `source` but keep `run.log` and `result.txt`.
 
-行级结果格式示例：
+The service cleans stale work directories older than 24 hours on startup and repeats cleanup hourly while running. Cleanup failures are logged as warnings and do not block reviews.
 
-```text
-src/config.rs:5: //TODO aa
-```
+## Configuration
 
-服务会按 `path:line:message` 解析每一行，路径会按 GitLab diff 路径处理。能解析且当前 MR diff refs 完整时，发布到对应代码行；无法解析时，发布一条 MR 级汇总评论。自动 MR Review 在 GitLab 返回的 diff refs 不完整时会整体跳过，并发布一条 MR 级跳过提示，因此不会继续执行自动脚本任务；手动触发脚本任务在 diff refs 不完整但 archive 可下载时仍会执行，发现问题后以 MR 级汇总评论发布。第一版不提供 Python helper，也不要求 JSON 输出。
-
-手动触发规则：
-
-- GitLab Webhook 需要开启 `Comments`。
-- 只处理 MR comment event，不处理 issue、wiki、work item comment。
-- 评论正文中出现独立 token `@task_id` 时触发对应 `script_tasks.id`。
-- 评论正文中出现独立 token `@ai_review_id` 时触发对应 `ai_reviews.id`。
-- 手动触发不写入自动 review 去重记录；用户每发一次合法命令，服务都会执行一次。
-- 如果 `@task_id` 不存在，服务只记录日志，不发布额外评论。
-
-### Comment Builder
-
-职责：
-
-- 将 finding 转换成 GitLab 评论正文。
-- 对同一个文件同一行多个 finding 做合并。
-- 为评论加入稳定标记，方便识别服务自己发过的评论。
-
-评论正文示例：
-
-```markdown
-**[警告] AI finding**
-
-Review finding.
-
-<!-- gitlab-work-runner:rule=ai:ai-review -->
-```
-
-### GitLab Discussion Publisher
-
-职责：
-
-- 优先发布行级 discussion。
-- 当 GitLab position 无法定位时，降级为 MR 级普通评论。
-- 记录 GitLab 返回的 discussion id 和 note id。
-
-第一版行级评论需要依赖 GitLab position 参数，包括：
-
-- `base_sha`
-- `start_sha`
-- `head_sha`
-- `old_path`
-- `new_path`
-- `new_line`
-
-这些字段来自 MR diff refs 和 diff parser 的行号映射。
-
-### Review Notifier
-
-职责：
-
-- 统一封装后台 review 运行态通知。
-- 给手动触发评论追加确认 emoji。
-- 发布重复运行、队列繁忙、review 失败等 MR 级状态评论。
-- 统一维护状态评论正文和隐藏 marker，避免通知逻辑散落在 Webhook Server 或 Review Service 中。
-
-### State Store
-
-职责：
-
-- 记录已处理 MR commit。
-- 记录已发布评论。
-- 支持任务幂等和后续清理。
-
-第一版使用 SQLite，后续可以抽象到 PostgreSQL。
-
-核心表：
-
-```sql
-create table processed_reviews (
-    id integer primary key autoincrement,
-    project_id integer not null,
-    mr_iid integer not null,
-    commit_sha text not null,
-    ruleset_hash text not null,
-    status text not null,
-    created_at text not null,
-    updated_at text not null,
-    unique(project_id, mr_iid, commit_sha, ruleset_hash)
-);
-
-create table review_comments (
-    id integer primary key autoincrement,
-    project_id integer not null,
-    mr_iid integer not null,
-    commit_sha text not null,
-    ruleset_hash text not null,
-    rule_id text not null,
-    path text not null,
-    new_line integer,
-    discussion_id text,
-    note_id integer,
-    created_at text not null
-);
-```
-
-### Work Directory Cleanup
-
-GitLab archive zip 只保存在内存中，不落盘保存。需要仓库上下文时，服务会把 archive 解压到 `work/`：
-
-- AI context tools 解压到 `work/ai_review_context/.../<review_run_id>/source`，review 完成或失败后删除本次 context run 目录。
-- 脚本任务解压到 `work/script_tasks/.../<task_id>/source`，任务结束后删除 `source`，保留 `run.log` 和 `result.txt` 便于排查。
-- AI context tool 调用日志记录工具名、参数摘要、返回 bytes、结果截断状态、调用上限状态、batch index/count 和累计 tool call 次数，用于判断模型是否实际调用内置上下文工具。
-
-进程启动时会清理一次超过 24 小时的残留目录，运行中每小时再清理一次。清理失败只记录 WARN，不阻断 review。当前运行中去重和清理都是单进程内防护；多实例部署时需要把运行中锁迁移到 SQLite/PostgreSQL。
-
-## 配置设计
-
-服务配置使用 `config.toml`：
+Service configuration lives in `config.toml`:
 
 ```toml
 [server]
@@ -345,80 +218,52 @@ database_url = "sqlite://gitlab-work-runner.db"
 [rules]
 file = "rules.toml"
 
-[logging]
-file = "logs/gitlab-work-runner.log"
-max_bytes = 10485760
-max_files = 5
+[dashboard]
+bind = "127.0.0.1:8082"
 
 [archive]
-max_archive_bytes = 104857600      # 100 MiB
-max_extracted_files = 10000        # 10,000 files
-max_extracted_bytes = 209715200    # 200 MiB
-max_single_file_bytes = 10485760   # 10 MiB
-max_entry_path_bytes = 512         # 512 bytes
+max_archive_bytes = 104857600
+max_extracted_files = 10000
+max_extracted_bytes = 209715200
+max_single_file_bytes = 10485760
+max_entry_path_bytes = 512
 ```
 
-Review 配置使用 `rules.toml`。当前支持两类配置：`[[ai_reviews]]` 调用 OpenAI-compatible API、`[[script_tasks]]` 下载 MR head 快照后执行外部脚本。脚本任务使用同一个 `rules.toml`，但作为独立任务执行；它的输出也会转换成统一 Finding 后发布。
+Review configuration lives in `rules.toml`; see `rules.example.toml` for a complete example.
 
-## 错误处理
+## Error Handling
 
-- Webhook token 不匹配：返回 `401 Unauthorized`。
-- 非 MR event：返回 `202 Accepted` 并忽略。
-- payload 缺少关键字段：返回 `400 Bad Request`。
-- GitLab API 失败：记录错误日志，当前 webhook 请求返回 `500 Internal Server Error`；不会写入已处理状态。
-- GitLab diff refs 不完整：自动 MR Review 发布 MR 级跳过提示并标记为 skipped；手动 AI Review 跳过；手动脚本任务仍可执行，但发现问题时只能发布 MR 级汇总评论。
-- diff 解析失败：当前 review 失败并返回 `500 Internal Server Error`。
-- 评论发布失败：当前 review 失败并返回 `500 Internal Server Error`，错误原因写入日志。
-- 后台 review run 不可恢复失败：发布一条 MR 级失败通知，包含 `commit`、`review_run_id` 和截断错误摘要；失败通知发送失败只记录 WARN。
-- 单个 AI review 子任务失败但其它任务可继续：记录失败的 `ai_review.id/title`，在本次 run 结束前发布 MR 级“部分 AI Review 失败”汇总评论，包含 `commit`、`review_run_id` 和查看 runner 日志的提示。
-- 全局 review 并发达到 `[server].max_concurrent_reviews`：返回 `202 Accepted` 并跳过本次 review；发布 MR 级队列繁忙提示，MR 评论触发时额外给触发评论加 `eyes`。
-- archive 下载或解压超过 `[archive]` 硬限制：停止下载或解压，当前 review 失败并走 MR 级失败通知。
-- 重复事件：返回 `202 Accepted`，不重复评论。
-- 日志文件超过大小限制：轮转当前日志文件，并最多保留配置数量的历史文件。
-- 脚本任务超时：kill 子进程，保留 `run.log` / `result.txt`，不发布 MR 评论。
+- Invalid webhook token: `401 Unauthorized`.
+- Unsupported or irrelevant event: accepted and ignored.
+- MR event: accepted and ignored with `merge_request_events_manual_triggers_only`.
+- Missing required payload fields: `400 Bad Request`.
+- Duplicate in-flight commit: skipped with an MR-level status comment for note triggers.
+- Queue busy: skipped with an MR-level queue-busy comment.
+- GitLab API failure, archive limit failure, diff processing failure, or internal fatal error: review run fails and posts an MR-level failure comment when possible.
+- Single AI review failure while other tasks can continue: a partial failure summary is posted before the run finishes.
 
-## 测试策略
+## Dashboard
 
-第一版需要覆盖：
-
-- GitLab webhook payload 解析。
-- token 校验。
-- 去重 key 生成。
-- unified diff parser 的新增行、删除行、上下文行号映射。
-- rules.toml 解析、AI Review 配置选择和脚本任务选择。
-- AI Review 配置解析、自动/手动选择、OpenAI-compatible 响应解析和新增行过滤。
-- finding 到 GitLab discussion payload 的转换。
-- script task 的 archive 下载、解压、输出文件和 timeout 处理。
-- SQLite 状态写入和重复处理。
-
-集成测试可以使用 mock GitLab API server，验证完整流程：
+The dashboard is a separate binary. It reads the same SQLite database and exposes:
 
 ```text
-Webhook payload -> diff fixture -> AI finding -> discussion API request -> state store
+GET /api/summary
+GET /api/finding-summary
+GET /api/runs
+GET /api/runs/<review_run_id>
+GET /api/projects
+GET /api/merge-requests
+GET /api/findings
+GET /api/comments
 ```
 
-## 第一版交付边界
+The dashboard does not run migrations; start the runner once first when using a new database.
 
-第一版完成后，应能做到：
+## Future Work
 
-1. 本地启动 HTTP 服务。
-2. 配置 GitLab webhook。
-3. MR 更新后自动触发 review。
-4. 服务拉取 MR diff。
-5. 根据 `rules.toml` 执行 AI Review 和可选脚本任务。
-6. 在 MR 中发布行级评论。
-7. 对同一 commit 和同一规则集不重复评论。
-8. 将完整 Review 流程写入 stdout 和日志文件，并按大小轮转日志文件。
-9. 可选执行 `ai_reviews`；AI 返回的 finding 只发布到当前 MR diff 的新增行。
-10. 可选执行 `script_tasks`；`exit 1` 发布脚本结果评论，执行异常或超时时只记录日志并保留 `run.log` / `result.txt`。
-
-## 后续扩展
-
-- 支持更多 AI Review API 适配方式。
-- 支持更完整的 MR 级汇总评论。
-- 支持 Redis / PostgreSQL。
-- 支持任务队列和并发 worker。
-- 支持定时轮询补偿。
-- 支持删除或 resolve 旧评论。
-- 支持更完整的 reviewdog diff 兼容层。
-- 支持脚本任务 JSON 输出协议和更精细的结果定位。
+- Shared active-review locks for multi-instance deployments.
+- Optional polling compensation for missed webhooks.
+- More AI provider adapters.
+- Richer MR-level summaries.
+- More structured script task output formats.
+- Permission checks or allowlists for manual command users.
