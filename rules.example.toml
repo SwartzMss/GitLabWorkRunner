@@ -6,7 +6,7 @@
 # system_prompt = "You are a careful code reviewer. Return only high-confidence bugs."
 extra_instructions = """
 重点关注编译错误、运行时错误、资源生命周期、线程安全和安全漏洞。
-不要报告风格建议、命名建议或不确定的问题。
+不要报告风格建议、命名建议、頭文件依賴或不确定的问题。
 """
 # Built-in read-only context tools are disabled by default. Enable them when the model may need
 # repository context beyond the diff. The runner controls call count and result size.
