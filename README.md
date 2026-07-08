@@ -218,9 +218,9 @@ max_tool_calls = 30
 max_tool_result_bytes = 60000
 
 [ai_review.context_tools]
-read_file = false
-search_code = false
-list_files = false
+read_file = true
+search_code = true
+list_files = true
 
 [[ai_reviews]]
 id = "ai-review"
