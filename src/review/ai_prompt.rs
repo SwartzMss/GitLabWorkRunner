@@ -8,14 +8,16 @@ const SYSTEM_PROMPT: &str = "You are a concise code reviewer. Review only added 
 pub(crate) fn build_review_prompt(
     config: &AiReviewConfig,
     changes: &[GitLabChange],
+    review_request: Option<&str>,
 ) -> (String, usize, bool) {
-    build_review_prompt_with_limit(config, changes, config.max_diff_bytes)
+    build_review_prompt_with_limit(config, changes, config.max_diff_bytes, review_request)
 }
 
 pub(crate) fn build_review_prompt_with_limit(
     config: &AiReviewConfig,
     changes: &[GitLabChange],
     max_diff_bytes: usize,
+    review_request: Option<&str>,
 ) -> (String, usize, bool) {
     let (diff_text, truncated) = limited_diff_payload(changes, max_diff_bytes);
     let diff_payload_bytes = diff_text.len();
@@ -32,8 +34,14 @@ pub(crate) fn build_review_prompt_with_limit(
     } else {
         format!("\n\n额外审查要求：\n{extra_instructions}")
     };
+    let review_request = review_request.unwrap_or("").trim();
+    let review_request = if review_request.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n本次触发说明：\n{review_request}")
+    };
     let prompt = format!(
-        "请用中文审查这个 GitLab Merge Request diff。只报告高置信度错误，例如会导致编译失败、运行时错误、数据损坏、安全漏洞或明显错误逻辑的问题。不要报告风格建议、可维护性建议、命名问题、性能微优化或不确定的问题。{response_instruction}severity 必须固定为 \"error\"。只能使用 diff 新增行的行号。{context_tool_instruction}{extra_instructions}{truncated_note}\n\n{diff_text}",
+        "请用中文审查这个 GitLab Merge Request diff。只报告高置信度错误，例如会导致编译失败、运行时错误、数据损坏、安全漏洞或明显错误逻辑的问题。不要报告风格建议、可维护性建议、命名问题、性能微优化或不确定的问题。{response_instruction}severity 必须固定为 \"error\"。只能使用 diff 新增行的行号。{context_tool_instruction}{extra_instructions}{review_request}{truncated_note}\n\n{diff_text}",
     );
     (prompt, diff_payload_bytes, truncated)
 }

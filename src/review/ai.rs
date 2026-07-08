@@ -35,18 +35,27 @@ pub async fn run_ai_review(
     config: &AiReviewConfig,
     changes: &[GitLabChange],
 ) -> AppResult<Vec<Finding>> {
-    run_ai_review_with_context(config, changes, None).await
+    run_ai_review_with_context(config, changes, None, None).await
 }
 
 pub async fn run_ai_review_with_context(
     config: &AiReviewConfig,
     changes: &[GitLabChange],
     source_dir: Option<&Path>,
+    review_request: Option<&str>,
 ) -> AppResult<Vec<Finding>> {
     if config.batch_review {
-        return run_batched_ai_review(config, changes, source_dir).await;
+        return run_batched_ai_review(config, changes, source_dir, review_request).await;
     }
-    run_ai_review_single(config, changes, config.max_diff_bytes, None, source_dir).await
+    run_ai_review_single(
+        config,
+        changes,
+        config.max_diff_bytes,
+        None,
+        source_dir,
+        review_request,
+    )
+    .await
 }
 
 async fn run_ai_review_single(
@@ -55,6 +64,7 @@ async fn run_ai_review_single(
     max_diff_bytes: usize,
     batch: Option<(usize, usize)>,
     source_dir: Option<&Path>,
+    review_request: Option<&str>,
 ) -> AppResult<Vec<Finding>> {
     let api_key = config.api_key.trim();
     if api_key.is_empty() {
@@ -64,7 +74,7 @@ async fn run_ai_review_single(
         )));
     }
     let (prompt, diff_payload_bytes, diff_payload_truncated) =
-        build_review_prompt_with_limit(config, changes, max_diff_bytes);
+        build_review_prompt_with_limit(config, changes, max_diff_bytes, review_request);
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
     let request_timeout_seconds = effective_request_timeout_seconds(config);
     let request_timeout = Duration::from_secs(request_timeout_seconds);
@@ -267,6 +277,7 @@ async fn run_batched_ai_review(
     config: &AiReviewConfig,
     changes: &[GitLabChange],
     source_dir: Option<&Path>,
+    review_request: Option<&str>,
 ) -> AppResult<Vec<Finding>> {
     let batches = split_ai_review_batches(
         changes,
@@ -292,6 +303,7 @@ async fn run_batched_ai_review(
             config.max_batch_diff_bytes.max(1),
             Some((batch_index, batch_count)),
             source_dir,
+            review_request,
         )
         .await?;
         all_findings.append(&mut findings);
@@ -530,26 +542,100 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
         }
 
         let request_body = serialize_review_request_body(config, messages, true)?;
-        let response = tokio::time::timeout(
-            request_guard_timeout,
-            perform_ai_review_http_attempt(
-                client,
-                config,
-                url,
-                api_key,
-                request_body,
-                attempt,
-                request_timeout,
-            ),
-        )
-        .await
-        .map_err(|_| {
-            AppError::AiReview(format!(
-                "AI review {} timed out after {} seconds",
-                config.id,
-                request_timeout.as_secs()
-            ))
-        })??;
+        let mut last_error = None;
+        let mut response = None;
+        for followup_attempt in 1..=AI_HTTP_ATTEMPTS {
+            let followup_response = tokio::time::timeout(
+                request_guard_timeout,
+                perform_ai_review_http_attempt(
+                    client,
+                    config,
+                    url,
+                    api_key,
+                    request_body.clone(),
+                    followup_attempt,
+                    request_timeout,
+                ),
+            )
+            .await;
+            match followup_response {
+                Ok(Ok(current_response)) => {
+                    if !(200..300).contains(&current_response.status) {
+                        let response_body_preview =
+                            preview_log_text(&current_response.body, AI_RESPONSE_PREVIEW_CHARS);
+                        if followup_attempt < AI_HTTP_ATTEMPTS
+                            && is_retryable_ai_http_response(
+                                current_response.status,
+                                &response_body_preview,
+                            )
+                        {
+                            let err = AppError::AiReview(format!(
+                                "AI review API returned retryable HTTP status {}: {}",
+                                current_response.status, response_body_preview
+                            ));
+                            warn!(
+                                ai_review_id = %config.id,
+                                model = %config.model,
+                                attempt,
+                                followup_attempt,
+                                status = current_response.status,
+                                error = %err,
+                                "AI review context follow-up request failed, retrying"
+                            );
+                            last_error = Some(err);
+                            continue;
+                        }
+                    }
+                    response = Some(current_response);
+                    break;
+                }
+                Ok(Err(err)) => {
+                    let retryable =
+                        followup_attempt < AI_HTTP_ATTEMPTS && is_retryable_ai_error(&err);
+                    if retryable {
+                        warn!(
+                            ai_review_id = %config.id,
+                            model = %config.model,
+                            attempt,
+                            followup_attempt,
+                            error = %err,
+                            "AI review context follow-up request failed, retrying"
+                        );
+                        last_error = Some(err);
+                        continue;
+                    }
+                    return Err(err);
+                }
+                Err(_) => {
+                    let err = AppError::AiReview(format!(
+                        "AI review {} timed out after {} seconds",
+                        config.id,
+                        request_timeout.as_secs()
+                    ));
+                    if followup_attempt < AI_HTTP_ATTEMPTS {
+                        warn!(
+                            ai_review_id = %config.id,
+                            model = %config.model,
+                            attempt,
+                            followup_attempt,
+                            timeout_seconds = request_guard_timeout.as_secs(),
+                            "AI review context follow-up request timed out, retrying"
+                        );
+                        last_error = Some(err);
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        let response = response.ok_or_else(|| {
+            last_error.unwrap_or_else(|| {
+                AppError::AiReview(format!(
+                    "AI review {} context follow-up request failed without an explicit error",
+                    config.id
+                ))
+            })
+        })?;
         if !(200..300).contains(&response.status) {
             return Err(AppError::AiReview(format!(
                 "AI review API returned HTTP status {}: {}",
@@ -1084,7 +1170,7 @@ mod tests {
             diff: "@@ -1 +1 @@\n+panic!();\n".into(),
         }];
 
-        let (prompt, _, _) = build_review_prompt(&config, &changes);
+        let (prompt, _, _) = build_review_prompt(&config, &changes, None);
 
         assert!(prompt.contains("submit_review_findings"));
         assert!(prompt.contains("不要把最终结果只写在 reasoning_content"));
@@ -1106,13 +1192,32 @@ mod tests {
             diff: "@@ -1 +1 @@\n+panic!();\n".into(),
         }];
 
-        let (prompt, _, _) = build_review_prompt(&config, &changes);
+        let (prompt, _, _) = build_review_prompt(&config, &changes, None);
         let messages = initial_chat_messages(&config, &prompt);
         let body = serialize_review_request_body(&config, &messages, true).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
 
         assert!(prompt.contains("Focus on C++ lifetime bugs."));
         assert_eq!(json["messages"][0]["content"], "Custom system prompt");
+    }
+
+    #[test]
+    fn prompt_includes_manual_review_request() {
+        let config = test_ai_review_config();
+        let changes = vec![GitLabChange {
+            old_path: "src/lib.rs".into(),
+            new_path: "src/lib.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "@@ -1 +1 @@\n+panic!();\n".into(),
+        }];
+
+        let (prompt, _, _) =
+            build_review_prompt(&config, &changes, Some("重点关注 parser 这段边界条件"));
+
+        assert!(prompt.contains("本次触发说明"));
+        assert!(prompt.contains("重点关注 parser 这段边界条件"));
     }
 
     #[test]
@@ -1134,7 +1239,7 @@ mod tests {
             diff: "@@ -1 +1 @@\n+panic!();\n".into(),
         }];
 
-        let (prompt, _, _) = build_review_prompt(&config, &changes);
+        let (prompt, _, _) = build_review_prompt(&config, &changes, None);
 
         assert!(prompt.contains("上下文工具已启用"));
         assert!(prompt.contains("list_files/search_code"));
@@ -1154,7 +1259,7 @@ mod tests {
             diff: "@@ -1 +1 @@\n+panic!();\n".into(),
         }];
 
-        let (prompt, _, _) = build_review_prompt(&config, &changes);
+        let (prompt, _, _) = build_review_prompt(&config, &changes, None);
         let messages = initial_chat_messages(&config, &prompt);
         let body = serialize_review_request_body(&config, &messages, true).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
@@ -1395,6 +1500,89 @@ mod tests {
         assert_eq!(request_count.load(Ordering::SeqCst), 2);
         assert_eq!(tool_message_count.load(Ordering::SeqCst), 2);
         assert_eq!(limit_result_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn retries_retryable_tool_loop_http_response_once_before_succeeding() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let tool_message_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_server = Arc::clone(&request_count);
+        let tool_message_count_for_server = Arc::clone(&tool_message_count);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request_count = Arc::clone(&request_count_for_server);
+                let tool_message_count = Arc::clone(&tool_message_count_for_server);
+                tokio::spawn(async move {
+                    let request_index = request_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    let request = read_http_json_request(&mut stream).await;
+                    let (status, body) = match request_index {
+                        1 => (
+                            "200 OK",
+                            r#"{"choices":[{"message":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"search_code","arguments":"{\"query\":\"panic\"}"}}]}}]}"#
+                                .as_bytes()
+                                .to_vec(),
+                        ),
+                        2 => {
+                            let messages = request["messages"].as_array().unwrap();
+                            let tool_messages = messages
+                                .iter()
+                                .filter(|message| message["role"] == "tool")
+                                .count();
+                            tool_message_count.store(tool_messages, Ordering::SeqCst);
+                            ("504 Gateway Time-out", b"gateway timeout".to_vec())
+                        }
+                        3 => {
+                            let messages = request["messages"].as_array().unwrap();
+                            let tool_messages = messages
+                                .iter()
+                                .filter(|message| message["role"] == "tool")
+                                .count();
+                            tool_message_count.store(tool_messages, Ordering::SeqCst);
+                            (
+                                "200 OK",
+                                r#"{"choices":[{"message":{"tool_calls":[{"id":"submit_1","type":"function","function":{"name":"submit_review_findings","arguments":"{\"findings\":[]}"}}]}}]}"#
+                                    .as_bytes()
+                                    .to_vec(),
+                            )
+                        }
+                        other => panic!("unexpected request {other}"),
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    stream.write_all(&body).await.unwrap();
+                });
+            }
+        });
+
+        let config = AiReviewConfig {
+            base_url: format!("http://{}", addr),
+            context_tools: AiReviewContextTools {
+                read_file: false,
+                search_code: true,
+                list_files: false,
+            },
+            ..test_ai_review_config()
+        };
+        let changes = vec![GitLabChange {
+            old_path: "src/lib.rs".into(),
+            new_path: "src/lib.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "@@ -1 +1 @@\n+panic!();\n".into(),
+        }];
+
+        let findings = run_ai_review(&config, &changes).await.unwrap();
+
+        assert!(findings.is_empty());
+        assert_eq!(request_count.load(Ordering::SeqCst), 3);
+        assert_eq!(tool_message_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
