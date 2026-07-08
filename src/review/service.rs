@@ -149,7 +149,8 @@ impl ReviewService {
         ai_reviews: Vec<AiReviewConfig>,
         requested_ids: Vec<String>,
     ) -> AppResult<ReviewSummary> {
-        let review_request = manual_review_request_text(&event.note, &requested_ids);
+        let selected_ids = selected_manual_ids(&tasks, &ai_reviews);
+        let review_request = manual_review_request_text(&event.note, &selected_ids);
         info!(
             project_id = event.project_id,
             mr_iid = event.mr_iid,
@@ -960,6 +961,17 @@ pub(crate) fn manual_review_request_text(text: &str, requested_ids: &[String]) -
     (!request.is_empty()).then(|| request.to_string())
 }
 
+fn selected_manual_ids(
+    tasks: &[crate::rules::ScriptTaskConfig],
+    ai_reviews: &[AiReviewConfig],
+) -> Vec<String> {
+    tasks
+        .iter()
+        .map(|task| task.id.clone())
+        .chain(ai_reviews.iter().map(|review| review.id.clone()))
+        .collect()
+}
+
 fn trim_manual_trigger_token(raw: &str) -> &str {
     raw.trim_matches(|ch: char| {
         matches!(
@@ -1092,6 +1104,18 @@ mod tests {
             manual_review_request_text("please run @ai-review, @check-script now", &requested_ids);
 
         assert_eq!(request.as_deref(), Some("please run now"));
+    }
+
+    #[test]
+    fn manual_review_request_text_preserves_non_trigger_mentions() {
+        let selected_ids = vec!["ai-review".to_string()];
+
+        let request = manual_review_request_text(
+            "@ai-review please check @decorator ordering",
+            &selected_ids,
+        );
+
+        assert_eq!(request.as_deref(), Some("please check @decorator ordering"));
     }
 
     #[test]
