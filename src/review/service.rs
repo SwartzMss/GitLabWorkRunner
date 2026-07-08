@@ -149,6 +149,7 @@ impl ReviewService {
         ai_reviews: Vec<AiReviewConfig>,
         requested_ids: Vec<String>,
     ) -> AppResult<ReviewSummary> {
+        let review_request = manual_review_request_text(&event.note, &requested_ids);
         info!(
             project_id = event.project_id,
             mr_iid = event.mr_iid,
@@ -195,7 +196,7 @@ impl ReviewService {
             target_branch: String::new(),
         };
         let ai_result = self
-            .run_selected_ai_reviews(&mr_event, &changes, ai_reviews)
+            .run_selected_ai_reviews(&mr_event, &changes, ai_reviews, review_request.as_deref())
             .await?;
         let ai_completion_comments = self
             .publish_manual_ai_review_clean_comments(&mr_event, &changes, &ai_result)
@@ -246,6 +247,7 @@ impl ReviewService {
         event: &MergeRequestEvent,
         changes: &crate::gitlab::MergeRequestChanges,
         reviews: Vec<AiReviewConfig>,
+        review_request: Option<&str>,
     ) -> AppResult<AiReviewRunSummary> {
         if reviews.is_empty() {
             info!(
@@ -284,7 +286,12 @@ impl ReviewService {
                 "AI review started"
             );
             match self
-                .run_ai_review_with_optional_clean_second_pass(&review, changes, event)
+                .run_ai_review_with_optional_clean_second_pass(
+                    &review,
+                    changes,
+                    event,
+                    review_request,
+                )
                 .await
             {
                 Ok(findings) => {
@@ -781,6 +788,7 @@ impl ReviewService {
         review: &AiReviewConfig,
         changes: &crate::gitlab::MergeRequestChanges,
         event: &MergeRequestEvent,
+        review_request: Option<&str>,
     ) -> AppResult<Vec<Finding>> {
         let context = self
             .prepare_ai_review_context(review, changes, event)
@@ -789,7 +797,7 @@ impl ReviewService {
         let findings = run_ai_review_with_deadline(
             &review.id,
             review.timeout_seconds,
-            run_ai_review_with_context(review, &changes.changes, source_dir),
+            run_ai_review_with_context(review, &changes.changes, source_dir, review_request),
         )
         .await?;
         if !review.second_pass_on_clean || !findings.is_empty() {
@@ -803,7 +811,7 @@ impl ReviewService {
         run_ai_review_with_deadline(
             &review.id,
             review.timeout_seconds,
-            run_ai_review_with_context(review, &changes.changes, source_dir),
+            run_ai_review_with_context(review, &changes.changes, source_dir, review_request),
         )
         .await
     }
@@ -921,27 +929,7 @@ fn sanitize_work_path_segment(value: &str) -> String {
 pub(crate) fn manual_script_task_ids(text: &str) -> Vec<String> {
     let mut ids = BTreeSet::new();
     for raw in text.split_whitespace() {
-        let token = raw.trim_matches(|ch: char| {
-            matches!(
-                ch,
-                ',' | '.'
-                    | ';'
-                    | ':'
-                    | '!'
-                    | '?'
-                    | '('
-                    | ')'
-                    | '['
-                    | ']'
-                    | '{'
-                    | '}'
-                    | '<'
-                    | '>'
-                    | '"'
-                    | '\''
-                    | '`'
-            )
-        });
+        let token = trim_manual_trigger_token(raw);
         let Some(id) = token.strip_prefix('@') else {
             continue;
         };
@@ -954,6 +942,46 @@ pub(crate) fn manual_script_task_ids(text: &str) -> Vec<String> {
         }
     }
     ids.into_iter().collect()
+}
+
+pub(crate) fn manual_review_request_text(text: &str, requested_ids: &[String]) -> Option<String> {
+    let request = text
+        .split_whitespace()
+        .filter(|raw| {
+            let token = trim_manual_trigger_token(raw);
+            let Some(id) = token.strip_prefix('@') else {
+                return true;
+            };
+            !requested_ids.iter().any(|requested_id| requested_id == id)
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let request = request.trim();
+    (!request.is_empty()).then(|| request.to_string())
+}
+
+fn trim_manual_trigger_token(raw: &str) -> &str {
+    raw.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            ',' | '.'
+                | ';'
+                | ':'
+                | '!'
+                | '?'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '<'
+                | '>'
+                | '"'
+                | '\''
+                | '`'
+        )
+    })
 }
 
 fn parse_script_result_findings(result: &ScriptTaskResult, text: &str) -> Vec<Finding> {
@@ -1044,6 +1072,26 @@ mod tests {
     fn ignores_non_standalone_manual_script_task_ids() {
         assert!(manual_script_task_ids("please@check-todo-tbd").is_empty());
         assert!(manual_script_task_ids("@").is_empty());
+    }
+
+    #[test]
+    fn extracts_manual_review_request_text_after_trigger_ids() {
+        let requested_ids = vec!["ai-review".to_string()];
+
+        let request =
+            manual_review_request_text("@ai-review 重点关注 parser 这段边界条件", &requested_ids);
+
+        assert_eq!(request.as_deref(), Some("重点关注 parser 这段边界条件"));
+    }
+
+    #[test]
+    fn manual_review_request_text_removes_multiple_trigger_ids() {
+        let requested_ids = vec!["ai-review".to_string(), "check-script".to_string()];
+
+        let request =
+            manual_review_request_text("please run @ai-review, @check-script now", &requested_ids);
+
+        assert_eq!(request.as_deref(), Some("please run now"));
     }
 
     #[test]

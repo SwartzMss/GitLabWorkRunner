@@ -482,6 +482,10 @@ async fn reviews_merge_request_with_ai_review() {
                         .as_str()
                         .unwrap()
                         .contains("let value = maybe.unwrap();"));
+                    assert!(body["messages"][1]["content"]
+                        .as_str()
+                        .unwrap()
+                        .contains("重点关注 unwrap 的空值分支"));
                     ai_request_count.fetch_add(1, Ordering::SeqCst);
                     Json(json!({
                         "choices": [{
@@ -548,7 +552,7 @@ timeout_seconds = 10
     let store = StateStore::connect("sqlite::memory:").await.unwrap();
     store.migrate().await.unwrap();
     let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset);
-    let event = manual_note_event("@ai-review");
+    let event = manual_note_event("@ai-review 重点关注 unwrap 的空值分支");
 
     let summary = service.review_merge_request_note(&event).await.unwrap();
 
