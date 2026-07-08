@@ -132,6 +132,8 @@ max_concurrent_reviews = 4
 [gitlab]
 base_url = "https://gitlab.example.com"
 token = "<your-gitlab-token>"
+api_timeout_seconds = 30
+archive_timeout_seconds = 300
 
 [storage]
 database_url = "sqlite://gitlab-work-runner.db"
@@ -148,11 +150,11 @@ max_entry_path_bytes = 512         # 512 bytes
 
 ```
 
-`[gitlab].token` is the token used by the service when calling the GitLab API. It is different from the webhook `Secret token`. Prefer a Project Access Token or a dedicated bot user token with the `api` scope and at least the `Developer` project role. It must be able to read MR diffs, download repository archives, and publish MR discussions. Do not commit a real `config.toml` token to the repository.
+`[gitlab].token` is the token used by the service when calling the GitLab API. It is different from the webhook `Secret token`. Prefer a Project Access Token or a dedicated bot user token with the `api` scope and at least the `Developer` project role. It must be able to read MR diffs, download repository archives, and publish MR discussions. Do not commit a real `config.toml` token to the repository. `api_timeout_seconds` controls regular GitLab API request timeouts, and `archive_timeout_seconds` separately controls repository archive download timeouts. Both default to `30` seconds.
 
 `[server].max_concurrent_reviews` controls how many review runs can execute at the same time in one process. The default is `4`. When the limit is reached, the runner does not start another background review and posts an MR-level comment asking the user to retry later because the review queue is busy. If the request came from an MR note, the service also awards `eyes` to the triggering note.
 
-`[archive]` controls hard limits for downloading and extracting GitLab repository archives. If `max_archive_bytes` is exceeded, the runner stops reading the archive and fails the current review. During extraction, exceeding `max_extracted_files`, `max_extracted_bytes`, `max_single_file_bytes`, or `max_entry_path_bytes` stops extraction and fails the current review. The existing MR failure notification path reports the failure; AI context tools or script tasks do not continue.
+`[archive]` controls hard limits for downloading and extracting GitLab repository archives. If `max_archive_bytes` is exceeded, the runner stops reading the archive and fails the current review. During extraction, exceeding `max_extracted_files`, `max_extracted_bytes`, `max_single_file_bytes`, or `max_entry_path_bytes` stops extraction and fails the current review. Large repositories may need both `[archive].max_archive_bytes` and `[gitlab].archive_timeout_seconds` increased. The existing MR failure notification path reports the failure; AI context tools or script tasks do not continue.
 
 ## Dashboard
 

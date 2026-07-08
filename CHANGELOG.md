@@ -1,5 +1,11 @@
 # Changelog
 
+## v2.0.8
+
+- 新增 `[gitlab].api_timeout_seconds` 和 `[gitlab].archive_timeout_seconds` 配置。
+- repository archive 下载现在使用独立超时，避免大仓库 archive 下载被默认 30 秒 GitLab API 超时提前中断。
+- `config.example.toml`、README 和 release notes 补充 archive 下载超时配置说明。
+
 ## v1.4.3
 
 - 新增 MR 评论手动触发脚本任务：在 GitLab Webhook 开启 `Comments` 后，可在 MR 评论中发送 `@script_task_id` 执行指定 `[[script_tasks]]`。

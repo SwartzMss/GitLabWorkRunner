@@ -8,6 +8,8 @@ const DEFAULT_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
 const DEFAULT_LOG_MAX_FILES: usize = 5;
 const DEFAULT_MAX_CONCURRENT_REVIEWS: usize = 4;
 const DEFAULT_DASHBOARD_BIND: &str = "127.0.0.1:8082";
+const DEFAULT_GITLAB_API_TIMEOUT_SECONDS: u64 = 30;
+const DEFAULT_GITLAB_ARCHIVE_TIMEOUT_SECONDS: u64 = 30;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct AppConfig {
@@ -35,6 +37,10 @@ pub struct ServerConfig {
 pub struct GitLabConfig {
     pub base_url: String,
     pub token: String,
+    #[serde(default = "default_gitlab_api_timeout_seconds")]
+    pub api_timeout_seconds: u64,
+    #[serde(default = "default_gitlab_archive_timeout_seconds")]
+    pub archive_timeout_seconds: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -101,6 +107,14 @@ fn default_dashboard_bind() -> String {
     DEFAULT_DASHBOARD_BIND.into()
 }
 
+fn default_gitlab_api_timeout_seconds() -> u64 {
+    DEFAULT_GITLAB_API_TIMEOUT_SECONDS
+}
+
+fn default_gitlab_archive_timeout_seconds() -> u64 {
+    DEFAULT_GITLAB_ARCHIVE_TIMEOUT_SECONDS
+}
+
 impl AppConfig {
     pub fn from_path(path: impl AsRef<Path>) -> AppResult<Self> {
         let text = fs::read_to_string(path)?;
@@ -153,6 +167,8 @@ file = "rules.toml"
         assert_eq!(config.server.max_concurrent_reviews, 4);
         assert_eq!(config.gitlab.base_url, "https://gitlab.example.com");
         assert_eq!(config.gitlab.token, "glpat-test-token");
+        assert_eq!(config.gitlab.api_timeout_seconds, 30);
+        assert_eq!(config.gitlab.archive_timeout_seconds, 30);
         assert_eq!(config.gitlab_token().unwrap(), "glpat-test-token");
         assert_eq!(config.storage.database_url, "sqlite::memory:");
         assert_eq!(config.rules.file, "rules.toml");
@@ -174,6 +190,8 @@ file = "rules.toml"
             gitlab: GitLabConfig {
                 base_url: "https://gitlab.example.com".into(),
                 token: "  ".into(),
+                api_timeout_seconds: 30,
+                archive_timeout_seconds: 30,
             },
             storage: StorageConfig {
                 database_url: "sqlite::memory:".into(),
@@ -227,6 +245,37 @@ max_files = 3
         assert_eq!(config.logging.max_bytes, 1024);
         assert_eq!(config.logging.max_files, 3);
         assert_eq!(config.dashboard.bind, "127.0.0.1:18082");
+    }
+
+    #[test]
+    fn loads_custom_gitlab_timeout_config() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"
+[server]
+bind = "127.0.0.1:8080"
+webhook_secret = "secret"
+
+[gitlab]
+base_url = "https://gitlab.example.com"
+token = "glpat-test-token"
+api_timeout_seconds = 45
+archive_timeout_seconds = 300
+
+[storage]
+database_url = "sqlite::memory:"
+
+[rules]
+file = "rules.toml"
+"#
+        )
+        .unwrap();
+
+        let config = AppConfig::from_path(file.path()).unwrap();
+
+        assert_eq!(config.gitlab.api_timeout_seconds, 45);
+        assert_eq!(config.gitlab.archive_timeout_seconds, 300);
     }
 
     #[test]

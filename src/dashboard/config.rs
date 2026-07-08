@@ -47,6 +47,8 @@ mod tests {
             gitlab: GitLabConfig {
                 base_url: "https://gitlab.example.com".into(),
                 token: "token".into(),
+                api_timeout_seconds: 30,
+                archive_timeout_seconds: 30,
             },
             storage: StorageConfig {
                 database_url: "sqlite://state.db".into(),

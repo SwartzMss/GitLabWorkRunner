@@ -13,7 +13,8 @@ pub struct GitLabClient {
     base_url: String,
     token: String,
     http: ureq::Agent,
-    timeout: Duration,
+    api_timeout: Duration,
+    archive_timeout: Duration,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -78,29 +79,32 @@ pub struct CreatedNote {
 
 impl GitLabClient {
     pub fn new(base_url: String, token: String) -> Self {
-        Self::with_timeout(
-            base_url,
-            token,
-            Duration::from_secs(GITLAB_API_TIMEOUT_SECONDS),
-        )
+        let timeout = Duration::from_secs(GITLAB_API_TIMEOUT_SECONDS);
+        Self::new_with_timeouts(base_url, token, timeout, timeout)
     }
 
-    fn with_timeout(base_url: String, token: String, timeout: Duration) -> Self {
+    pub fn new_with_timeouts(
+        base_url: String,
+        token: String,
+        api_timeout: Duration,
+        archive_timeout: Duration,
+    ) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             token,
             http: ureq::AgentBuilder::new()
                 .timeout_connect(Duration::from_secs(10))
-                .timeout_read(timeout)
-                .timeout_write(timeout)
+                .timeout_read(longest_timeout(api_timeout, archive_timeout))
+                .timeout_write(longest_timeout(api_timeout, archive_timeout))
                 .build(),
-            timeout,
+            api_timeout,
+            archive_timeout,
         }
     }
 
     #[cfg(test)]
     fn new_with_timeout_for_tests(base_url: String, token: String, timeout: Duration) -> Self {
-        Self::with_timeout(base_url, token, timeout)
+        Self::new_with_timeouts(base_url, token, timeout, timeout)
     }
 
     pub async fn merge_request_changes(
@@ -122,29 +126,33 @@ impl GitLabClient {
             project_id,
             mr_iid,
             request_url = %url,
-            timeout_ms = self.timeout.as_millis(),
+            timeout_ms = self.api_timeout.as_millis(),
             "fetching merge request changes from gitlab"
         );
         let started = Instant::now();
         let http = self.http.clone();
         let token = self.token.clone();
-        let timeout = self.timeout;
+        let timeout = self.api_timeout;
         let response = self
-            .with_timeout_guard("fetch merge request changes from gitlab", move || {
-                let response = http
-                    .get(&url)
-                    .timeout(timeout)
-                    .set("PRIVATE-TOKEN", &token)
-                    .call();
-                let response = ensure_gitlab_success_response(
-                    response_from_ureq_result(response)?,
-                    "fetch merge request changes from gitlab",
-                )?;
-                let status = response.status();
-                let body = read_ureq_text(response)?;
-                let changes = serde_json::from_str(&body)?;
-                Ok((status, changes))
-            })
+            .with_timeout_guard(
+                "fetch merge request changes from gitlab",
+                timeout,
+                move || {
+                    let response = http
+                        .get(&url)
+                        .timeout(timeout)
+                        .set("PRIVATE-TOKEN", &token)
+                        .call();
+                    let response = ensure_gitlab_success_response(
+                        response_from_ureq_result(response)?,
+                        "fetch merge request changes from gitlab",
+                    )?;
+                    let status = response.status();
+                    let body = read_ureq_text(response)?;
+                    let changes = serde_json::from_str(&body)?;
+                    Ok((status, changes))
+                },
+            )
             .await?;
         let (status, changes): (u16, MergeRequestChanges) = response;
         info!(
@@ -188,32 +196,36 @@ impl GitLabClient {
             project_id,
             sha,
             request_url = %url,
-            timeout_ms = self.timeout.as_millis(),
+            timeout_ms = self.archive_timeout.as_millis(),
             max_archive_bytes,
             "downloading repository archive from gitlab"
         );
         let started = Instant::now();
         let http = self.http.clone();
         let token = self.token.clone();
-        let timeout = self.timeout;
+        let timeout = self.archive_timeout;
         let sha = sha.to_string();
         let request_sha = sha.clone();
         let response = self
-            .with_timeout_guard("download repository archive from gitlab", move || {
-                let response = http
-                    .get(&url)
-                    .query("sha", &request_sha)
-                    .timeout(timeout)
-                    .set("PRIVATE-TOKEN", &token)
-                    .call();
-                let response = ensure_gitlab_success_response(
-                    response_from_ureq_result(response)?,
-                    "download repository archive from gitlab",
-                )?;
-                let status = response.status();
-                let archive = read_ureq_bytes_limited(response, max_archive_bytes)?;
-                Ok((status, archive))
-            })
+            .with_timeout_guard(
+                "download repository archive from gitlab",
+                timeout,
+                move || {
+                    let response = http
+                        .get(&url)
+                        .query("sha", &request_sha)
+                        .timeout(timeout)
+                        .set("PRIVATE-TOKEN", &token)
+                        .call();
+                    let response = ensure_gitlab_success_response(
+                        response_from_ureq_result(response)?,
+                        "download repository archive from gitlab",
+                    )?;
+                    let status = response.status();
+                    let archive = read_ureq_bytes_limited(response, max_archive_bytes)?;
+                    Ok((status, archive))
+                },
+            )
             .await?;
         let (status, archive): (u16, Vec<u8>) = response;
         info!(
@@ -254,53 +266,57 @@ impl GitLabClient {
             mr_iid,
             request_url = %url,
             has_position,
-            timeout_ms = self.timeout.as_millis(),
+            timeout_ms = self.api_timeout.as_millis(),
             "creating gitlab merge request discussion"
         );
         let started = Instant::now();
         let http = self.http.clone();
         let token = self.token.clone();
-        let timeout = self.timeout;
+        let timeout = self.api_timeout;
         let request = request.clone();
         let response = self
-            .with_timeout_guard("create gitlab merge request discussion", move || {
-                let body = serde_json::to_string(&request)?;
-                let response = http
-                    .post(&url)
-                    .timeout(timeout)
-                    .set("PRIVATE-TOKEN", &token)
-                    .set("content-type", "application/json")
-                    .send_string(&body);
-                let response = response_from_ureq_result(response)?;
-                let status = response.status();
-                if status == 400 && request.position.is_some() {
-                    let fallback = CreateDiscussionRequest {
-                        body: request.body.clone(),
-                        position: None,
-                    };
-                    let fallback_body = serde_json::to_string(&fallback)?;
-                    let created = http
+            .with_timeout_guard(
+                "create gitlab merge request discussion",
+                timeout,
+                move || {
+                    let body = serde_json::to_string(&request)?;
+                    let response = http
                         .post(&url)
                         .timeout(timeout)
                         .set("PRIVATE-TOKEN", &token)
                         .set("content-type", "application/json")
-                        .send_string(&fallback_body);
+                        .send_string(&body);
+                    let response = response_from_ureq_result(response)?;
+                    let status = response.status();
+                    if status == 400 && request.position.is_some() {
+                        let fallback = CreateDiscussionRequest {
+                            body: request.body.clone(),
+                            position: None,
+                        };
+                        let fallback_body = serde_json::to_string(&fallback)?;
+                        let created = http
+                            .post(&url)
+                            .timeout(timeout)
+                            .set("PRIVATE-TOKEN", &token)
+                            .set("content-type", "application/json")
+                            .send_string(&fallback_body);
+                        let response = ensure_gitlab_success_response(
+                            response_from_ureq_result(created)?,
+                            "create fallback gitlab merge request discussion",
+                        )?;
+                        let body = read_ureq_text(response)?;
+                        let created = serde_json::from_str(&body)?;
+                        return Ok((status, Some(created)));
+                    }
                     let response = ensure_gitlab_success_response(
-                        response_from_ureq_result(created)?,
-                        "create fallback gitlab merge request discussion",
+                        response,
+                        "create gitlab merge request discussion",
                     )?;
                     let body = read_ureq_text(response)?;
                     let created = serde_json::from_str(&body)?;
-                    return Ok((status, Some(created)));
-                }
-                let response = ensure_gitlab_success_response(
-                    response,
-                    "create gitlab merge request discussion",
-                )?;
-                let body = read_ureq_text(response)?;
-                let created = serde_json::from_str(&body)?;
-                Ok((status, Some(created)))
-            })
+                    Ok((status, Some(created)))
+                },
+            )
             .await?;
         let (status, created): (u16, Option<CreatedDiscussion>) = response;
         info!(
@@ -361,34 +377,38 @@ impl GitLabClient {
             note_id,
             emoji_name = %name,
             request_url = %url,
-            timeout_ms = self.timeout.as_millis(),
+            timeout_ms = self.api_timeout.as_millis(),
             "awarding gitlab merge request note emoji"
         );
         let started = Instant::now();
         let http = self.http.clone();
         let token = self.token.clone();
-        let timeout = self.timeout;
+        let timeout = self.api_timeout;
         let name = name.to_string();
         let request_name = name.clone();
         let response = self
-            .with_timeout_guard("award gitlab merge request note emoji", move || {
-                let response = http
-                    .post(&url)
-                    .query("name", &request_name)
-                    .timeout(timeout)
-                    .set("PRIVATE-TOKEN", &token)
-                    .call();
-                let response = response_from_ureq_result(response)?;
-                let status = response.status();
-                if status == 409 {
-                    return Ok(status);
-                }
-                let _ = ensure_gitlab_success_response(
-                    response,
-                    "award gitlab merge request note emoji",
-                )?;
-                Ok(status)
-            })
+            .with_timeout_guard(
+                "award gitlab merge request note emoji",
+                timeout,
+                move || {
+                    let response = http
+                        .post(&url)
+                        .query("name", &request_name)
+                        .timeout(timeout)
+                        .set("PRIVATE-TOKEN", &token)
+                        .call();
+                    let response = response_from_ureq_result(response)?;
+                    let status = response.status();
+                    if status == 409 {
+                        return Ok(status);
+                    }
+                    let _ = ensure_gitlab_success_response(
+                        response,
+                        "award gitlab merge request note emoji",
+                    )?;
+                    Ok(status)
+                },
+            )
             .await?;
         info!(
             project_id,
@@ -402,7 +422,12 @@ impl GitLabClient {
         Ok(())
     }
 
-    async fn with_timeout_guard<T, F>(&self, operation: &'static str, task: F) -> AppResult<T>
+    async fn with_timeout_guard<T, F>(
+        &self,
+        operation: &'static str,
+        timeout: Duration,
+        task: F,
+    ) -> AppResult<T>
     where
         T: Send + 'static,
         F: FnOnce() -> AppResult<T> + Send + 'static,
@@ -412,17 +437,21 @@ impl GitLabClient {
             let _entered = span.enter();
             task()
         };
-        match tokio::time::timeout(self.timeout, tokio::task::spawn_blocking(task)).await {
+        match tokio::time::timeout(timeout, tokio::task::spawn_blocking(task)).await {
             Ok(Ok(result)) => result,
             Ok(Err(err)) => Err(AppError::GitLab(format!(
                 "{operation} blocking task failed: {err}"
             ))),
             Err(_) => Err(AppError::GitLab(format!(
                 "{operation} timed out after {} ms",
-                self.timeout.as_millis()
+                timeout.as_millis()
             ))),
         }
     }
+}
+
+fn longest_timeout(first: Duration, second: Duration) -> Duration {
+    first.max(second)
 }
 
 fn response_from_ureq_result(
@@ -601,6 +630,28 @@ mod tests {
         let err = client.repository_archive(1, "abc", 4).await.unwrap_err();
 
         assert!(err.to_string().contains("max_archive_bytes"));
+    }
+
+    #[tokio::test]
+    async fn repository_archive_uses_archive_timeout() {
+        let app = Router::new().route(
+            "/api/v4/projects/1/repository/archive.zip",
+            get(|| async {
+                sleep(Duration::from_millis(120)).await;
+                vec![b'a'; 4]
+            }),
+        );
+        let base_url = spawn_server(app).await;
+        let client = GitLabClient::new_with_timeouts(
+            base_url,
+            "token".into(),
+            Duration::from_millis(50),
+            Duration::from_secs(2),
+        );
+
+        let archive = client.repository_archive(1, "abc", 4).await.unwrap();
+
+        assert_eq!(archive.len(), 4);
     }
 
     #[tokio::test]

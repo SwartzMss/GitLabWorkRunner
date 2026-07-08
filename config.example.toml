@@ -6,6 +6,8 @@ max_concurrent_reviews = 4
 [gitlab]
 base_url = "https://gitlab.example.com"
 token = "<your-gitlab-token>"
+api_timeout_seconds = 30
+archive_timeout_seconds = 300
 
 [storage]
 database_url = "sqlite://gitlab-work-runner.db"

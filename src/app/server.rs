@@ -30,7 +30,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, info_span, warn, Instrument};
@@ -341,7 +341,12 @@ async fn gitlab_webhook(
         }
     };
 
-    let gitlab = GitLabClient::new(state.config.gitlab.base_url.clone(), gitlab_token);
+    let gitlab = GitLabClient::new_with_timeouts(
+        state.config.gitlab.base_url.clone(),
+        gitlab_token,
+        Duration::from_secs(state.config.gitlab.api_timeout_seconds.max(1)),
+        Duration::from_secs(state.config.gitlab.archive_timeout_seconds.max(1)),
+    );
     let notifier = ReviewNotifier::new(gitlab.clone());
     let service = ReviewService::new(gitlab, state.store.clone(), ruleset)
         .with_review_run_id(review_run_id.clone())

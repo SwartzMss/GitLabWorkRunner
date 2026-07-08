@@ -132,6 +132,8 @@ max_concurrent_reviews = 4
 [gitlab]
 base_url = "https://gitlab.example.com"
 token = "<your-gitlab-token>"
+api_timeout_seconds = 30
+archive_timeout_seconds = 300
 
 [storage]
 database_url = "sqlite://gitlab-work-runner.db"
@@ -148,11 +150,11 @@ max_entry_path_bytes = 512         # 512 bytes
 
 ```
 
-`[gitlab].token` 是服务调用 GitLab API 使用的 token，和 Webhook 里的 `Secret token` 不是同一个东西。建议使用 Project Access Token 或专用 Bot 用户 token，scope 使用 `api`，项目角色至少 `Developer`。它需要能读取 MR diff、下载仓库 archive，并发布 MR discussion。不要把包含真实 token 的 `config.toml` 提交到仓库。
+`[gitlab].token` 是服务调用 GitLab API 使用的 token，和 Webhook 里的 `Secret token` 不是同一个东西。建议使用 Project Access Token 或专用 Bot 用户 token，scope 使用 `api`，项目角色至少 `Developer`。它需要能读取 MR diff、下载仓库 archive，并发布 MR discussion。不要把包含真实 token 的 `config.toml` 提交到仓库。`api_timeout_seconds` 控制普通 GitLab API 请求超时，`archive_timeout_seconds` 单独控制 repository archive 下载超时；两者默认都是 `30` 秒。
 
 `[server].max_concurrent_reviews` 控制单进程内最多同时执行多少个 review run，默认 `4`。达到上限时不会启动新的后台 review，并会发布一条 MR 级评论提示当前 review 队列繁忙，请稍后再试；如果是 MR 评论手动触发，服务还会给触发评论加 `eyes`。
 
-`[archive]` 控制 GitLab repository archive 的下载和解压硬限制。超过 `max_archive_bytes` 会停止下载并让本次 review 失败；解压时超过 `max_extracted_files`、`max_extracted_bytes`、`max_single_file_bytes` 或 `max_entry_path_bytes` 会停止解压并让本次 review 失败。失败会走现有 MR 失败通知，不会继续执行 AI context tools 或脚本任务。
+`[archive]` 控制 GitLab repository archive 的下载和解压硬限制。超过 `max_archive_bytes` 会停止下载并让本次 review 失败；解压时超过 `max_extracted_files`、`max_extracted_bytes`、`max_single_file_bytes` 或 `max_entry_path_bytes` 会停止解压并让本次 review 失败。大仓库需要同时调大 `[archive].max_archive_bytes` 和 `[gitlab].archive_timeout_seconds`。失败会走现有 MR 失败通知，不会继续执行 AI context tools 或脚本任务。
 
 ## Dashboard
 

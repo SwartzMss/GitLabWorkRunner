@@ -32,6 +32,8 @@ async fn test_state(
             gitlab: GitLabConfig {
                 base_url: gitlab_base_url,
                 token: "token".into(),
+                api_timeout_seconds: 30,
+                archive_timeout_seconds: 30,
             },
             storage: StorageConfig {
                 database_url: "sqlite::memory:".into(),
