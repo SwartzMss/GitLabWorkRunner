@@ -18,6 +18,16 @@ pub(crate) struct AiReviewHttpResponse {
     pub(crate) body: String,
 }
 
+pub(crate) struct AiReviewHttpRequest<'a> {
+    pub(crate) config: &'a AiReviewConfig,
+    pub(crate) url: &'a str,
+    pub(crate) api_key: &'a str,
+    pub(crate) request_body: Vec<u8>,
+    pub(crate) attempt: usize,
+    pub(crate) request_timeout: Duration,
+    pub(crate) timeout_code: ReviewErrorCode,
+}
+
 pub(crate) fn shared_ai_http_client() -> AppResult<&'static ureq::Agent> {
     AI_HTTP_CLIENT
         .get_or_init(|| {
@@ -38,14 +48,17 @@ pub(crate) fn shared_ai_http_client() -> AppResult<&'static ureq::Agent> {
 
 pub(crate) async fn perform_ai_review_http_attempt(
     client: &ureq::Agent,
-    config: &AiReviewConfig,
-    url: &str,
-    api_key: &str,
-    request_body: Vec<u8>,
-    attempt: usize,
-    request_timeout: Duration,
-    timeout_code: ReviewErrorCode,
+    request: AiReviewHttpRequest<'_>,
 ) -> AppResult<AiReviewHttpResponse> {
+    let AiReviewHttpRequest {
+        config,
+        url,
+        api_key,
+        request_body,
+        attempt,
+        request_timeout,
+        timeout_code,
+    } = request;
     let client = client.clone();
     let review_id = config.id.clone();
     let model = config.model.clone();

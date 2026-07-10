@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 use super::{
     ai_http::{
         is_retryable_ai_error, perform_ai_review_http_attempt, shared_ai_http_client,
-        AiReviewHttpResponse,
+        AiReviewHttpRequest, AiReviewHttpResponse,
     },
     ai_prompt::{
         build_review_prompt_with_limit, formatted_change_payload, initial_chat_messages,
@@ -202,13 +202,15 @@ async fn run_ai_review_single(
                 request_guard_timeout,
                 perform_ai_review_http_attempt(
                     client,
-                    config,
-                    &url,
-                    api_key,
-                    request_body,
-                    attempt,
-                    request_timeout,
-                    ReviewErrorCode::AiRequestTimeout,
+                    AiReviewHttpRequest {
+                        config,
+                        url: &url,
+                        api_key,
+                        request_body,
+                        attempt,
+                        request_timeout,
+                        timeout_code: ReviewErrorCode::AiRequestTimeout,
+                    },
                 ),
             )
             .await
@@ -760,13 +762,15 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                 request_guard_timeout,
                 perform_ai_review_http_attempt(
                     client,
-                    config,
-                    url,
-                    api_key,
-                    request_body.clone(),
-                    followup_attempt,
-                    request_timeout,
-                    ReviewErrorCode::AiToolLoopTimeout,
+                    AiReviewHttpRequest {
+                        config,
+                        url,
+                        api_key,
+                        request_body: request_body.clone(),
+                        attempt: followup_attempt,
+                        request_timeout,
+                        timeout_code: ReviewErrorCode::AiToolLoopTimeout,
+                    },
                 ),
             )
             .await;
