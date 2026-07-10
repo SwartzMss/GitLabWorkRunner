@@ -208,6 +208,7 @@ async fn run_ai_review_single(
                     request_body,
                     attempt,
                     request_timeout,
+                    ReviewErrorCode::AiRequestTimeout,
                 ),
             )
             .await
@@ -765,6 +766,7 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                     request_body.clone(),
                     followup_attempt,
                     request_timeout,
+                    ReviewErrorCode::AiToolLoopTimeout,
                 ),
             )
             .await;
@@ -2059,6 +2061,107 @@ mod tests {
         let findings = run_ai_review(&config, &changes).await.unwrap();
 
         assert!(findings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn classifies_client_request_timeout_as_ai_request_timeout() {
+        let attempt_count = Arc::new(AtomicUsize::new(0));
+        let attempt_count_for_server = Arc::clone(&attempt_count);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let attempt_count = Arc::clone(&attempt_count_for_server);
+                tokio::spawn(async move {
+                    attempt_count.fetch_add(1, Ordering::SeqCst);
+                    let mut buffer = [0_u8; 4096];
+                    let _ = stream.read(&mut buffer).await.unwrap();
+                    sleep(Duration::from_secs(2)).await;
+                });
+            }
+        });
+
+        let config = AiReviewConfig {
+            base_url: format!("http://{}", addr),
+            timeout_seconds: 10,
+            request_timeout_seconds: Some(1),
+            ..test_ai_review_config()
+        };
+        let changes = vec![GitLabChange {
+            old_path: "src/lib.rs".into(),
+            new_path: "src/lib.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "@@ -1 +1 @@\n+panic!();\n".into(),
+        }];
+
+        let err = run_ai_review(&config, &changes).await.unwrap_err();
+
+        assert_eq!(
+            err.review_failure().map(|failure| failure.code),
+            Some(ReviewErrorCode::AiRequestTimeout)
+        );
+        assert_eq!(attempt_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn classifies_client_tool_followup_timeout_as_tool_loop_timeout() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_server = Arc::clone(&request_count);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request_count = Arc::clone(&request_count_for_server);
+                tokio::spawn(async move {
+                    let request_index = request_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    let mut buffer = [0_u8; 4096];
+                    let _ = stream.read(&mut buffer).await.unwrap();
+                    if request_index == 1 {
+                        let body = br#"{"choices":[{"message":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"search_code","arguments":"{\"query\":\"panic\"}"}}]}}]}"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                            body.len()
+                        );
+                        stream.write_all(response.as_bytes()).await.unwrap();
+                        stream.write_all(body).await.unwrap();
+                    } else {
+                        sleep(Duration::from_secs(2)).await;
+                    }
+                });
+            }
+        });
+
+        let config = AiReviewConfig {
+            base_url: format!("http://{}", addr),
+            timeout_seconds: 10,
+            request_timeout_seconds: Some(1),
+            context_tools: AiReviewContextTools {
+                read_file: false,
+                search_code: true,
+                list_files: false,
+            },
+            ..test_ai_review_config()
+        };
+        let changes = vec![GitLabChange {
+            old_path: "src/lib.rs".into(),
+            new_path: "src/lib.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "@@ -1 +1 @@\n+panic!();\n".into(),
+        }];
+
+        let err = run_ai_review(&config, &changes).await.unwrap_err();
+
+        assert_eq!(
+            err.review_failure().map(|failure| failure.code),
+            Some(ReviewErrorCode::AiToolLoopTimeout)
+        );
+        assert_eq!(request_count.load(Ordering::SeqCst), 3);
     }
 
     #[test]

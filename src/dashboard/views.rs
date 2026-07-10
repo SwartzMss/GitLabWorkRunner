@@ -223,9 +223,9 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       ai_tool_loop_timeout: "AI 工具循环超时", ai_response_parse_failed: "AI 响应解析失败",
       review_run_timeout: "Review 整体超时", gitlab_comment_failed: "GitLab 发布失败", permission_denied: "权限不足",
       invalid_configuration: "配置无效", script_task_failed: "脚本任务失败", internal: "内部错误"
-    }[code] || code || "未知错误");
-    const renderFailure = (failure) => failure ? `<div class="failure"><div><span class="badge failed">${esc(errorCodeText(failure.code))}</span> <code>${esc(failure.code)}</code></div><pre class="failure-message">${esc(failure.message || "-")}</pre></div>` : "";
-    const taskFailure = (task) => task.error_code ? { code: task.error_code, message: task.error } : null;
+    }[code] || code || "未分类错误");
+    const renderFailure = (failure) => failure ? `<div class="failure"><div><span class="badge failed">${esc(errorCodeText(failure.code))}</span>${failure.code ? ` <code>${esc(failure.code)}</code>` : ""}</div><pre class="failure-message">${esc(failure.message || "-")}</pre></div>` : "";
+    const taskFailure = (task) => (task.error_code || task.error) ? { code: task.error_code, message: task.error } : null;
 
     function renderTaskCoverage(task) {
       if (task.coverage_total_files == null) {
@@ -469,6 +469,13 @@ mod tests {
         assert!(DASHBOARD_HTML.contains("达到批次上限"));
         assert!(DASHBOARD_HTML.contains("单文件 Diff 超过批次限制"));
         assert!(DASHBOARD_HTML.contains("批次执行失败"));
+    }
+
+    #[test]
+    fn run_detail_renders_legacy_failures_without_codes() {
+        assert!(DASHBOARD_HTML.contains(r#"}[code] || code || "未分类错误""#));
+        assert!(DASHBOARD_HTML.contains("failure.code ?"));
+        assert!(DASHBOARD_HTML.contains("(task.error_code || task.error)"));
     }
 
     #[test]

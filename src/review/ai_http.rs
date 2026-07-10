@@ -3,6 +3,8 @@ use crate::{
     rules::AiReviewConfig,
 };
 use std::{
+    error::Error,
+    io,
     sync::OnceLock,
     thread,
     time::{Duration, Instant},
@@ -42,6 +44,7 @@ pub(crate) async fn perform_ai_review_http_attempt(
     request_body: Vec<u8>,
     attempt: usize,
     request_timeout: Duration,
+    timeout_code: ReviewErrorCode,
 ) -> AppResult<AiReviewHttpResponse> {
     let client = client.clone();
     let review_id = config.id.clone();
@@ -65,6 +68,7 @@ pub(crate) async fn perform_ai_review_http_attempt(
                 request_body,
                 attempt,
                 request_timeout,
+                timeout_code,
             });
             let result_sent = sender.send(result).is_ok();
             info!(
@@ -130,6 +134,7 @@ struct AiReviewHttpAttempt {
     request_body: Vec<u8>,
     attempt: usize,
     request_timeout: Duration,
+    timeout_code: ReviewErrorCode,
 }
 
 fn perform_ai_review_http_attempt_blocking(
@@ -144,6 +149,7 @@ fn perform_ai_review_http_attempt_blocking(
         request_body,
         attempt,
         request_timeout,
+        timeout_code,
     } = attempt_context;
     let started = Instant::now();
     let response = match ureq_response_from_result(
@@ -153,6 +159,7 @@ fn perform_ai_review_http_attempt_blocking(
             .set("content-type", "application/json")
             .timeout(request_timeout)
             .send_bytes(&request_body),
+        timeout_code,
     ) {
         Ok(response) => response,
         Err(err) => {
@@ -190,8 +197,13 @@ fn perform_ai_review_http_attempt_blocking(
                 error = %err,
                 "AI review blocking API response body read failed"
             );
+            let code = if is_io_timeout(&err) {
+                timeout_code
+            } else {
+                ReviewErrorCode::AiRequestFailed
+            };
             return Err(AppError::ai_review(
-                ReviewErrorCode::AiRequestFailed,
+                code,
                 format!("AI review blocking API response body read failed: {err}"),
             ));
         }
@@ -209,13 +221,32 @@ fn perform_ai_review_http_attempt_blocking(
 
 fn ureq_response_from_result(
     result: Result<ureq::Response, ureq::Error>,
+    timeout_code: ReviewErrorCode,
 ) -> AppResult<ureq::Response> {
     match result {
         Ok(response) => Ok(response),
         Err(ureq::Error::Status(_, response)) => Ok(response),
-        Err(err) => Err(AppError::ai_review(
-            ReviewErrorCode::AiRequestFailed,
-            format!("AI review blocking API request failed before response headers: {err}"),
-        )),
+        Err(err) => {
+            let code = if is_ureq_timeout(&err) {
+                timeout_code
+            } else {
+                ReviewErrorCode::AiRequestFailed
+            };
+            Err(AppError::ai_review(
+                code,
+                format!("AI review blocking API request failed before response headers: {err}"),
+            ))
+        }
     }
+}
+
+fn is_ureq_timeout(err: &ureq::Error) -> bool {
+    err.kind() == ureq::ErrorKind::Io
+        && Error::source(err)
+            .and_then(|source| source.downcast_ref::<io::Error>())
+            .is_some_and(is_io_timeout)
+}
+
+fn is_io_timeout(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::TimedOut
 }

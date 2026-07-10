@@ -184,7 +184,7 @@ pub struct DashboardRunDetail {
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct DashboardFailure {
-    pub code: String,
+    pub code: Option<String>,
     pub message: String,
 }
 
@@ -233,7 +233,15 @@ impl DashboardStore {
                 )));
             }
         }
+        for column in ["error_code", "error"] {
+            if !self.column_exists("review_requests", column).await? {
+                return Err(AppError::Storage(format!(
+                    "dashboard database is missing required column `review_requests.{column}`; start gitlab-work-runner once to run migrations"
+                )));
+            }
+        }
         for column in [
+            "error_code",
             "coverage_total_files",
             "coverage_fully_reviewed_files",
             "coverage_partially_reviewed_files",
@@ -698,7 +706,9 @@ limit 500
 const ERROR_PREVIEW_MAX_BYTES: usize = 4 * 1024;
 
 fn dashboard_failure(code: Option<String>, message: Option<String>) -> Option<DashboardFailure> {
-    let code = code?;
+    if code.is_none() && message.is_none() {
+        return None;
+    }
     Some(DashboardFailure {
         code,
         message: error_preview(message).unwrap_or_default(),
@@ -867,5 +877,13 @@ mod tests {
 
         assert!(preview.len() <= ERROR_PREVIEW_MAX_BYTES);
         assert!(preview.is_char_boundary(preview.len()));
+    }
+
+    #[test]
+    fn dashboard_failure_keeps_legacy_message_without_code() {
+        let failure = dashboard_failure(None, Some("legacy failure".into())).unwrap();
+
+        assert_eq!(failure.code, None);
+        assert_eq!(failure.message, "legacy failure");
     }
 }
