@@ -31,7 +31,7 @@ second_pass_on_clean = false
 # AI Review requests Chat Completions tool_calls by default and falls back to JSON content parsing when needed.
 # This does not require MCP; findings are read from submit_review_findings arguments when tool_calls are returned.
 batch_review = true
-max_batch_diff_bytes = 15000
+max_batch_diff_bytes = 30000
 max_batches = 10
 
 [[script_tasks]]
