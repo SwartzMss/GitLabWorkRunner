@@ -7,7 +7,7 @@ use axum::{
     Json, Router,
 };
 use gitlab_work_runner::{
-    ai_review::run_ai_review,
+    ai_review::{run_ai_review, run_ai_review_execution_with_context},
     gitlab::GitLabChange,
     gitlab::GitLabClient,
     review::ReviewService,
@@ -896,9 +896,19 @@ async fn ai_review_batches_large_merge_request_by_file() {
         },
     ];
 
-    let findings = run_ai_review(&config, &changes).await.unwrap();
+    let execution = run_ai_review_execution_with_context(&config, &changes, None, None).await;
+    let coverage = execution.coverage.unwrap();
+    let incomplete_files = execution.incomplete_files;
+    let findings = execution.result.unwrap();
 
     assert_eq!(ai_request_count.load(Ordering::SeqCst), 2);
+    assert_eq!(coverage.required_batches, 3);
+    assert_eq!(coverage.planned_batches, 2);
+    assert_eq!(coverage.completed_batches, 2);
+    assert!(!coverage.complete);
+    assert_eq!(incomplete_files.len(), 1);
+    assert_eq!(incomplete_files[0].path, "src/c.rs");
+    assert_eq!(incomplete_files[0].reason, "max_batches_reached");
     assert_eq!(findings.len(), 2);
     assert_eq!(findings[0].path, "src/a.rs");
     assert_eq!(findings[1].path, "src/b.rs");

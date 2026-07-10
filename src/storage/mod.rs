@@ -49,6 +49,29 @@ pub struct TaskRunFinish<'a> {
 }
 
 #[derive(Clone, Debug)]
+pub struct StoredReviewCoverage {
+    pub total_files: usize,
+    pub fully_reviewed_files: usize,
+    pub partially_reviewed_files: usize,
+    pub unreviewed_files: usize,
+    pub total_diff_bytes: usize,
+    pub reviewed_diff_bytes: usize,
+    pub required_batches: usize,
+    pub planned_batches: usize,
+    pub completed_batches: usize,
+    pub complete: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct StoredReviewCoverageFile<'a> {
+    pub path: &'a str,
+    pub status: &'a str,
+    pub reason: &'a str,
+    pub total_diff_bytes: usize,
+    pub reviewed_diff_bytes: usize,
+}
+
+#[derive(Clone, Debug)]
 pub struct StoredFinding<'a> {
     pub review_run_id: &'a str,
     pub task_type: &'a str,
@@ -132,6 +155,41 @@ create table if not exists review_task_runs (
     finished_at text,
     unique(review_run_id, task_type, task_id)
 );
+"#,
+        )
+        .execute(&self.pool)
+        .await?;
+        for column in [
+            "coverage_total_files",
+            "coverage_fully_reviewed_files",
+            "coverage_partially_reviewed_files",
+            "coverage_unreviewed_files",
+            "coverage_total_diff_bytes",
+            "coverage_reviewed_diff_bytes",
+            "coverage_required_batches",
+            "coverage_planned_batches",
+            "coverage_completed_batches",
+            "coverage_complete",
+        ] {
+            self.ensure_column("review_task_runs", column, "integer")
+                .await?;
+        }
+        sqlx::query(
+            r#"
+create table if not exists review_coverage_files (
+    id integer primary key autoincrement,
+    review_run_id text not null,
+    task_type text not null,
+    task_id text not null,
+    path text not null,
+    status text not null,
+    reason text not null,
+    total_diff_bytes integer not null,
+    reviewed_diff_bytes integer not null,
+    created_at text not null
+);
+create index if not exists review_coverage_files_run_task
+on review_coverage_files(review_run_id, task_type, task_id);
 "#,
         )
         .execute(&self.pool)
@@ -331,6 +389,76 @@ where review_run_id = ? and task_type = ? and task_id = ?
         Ok(())
     }
 
+    pub async fn finish_task_run_with_coverage(
+        &self,
+        task: &TaskRunFinish<'_>,
+        coverage: &StoredReviewCoverage,
+        files: &[StoredReviewCoverageFile<'_>],
+    ) -> AppResult<()> {
+        let now = now_rfc3339();
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            r#"
+update review_task_runs set
+    status = ?, findings = ?, comments = ?, error = ?, finished_at = ?,
+    coverage_total_files = ?, coverage_fully_reviewed_files = ?,
+    coverage_partially_reviewed_files = ?, coverage_unreviewed_files = ?,
+    coverage_total_diff_bytes = ?, coverage_reviewed_diff_bytes = ?,
+    coverage_required_batches = ?, coverage_planned_batches = ?,
+    coverage_completed_batches = ?, coverage_complete = ?
+where review_run_id = ? and task_type = ? and task_id = ?
+"#,
+        )
+        .bind(task.status)
+        .bind(task.findings as i64)
+        .bind(task.comments as i64)
+        .bind(task.error)
+        .bind(&now)
+        .bind(coverage.total_files as i64)
+        .bind(coverage.fully_reviewed_files as i64)
+        .bind(coverage.partially_reviewed_files as i64)
+        .bind(coverage.unreviewed_files as i64)
+        .bind(coverage.total_diff_bytes as i64)
+        .bind(coverage.reviewed_diff_bytes as i64)
+        .bind(coverage.required_batches as i64)
+        .bind(coverage.planned_batches as i64)
+        .bind(coverage.completed_batches as i64)
+        .bind(coverage.complete)
+        .bind(task.review_run_id)
+        .bind(task.task_type)
+        .bind(task.task_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "delete from review_coverage_files where review_run_id = ? and task_type = ? and task_id = ?",
+        )
+        .bind(task.review_run_id)
+        .bind(task.task_type)
+        .bind(task.task_id)
+        .execute(&mut *tx)
+        .await?;
+        for file in files {
+            sqlx::query(
+                r#"insert into review_coverage_files
+(review_run_id, task_type, task_id, path, status, reason, total_diff_bytes, reviewed_diff_bytes, created_at)
+values (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+            )
+            .bind(task.review_run_id)
+            .bind(task.task_type)
+            .bind(task.task_id)
+            .bind(file.path)
+            .bind(file.status)
+            .bind(file.reason)
+            .bind(file.total_diff_bytes as i64)
+            .bind(file.reviewed_diff_bytes as i64)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn record_finding(&self, finding: &StoredFinding<'_>) -> AppResult<()> {
         let now = now_rfc3339();
         sqlx::query(
@@ -433,5 +561,68 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn records_and_replaces_task_coverage_atomically() {
+        let store = StateStore::connect("sqlite::memory:").await.unwrap();
+        store.migrate().await.unwrap();
+        store
+            .start_task_run(&TaskRunStart {
+                review_run_id: "rr-coverage",
+                task_type: "ai_review",
+                task_id: "ai-review",
+                title: "AI Review",
+            })
+            .await
+            .unwrap();
+        let coverage = StoredReviewCoverage {
+            total_files: 3,
+            fully_reviewed_files: 1,
+            partially_reviewed_files: 1,
+            unreviewed_files: 1,
+            total_diff_bytes: 30,
+            reviewed_diff_bytes: 15,
+            required_batches: 3,
+            planned_batches: 2,
+            completed_batches: 2,
+            complete: false,
+        };
+        let file = StoredReviewCoverageFile {
+            path: "src/a.rs",
+            status: "partial",
+            reason: "single_file_diff_truncated",
+            total_diff_bytes: 20,
+            reviewed_diff_bytes: 10,
+        };
+        let finish = TaskRunFinish {
+            review_run_id: "rr-coverage",
+            task_type: "ai_review",
+            task_id: "ai-review",
+            status: "completed",
+            findings: 0,
+            comments: 0,
+            error: None,
+        };
+
+        store
+            .finish_task_run_with_coverage(&finish, &coverage, &[file.clone()])
+            .await
+            .unwrap();
+        store
+            .finish_task_run_with_coverage(&finish, &coverage, &[file])
+            .await
+            .unwrap();
+
+        let rows: i64 = sqlx::query_scalar(
+            "select count(*) from review_coverage_files where review_run_id = 'rr-coverage'",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        let reviewed: i64 = sqlx::query_scalar("select coverage_reviewed_diff_bytes from review_task_runs where review_run_id = 'rr-coverage'")
+            .fetch_one(&store.pool).await.unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(reviewed, 15);
     }
 }

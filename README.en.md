@@ -248,6 +248,8 @@ When context tools are enabled, logs include each tool call's tool name, argumen
 AI Review requests Chat Completions `tool_calls` structured output by default and parses findings from `submit_review_findings` arguments. If no tool call is returned, it falls back to parsing JSON in `content`. Built-in context tools do not require MCP.
 `batch_review` defaults to `false`; set it to `true` to split large MR diffs by complete file diffs. `max_batch_diff_bytes` controls the per-batch diff byte limit, and `max_batches` controls the maximum number of AI requests.
 
+When batching is enabled, the runner scans all MR changes and stores file counts, raw diff byte counts, and required/planned/completed batch counts in SQLite. Files omitted by `max_batches` and files partially reviewed because a single diff exceeded the batch limit appear in Dashboard run details. Coverage is never added to GitLab comments.
+
 Do not commit a real `rules.toml` that contains an actual `api_key`.
 
 `@ai-review` matches `id = "ai-review"` inside `[[ai_reviews]]`. `[[ai_reviews]]` is the config block type, not the trigger command.

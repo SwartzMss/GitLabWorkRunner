@@ -158,7 +158,8 @@ fn dashboard_error(err: crate::error::AppError) -> axum::response::Response {
 mod tests {
     use super::*;
     use crate::storage::{
-        ReviewRequestStart, StateStore, StoredComment, StoredFinding, TaskRunFinish, TaskRunStart,
+        ReviewRequestStart, StateStore, StoredComment, StoredFinding, StoredReviewCoverage,
+        StoredReviewCoverageFile, TaskRunFinish, TaskRunStart,
     };
     use axum::body::{to_bytes, Body};
     use std::fs;
@@ -280,6 +281,87 @@ mod tests {
         assert_eq!(body["comments"][0]["review_run_id"], "rr-dashboard");
         assert_eq!(body["comments"][0]["project_label"], "platform/runner");
         assert_eq!(body["comments"][0]["note_id"], 99);
+    }
+
+    #[tokio::test]
+    async fn dashboard_run_detail_returns_ai_review_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("dashboard-coverage.db");
+        let database_url = format!("sqlite://{}", db_path.display());
+        let writer = StateStore::connect(&database_url).await.unwrap();
+        writer.migrate().await.unwrap();
+        writer
+            .start_review_request(&ReviewRequestStart {
+                review_run_id: "rr-coverage",
+                trigger_type: "manual_note",
+                project_id: 1,
+                project_name: Some("Runner"),
+                project_path_with_namespace: Some("platform/runner"),
+                mr_iid: 2,
+                commit_sha: "abc",
+                note_id: None,
+                requested_ids_json: "[]",
+                selected_ai_reviews: 1,
+                selected_script_tasks: 0,
+            })
+            .await
+            .unwrap();
+        writer
+            .start_task_run(&TaskRunStart {
+                review_run_id: "rr-coverage",
+                task_type: "ai_review",
+                task_id: "ai-review",
+                title: "AI Review",
+            })
+            .await
+            .unwrap();
+        let finish = TaskRunFinish {
+            review_run_id: "rr-coverage",
+            task_type: "ai_review",
+            task_id: "ai-review",
+            status: "completed",
+            findings: 0,
+            comments: 1,
+            error: None,
+        };
+        writer
+            .finish_task_run_with_coverage(
+                &finish,
+                &StoredReviewCoverage {
+                    total_files: 3,
+                    fully_reviewed_files: 2,
+                    partially_reviewed_files: 0,
+                    unreviewed_files: 1,
+                    total_diff_bytes: 30,
+                    reviewed_diff_bytes: 20,
+                    required_batches: 3,
+                    planned_batches: 2,
+                    completed_batches: 2,
+                    complete: false,
+                },
+                &[StoredReviewCoverageFile {
+                    path: "src/c.rs",
+                    status: "unreviewed",
+                    reason: "max_batches_reached",
+                    total_diff_bytes: 10,
+                    reviewed_diff_bytes: 0,
+                }],
+            )
+            .await
+            .unwrap();
+        drop(writer);
+
+        let store = DashboardStore::connect(&database_url).await.unwrap();
+        let detail = store.run_detail("rr-coverage").await.unwrap().unwrap();
+
+        assert_eq!(detail.tasks[0].coverage_required_batches, Some(3));
+        assert_eq!(detail.tasks[0].coverage_completed_batches, Some(2));
+        assert_eq!(detail.tasks[0].coverage_complete, Some(false));
+        assert_eq!(detail.tasks[0].incomplete_files[0].path, "src/c.rs");
+        assert_eq!(
+            detail.tasks[0].incomplete_files[0].reason,
+            "max_batches_reached"
+        );
     }
 
     #[tokio::test]

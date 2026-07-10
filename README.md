@@ -246,6 +246,8 @@ max_batches = 10
 `second_pass_on_clean` 默认是 `false`；设置为 `true` 时，第一次 AI Review 没有发现问题会再执行一次确认。
 AI Review 默认请求 Chat Completions `tool_calls` 结构化输出，并从 `submit_review_findings` 的 arguments 解析 findings；如果响应没有 tool call，会回退解析 `content` 中的 JSON。内置 context tools 不需要 MCP，也不会调用外部服务。
 `batch_review` 默认是 `false`；设置为 `true` 时，会按完整文件 diff 分批调用 AI Review。`max_batch_diff_bytes` 控制单批 diff 字节上限，`max_batches` 控制最多请求批次数。
+
+启用分批后，runner 会完整扫描 MR changes，并把文件数、原始 diff 字节数以及 required/planned/completed batches 保存到 SQLite。达到 `max_batches` 而未送审的文件和因单文件 diff 过大而被截断的文件会记录在 Review 运行明细中，可从 Dashboard 查看；这些 coverage 信息不会写入 GitLab comments。
 上面的示例是面向较大 MR 的推荐配置；代码缺省值仍保持保守，不写 `batch_review` 时不会自动分批，也不会增加额外 AI 请求。
 
 内置 context tools 说明：

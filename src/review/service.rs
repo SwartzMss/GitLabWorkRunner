@@ -1,5 +1,7 @@
 use crate::{
-    ai_review::run_ai_review_with_context,
+    ai_review::{
+        run_ai_review_execution_with_context, AiReviewExecution, ReviewCoverage, ReviewCoverageFile,
+    },
     comments::{build_comment_drafts, CommentDraft},
     error::{AppError, AppResult},
     gitlab::{CreateDiscussionRequest, DiscussionPosition, GitLabClient},
@@ -9,14 +11,16 @@ use crate::{
         ScriptTaskStatus,
     },
     storage::{
-        ReviewRequestStart, StateStore, StoredComment, StoredFinding, TaskRunFinish, TaskRunStart,
+        ReviewRequestStart, StateStore, StoredComment, StoredFinding, StoredReviewCoverage,
+        StoredReviewCoverageFile, TaskRunFinish, TaskRunStart,
     },
     webhook::{MergeRequestEvent, MergeRequestNoteEvent},
 };
+#[cfg(test)]
+use std::future::Future;
 use std::{
     collections::BTreeSet,
     fs,
-    future::Future,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -31,6 +35,42 @@ pub struct ReviewService {
 }
 
 impl ReviewService {
+    async fn finish_ai_task_run(
+        &self,
+        task: &TaskRunFinish<'_>,
+        coverage: Option<&ReviewCoverage>,
+        files: &[ReviewCoverageFile],
+    ) -> AppResult<()> {
+        let Some(coverage) = coverage else {
+            return self.store.finish_task_run(task).await;
+        };
+        let stored = StoredReviewCoverage {
+            total_files: coverage.total_files,
+            fully_reviewed_files: coverage.fully_reviewed_files,
+            partially_reviewed_files: coverage.partially_reviewed_files,
+            unreviewed_files: coverage.unreviewed_files,
+            total_diff_bytes: coverage.total_diff_bytes,
+            reviewed_diff_bytes: coverage.reviewed_diff_bytes,
+            required_batches: coverage.required_batches,
+            planned_batches: coverage.planned_batches,
+            completed_batches: coverage.completed_batches,
+            complete: coverage.complete,
+        };
+        let stored_files = files
+            .iter()
+            .map(|file| StoredReviewCoverageFile {
+                path: &file.path,
+                status: file.status,
+                reason: file.reason,
+                total_diff_bytes: file.total_diff_bytes,
+                reviewed_diff_bytes: file.reviewed_diff_bytes,
+            })
+            .collect::<Vec<_>>();
+        self.store
+            .finish_task_run_with_coverage(task, &stored, &stored_files)
+            .await
+    }
+
     pub fn new(gitlab: GitLabClient, store: StateStore, ruleset: Ruleset) -> Self {
         Self {
             gitlab,
@@ -286,15 +326,17 @@ impl ReviewService {
                 ai_review_id = %review.id,
                 "AI review started"
             );
-            match self
+            let execution = self
                 .run_ai_review_with_optional_clean_second_pass(
                     &review,
                     changes,
                     event,
                     review_request,
                 )
-                .await
-            {
+                .await;
+            let coverage = execution.coverage;
+            let incomplete_files = execution.incomplete_files;
+            match execution.result {
                 Ok(findings) => {
                     let review_findings = findings.len();
                     summary.successful_reviews += 1;
@@ -308,8 +350,8 @@ impl ReviewService {
                         .publish_line_findings(event, changes, &findings)
                         .await?;
                     summary.comments += comments;
-                    self.store
-                        .finish_task_run(&TaskRunFinish {
+                    self.finish_ai_task_run(
+                        &TaskRunFinish {
                             review_run_id: self.review_run_id(),
                             task_type: "ai_review",
                             task_id: &review.id,
@@ -317,8 +359,11 @@ impl ReviewService {
                             findings: review_findings,
                             comments,
                             error: None,
-                        })
-                        .await?;
+                        },
+                        coverage.as_ref(),
+                        &incomplete_files,
+                    )
+                    .await?;
                     info!(
                         project_id = event.project_id,
                         mr_iid = event.mr_iid,
@@ -330,8 +375,8 @@ impl ReviewService {
                     );
                 }
                 Err(err) => {
-                    self.store
-                        .finish_task_run(&TaskRunFinish {
+                    self.finish_ai_task_run(
+                        &TaskRunFinish {
                             review_run_id: self.review_run_id(),
                             task_type: "ai_review",
                             task_id: &review.id,
@@ -339,8 +384,11 @@ impl ReviewService {
                             findings: 0,
                             comments: 0,
                             error: Some(&err.to_string()),
-                        })
-                        .await?;
+                        },
+                        coverage.as_ref(),
+                        &incomplete_files,
+                    )
+                    .await?;
                     if matches!(err, AppError::Archive(_)) {
                         return Err(err);
                     }
@@ -766,6 +814,7 @@ fn severity_name(severity: &Severity) -> &'static str {
     }
 }
 
+#[cfg(test)]
 async fn run_ai_review_with_deadline<F>(
     review_id: &str,
     timeout_seconds: u64,
@@ -790,31 +839,71 @@ impl ReviewService {
         changes: &crate::gitlab::MergeRequestChanges,
         event: &MergeRequestEvent,
         review_request: Option<&str>,
-    ) -> AppResult<Vec<Finding>> {
-        let context = self
-            .prepare_ai_review_context(review, changes, event)
-            .await?;
+    ) -> AiReviewExecution {
+        let context = match self.prepare_ai_review_context(review, changes, event).await {
+            Ok(context) => context,
+            Err(err) => {
+                return AiReviewExecution {
+                    result: Err(err),
+                    coverage: None,
+                    incomplete_files: Vec::new(),
+                }
+            }
+        };
         let source_dir = context.as_ref().map(|context| context.source_dir.as_path());
-        let findings = run_ai_review_with_deadline(
-            &review.id,
-            review.timeout_seconds,
-            run_ai_review_with_context(review, &changes.changes, source_dir, review_request),
+        let execution = match tokio::time::timeout(
+            Duration::from_secs(review.timeout_seconds.max(1)),
+            run_ai_review_execution_with_context(
+                review,
+                &changes.changes,
+                source_dir,
+                review_request,
+            ),
         )
-        .await?;
-        if !review.second_pass_on_clean || !findings.is_empty() {
-            return Ok(findings);
+        .await
+        {
+            Ok(execution) => execution,
+            Err(_) => AiReviewExecution {
+                result: Err(AppError::AiReview(format!(
+                    "AI review {} timed out after {} seconds",
+                    review.id,
+                    review.timeout_seconds.max(1)
+                ))),
+                coverage: None,
+                incomplete_files: Vec::new(),
+            },
+        };
+        let is_clean = matches!(&execution.result, Ok(findings) if findings.is_empty());
+        if !review.second_pass_on_clean || !is_clean {
+            return execution;
         }
 
         info!(
             ai_review_id = %review.id,
             "AI review first pass was clean; running second confirmation pass"
         );
-        run_ai_review_with_deadline(
-            &review.id,
-            review.timeout_seconds,
-            run_ai_review_with_context(review, &changes.changes, source_dir, review_request),
+        match tokio::time::timeout(
+            Duration::from_secs(review.timeout_seconds.max(1)),
+            run_ai_review_execution_with_context(
+                review,
+                &changes.changes,
+                source_dir,
+                review_request,
+            ),
         )
         .await
+        {
+            Ok(execution) => execution,
+            Err(_) => AiReviewExecution {
+                result: Err(AppError::AiReview(format!(
+                    "AI review {} timed out after {} seconds",
+                    review.id,
+                    review.timeout_seconds.max(1)
+                ))),
+                coverage: None,
+                incomplete_files: Vec::new(),
+            },
+        }
     }
 
     async fn prepare_ai_review_context(

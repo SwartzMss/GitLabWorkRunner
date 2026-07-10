@@ -207,6 +207,27 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     const empty = (cols, text = "暂无数据") => `<tr><td class="empty" colspan="${cols}">${text}</td></tr>`;
     const row = (cells, attrs = "") => `<tr ${attrs}>${cells.map((cell) => `<td>${cell ?? ""}</td>`).join("")}</tr>`;
     const pct = (part, total) => total ? ((part / total) * 100).toFixed(1) : "0.0";
+    const fmtBytes = (value) => value == null ? "-" : value < 1024 ? `${value} B` : `${(value / 1024).toFixed(1)} KB`;
+    const coverageReason = (reason) => ({
+      max_batches_reached: "达到批次上限",
+      single_file_diff_truncated: "单文件 Diff 超过批次限制",
+      batch_execution_failed: "批次执行失败"
+    }[reason] || reason || "-");
+
+    function renderTaskCoverage(task) {
+      if (task.coverage_total_files == null) {
+        return `<div class="detail-list"><div class="detail-row"><span>${esc(task.title)}</span><span class="badge unknown">未记录</span></div></div>`;
+      }
+      const state = task.coverage_complete ? "完整" : "部分";
+      const files = task.incomplete_files || [];
+      const incomplete = files.length ? `<table><thead><tr><th>文件</th><th>状态</th><th>原因</th><th>已审查 Diff</th><th>总 Diff</th></tr></thead><tbody>${files.map((file) => row([esc(file.path), file.status === "partial" ? "部分" : "未审查", coverageReason(file.reason), fmtBytes(file.reviewed_diff_bytes), fmtBytes(file.total_diff_bytes)])).join("")}</tbody></table>` : "";
+      return `<div class="detail-list">
+        <div class="detail-row"><span>${esc(task.title)}</span><span class="badge ${task.coverage_complete ? "completed" : "warning"}">${state}</span></div>
+        <div class="detail-row"><span>文件</span><span>${task.coverage_fully_reviewed_files} 完整 / ${task.coverage_partially_reviewed_files} 部分 / ${task.coverage_unreviewed_files} 未审查 / ${task.coverage_total_files} 总计</span></div>
+        <div class="detail-row"><span>Diff</span><span>${fmtBytes(task.coverage_reviewed_diff_bytes)} / ${fmtBytes(task.coverage_total_diff_bytes)} (${pct(task.coverage_reviewed_diff_bytes, task.coverage_total_diff_bytes)}%)</span></div>
+        <div class="detail-row"><span>批次</span><span>${task.coverage_completed_batches} 完成 / ${task.coverage_planned_batches} 计划 / ${task.coverage_required_batches} 所需</span></div>
+      </div>${incomplete}`;
+    }
 
     function params(includeStatus = true) {
       const search = new URLSearchParams();
@@ -366,6 +387,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
           <div class="detail-row"><span>Commit</span><code>${esc(detail.run.commit_sha)}</code></div>
           <div class="detail-row"><span>问题</span><span>${esc(detail.run.findings)}</span></div>
         </div></section>
+        <section class="panel"><div class="panel-header"><div class="panel-title">Review 覆盖</div></div>${detail.tasks.length ? detail.tasks.map(renderTaskCoverage).join("") : `<div class="empty">暂无任务数据</div>`}</section>
         <section class="panel"><div class="panel-header"><div class="panel-title">问题</div></div><table><thead><tr><th>级别</th><th>路径</th><th>标题</th><th>消息</th></tr></thead><tbody>${detail.findings.length ? detail.findings.map((finding) => row([severityBadge(finding.severity), `${esc(finding.path)}${finding.new_line ? `:${esc(finding.new_line)}` : ""}`, esc(finding.title), `<span class="wrap">${esc(finding.message)}</span>`])).join("") : empty(4)}</tbody></table></section>
       </div>`;
       $("backToRuns").addEventListener("click", () => setView("runs"));
@@ -430,10 +452,13 @@ mod tests {
     }
 
     #[test]
-    fn run_detail_focuses_on_findings_without_task_table() {
+    fn run_detail_shows_ai_review_coverage_without_comments() {
         assert!(DASHBOARD_HTML.contains("detail.findings"));
-        assert!(!DASHBOARD_HTML.contains("detail.tasks"));
-        assert!(!DASHBOARD_HTML.contains(r#"<div class="panel-title">任务</div>"#));
+        assert!(DASHBOARD_HTML.contains("detail.tasks"));
+        assert!(DASHBOARD_HTML.contains("Review 覆盖"));
+        assert!(DASHBOARD_HTML.contains("达到批次上限"));
+        assert!(DASHBOARD_HTML.contains("单文件 Diff 超过批次限制"));
+        assert!(DASHBOARD_HTML.contains("批次执行失败"));
     }
 
     #[test]
