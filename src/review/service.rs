@@ -16,13 +16,10 @@ use crate::{
     },
     webhook::{MergeRequestEvent, MergeRequestNoteEvent},
 };
-#[cfg(test)]
-use std::future::Future;
 use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
-    time::Duration,
 };
 use tracing::{info, warn};
 
@@ -814,24 +811,6 @@ fn severity_name(severity: &Severity) -> &'static str {
     }
 }
 
-#[cfg(test)]
-async fn run_ai_review_with_deadline<F>(
-    review_id: &str,
-    timeout_seconds: u64,
-    future: F,
-) -> AppResult<Vec<Finding>>
-where
-    F: Future<Output = AppResult<Vec<Finding>>>,
-{
-    let timeout_seconds = timeout_seconds.max(1);
-    match tokio::time::timeout(Duration::from_secs(timeout_seconds), future).await {
-        Ok(result) => result,
-        Err(_) => Err(AppError::AiReview(format!(
-            "AI review {review_id} timed out after {timeout_seconds} seconds"
-        ))),
-    }
-}
-
 impl ReviewService {
     async fn run_ai_review_with_optional_clean_second_pass(
         &self,
@@ -851,28 +830,13 @@ impl ReviewService {
             }
         };
         let source_dir = context.as_ref().map(|context| context.source_dir.as_path());
-        let execution = match tokio::time::timeout(
-            Duration::from_secs(review.timeout_seconds.max(1)),
-            run_ai_review_execution_with_context(
-                review,
-                &changes.changes,
-                source_dir,
-                review_request,
-            ),
+        let execution = run_ai_review_execution_with_context(
+            review,
+            &changes.changes,
+            source_dir,
+            review_request,
         )
-        .await
-        {
-            Ok(execution) => execution,
-            Err(_) => AiReviewExecution {
-                result: Err(AppError::AiReview(format!(
-                    "AI review {} timed out after {} seconds",
-                    review.id,
-                    review.timeout_seconds.max(1)
-                ))),
-                coverage: None,
-                incomplete_files: Vec::new(),
-            },
-        };
+        .await;
         let is_clean = matches!(&execution.result, Ok(findings) if findings.is_empty());
         if !review.second_pass_on_clean || !is_clean {
             return execution;
@@ -882,28 +846,8 @@ impl ReviewService {
             ai_review_id = %review.id,
             "AI review first pass was clean; running second confirmation pass"
         );
-        match tokio::time::timeout(
-            Duration::from_secs(review.timeout_seconds.max(1)),
-            run_ai_review_execution_with_context(
-                review,
-                &changes.changes,
-                source_dir,
-                review_request,
-            ),
-        )
-        .await
-        {
-            Ok(execution) => execution,
-            Err(_) => AiReviewExecution {
-                result: Err(AppError::AiReview(format!(
-                    "AI review {} timed out after {} seconds",
-                    review.id,
-                    review.timeout_seconds.max(1)
-                ))),
-                coverage: None,
-                incomplete_files: Vec::new(),
-            },
-        }
+        run_ai_review_execution_with_context(review, &changes.changes, source_dir, review_request)
+            .await
     }
 
     async fn prepare_ai_review_context(
@@ -1158,8 +1102,6 @@ struct ScriptTaskRunSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::{AppError, AppResult};
-    use std::future;
 
     #[test]
     fn parses_manual_script_task_ids() {
@@ -1213,21 +1155,5 @@ mod tests {
         let normalized = path.to_string_lossy().replace('\\', "/");
 
         assert!(normalized.contains("/abc123/ai-review/run_1"));
-    }
-
-    #[tokio::test]
-    async fn ai_review_deadline_times_out_pending_review_future() {
-        let result = run_ai_review_with_deadline(
-            "ai-review",
-            1,
-            future::pending::<AppResult<Vec<Finding>>>(),
-        )
-        .await;
-
-        let Err(AppError::AiReview(message)) = result else {
-            panic!("expected AI review timeout error");
-        };
-
-        assert!(message.contains("AI review ai-review timed out after 1 seconds"));
     }
 }

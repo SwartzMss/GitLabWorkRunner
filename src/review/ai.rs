@@ -98,19 +98,35 @@ pub async fn run_ai_review_execution_with_context(
     if config.batch_review {
         return run_batched_ai_review(config, changes, source_dir, review_request).await;
     }
-    AiReviewExecution {
-        result: run_ai_review_single(
+    let result = match tokio::time::timeout(
+        Duration::from_secs(config.timeout_seconds.max(1)),
+        run_ai_review_single(
             config,
             changes,
             config.max_diff_bytes,
             None,
             source_dir,
             review_request,
-        )
-        .await,
+        ),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(ai_review_deadline_error(config)),
+    };
+    AiReviewExecution {
+        result,
         coverage: None,
         incomplete_files: Vec::new(),
     }
+}
+
+fn ai_review_deadline_error(config: &AiReviewConfig) -> AppError {
+    AppError::AiReview(format!(
+        "AI review {} timed out after {} seconds",
+        config.id,
+        config.timeout_seconds.max(1)
+    ))
 }
 
 async fn run_ai_review_single(
@@ -334,6 +350,7 @@ async fn run_batched_ai_review(
     source_dir: Option<&Path>,
     review_request: Option<&str>,
 ) -> AiReviewExecution {
+    let deadline = Instant::now() + Duration::from_secs(config.timeout_seconds.max(1));
     let mut plan = plan_ai_review_batches(
         changes,
         config.max_batch_diff_bytes.max(1),
@@ -367,15 +384,23 @@ async fn run_batched_ai_review(
             diff_bytes = batch.iter().map(|change| change.diff.len()).sum::<usize>(),
             "AI review batch started"
         );
-        let result = run_ai_review_single(
-            config,
-            batch,
-            config.max_batch_diff_bytes.max(1),
-            Some((batch_index, batch_count)),
-            source_dir,
-            review_request,
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let result = match tokio::time::timeout(
+            remaining,
+            run_ai_review_single(
+                config,
+                batch,
+                config.max_batch_diff_bytes.max(1),
+                Some((batch_index, batch_count)),
+                source_dir,
+                review_request,
+            ),
         )
-        .await;
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(ai_review_deadline_error(config)),
+        };
         match result {
             Ok(mut findings) => {
                 all_findings.append(&mut findings);
@@ -1951,7 +1976,7 @@ mod tests {
 
         let config = AiReviewConfig {
             base_url: format!("http://{}", addr),
-            timeout_seconds: 2,
+            timeout_seconds: 4,
             request_timeout_seconds: Some(3),
             ..test_ai_review_config()
         };

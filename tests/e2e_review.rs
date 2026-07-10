@@ -915,6 +915,68 @@ async fn ai_review_batches_large_merge_request_by_file() {
 }
 
 #[tokio::test]
+async fn batched_ai_review_preserves_coverage_when_total_deadline_fires() {
+    let ai_request_count = Arc::new(AtomicUsize::new(0));
+    let count_for_handler = Arc::clone(&ai_request_count);
+    let (listener, addr) = bind_test_listener().await;
+    let app = Router::new().route(
+        "/chat/completions",
+        post(move || {
+            let count = Arc::clone(&count_for_handler);
+            async move {
+                let request_index = count.fetch_add(1, Ordering::SeqCst);
+                if request_index > 0 {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                Json(json!({
+                    "choices": [{
+                        "message": {
+                            "content": "{\"findings\":[]}"
+                        }
+                    }]
+                }))
+            }
+        }),
+    );
+    spawn_server_on(listener, app);
+    let config = AiReviewConfig {
+        base_url: format!("http://{}", addr),
+        timeout_seconds: 1,
+        request_timeout_seconds: Some(5),
+        batch_review: true,
+        max_batch_diff_bytes: 160,
+        max_batches: 2,
+        ..test_ai_review_config(format!("http://{}", addr))
+    };
+    let changes = ["src/a.rs", "src/b.rs"]
+        .into_iter()
+        .map(|path| GitLabChange {
+            old_path: path.into(),
+            new_path: path.into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "@@ -1 +1 @@\n+let value = 1;\n".into(),
+        })
+        .collect::<Vec<_>>();
+
+    let execution = run_ai_review_execution_with_context(&config, &changes, None, None).await;
+    let coverage = execution.coverage.unwrap();
+
+    assert!(execution.result.is_err());
+    assert_eq!(coverage.required_batches, 2);
+    assert_eq!(coverage.planned_batches, 2);
+    assert_eq!(coverage.completed_batches, 1);
+    assert_eq!(coverage.fully_reviewed_files, 1);
+    assert_eq!(coverage.unreviewed_files, 1);
+    assert!(execution
+        .incomplete_files
+        .iter()
+        .any(|file| { file.path == "src/b.rs" && file.reason == "batch_execution_failed" }));
+    assert_eq!(ai_request_count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn ai_review_falls_back_to_json_content_when_tools_are_rejected() {
     let ai_request_count = Arc::new(AtomicUsize::new(0));
     let ai_request_count_for_handler = Arc::clone(&ai_request_count);

@@ -130,6 +130,11 @@ pub(crate) fn limited_diff_payload_details(
     let mut truncated = false;
     let mut files = Vec::new();
     for change in changes {
+        if output.len() >= max_bytes {
+            files.push(skipped_reviewed_file_payload(change));
+            truncated = true;
+            continue;
+        }
         let formatted = formatted_change_payload(change);
         let remaining = max_bytes.saturating_sub(output.len());
         let mut end = remaining.min(formatted.total_payload_bytes);
@@ -158,6 +163,15 @@ pub(crate) fn limited_diff_payload_details(
     }
 }
 
+fn skipped_reviewed_file_payload(change: &GitLabChange) -> ReviewedFilePayload {
+    ReviewedFilePayload {
+        path: change.new_path.clone(),
+        total_diff_bytes: change.diff.len(),
+        reviewed_diff_bytes: 0,
+        truncated: true,
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn change_diff_payload(change: &GitLabChange) -> String {
     formatted_change_payload(change).content
@@ -176,5 +190,29 @@ pub(crate) fn formatted_change_payload(change: &GitLabChange) -> FormattedChange
         content,
         diff_start,
         diff_end,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skipped_file_metadata_does_not_require_a_formatted_payload() {
+        let change = GitLabChange {
+            old_path: "src/large.rs".into(),
+            new_path: "src/large.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "+large diff\n".repeat(100),
+        };
+
+        let file = skipped_reviewed_file_payload(&change);
+
+        assert_eq!(file.path, "src/large.rs");
+        assert_eq!(file.total_diff_bytes, change.diff.len());
+        assert_eq!(file.reviewed_diff_bytes, 0);
+        assert!(file.truncated);
     }
 }
