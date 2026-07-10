@@ -117,6 +117,26 @@ pub struct DashboardTaskRun {
     pub error: Option<String>,
     pub started_at: String,
     pub finished_at: Option<String>,
+    pub coverage_total_files: Option<i64>,
+    pub coverage_fully_reviewed_files: Option<i64>,
+    pub coverage_partially_reviewed_files: Option<i64>,
+    pub coverage_unreviewed_files: Option<i64>,
+    pub coverage_total_diff_bytes: Option<i64>,
+    pub coverage_reviewed_diff_bytes: Option<i64>,
+    pub coverage_required_batches: Option<i64>,
+    pub coverage_planned_batches: Option<i64>,
+    pub coverage_completed_batches: Option<i64>,
+    pub coverage_complete: Option<bool>,
+    pub incomplete_files: Vec<DashboardCoverageFile>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct DashboardCoverageFile {
+    pub path: String,
+    pub status: String,
+    pub reason: String,
+    pub total_diff_bytes: i64,
+    pub reviewed_diff_bytes: i64,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -183,6 +203,7 @@ impl DashboardStore {
             "review_task_runs",
             "review_findings",
             "review_comment_records",
+            "review_coverage_files",
         ];
         for table in required {
             let exists: Option<i64> = sqlx::query_scalar(
@@ -201,6 +222,24 @@ impl DashboardStore {
             if !self.column_exists("review_requests", column).await? {
                 return Err(AppError::Storage(format!(
                     "dashboard database is missing required column `review_requests.{column}`; start gitlab-work-runner once to run migrations"
+                )));
+            }
+        }
+        for column in [
+            "coverage_total_files",
+            "coverage_fully_reviewed_files",
+            "coverage_partially_reviewed_files",
+            "coverage_unreviewed_files",
+            "coverage_total_diff_bytes",
+            "coverage_reviewed_diff_bytes",
+            "coverage_required_batches",
+            "coverage_planned_batches",
+            "coverage_completed_batches",
+            "coverage_complete",
+        ] {
+            if !self.column_exists("review_task_runs", column).await? {
+                return Err(AppError::Storage(format!(
+                    "dashboard database is missing required column `review_task_runs.{column}`; start gitlab-work-runner once to run migrations"
                 )));
             }
         }
@@ -535,7 +574,11 @@ where 1 = 1
     async fn tasks(&self, review_run_id: &str) -> AppResult<Vec<DashboardTaskRun>> {
         let rows = sqlx::query(
             r#"
-select task_type, task_id, title, status, findings, comments, error, started_at, finished_at
+select task_type, task_id, title, status, findings, comments, error, started_at, finished_at,
+    coverage_total_files, coverage_fully_reviewed_files, coverage_partially_reviewed_files,
+    coverage_unreviewed_files, coverage_total_diff_bytes, coverage_reviewed_diff_bytes,
+    coverage_required_batches, coverage_planned_batches, coverage_completed_batches,
+    coverage_complete
 from review_task_runs
 where review_run_id = ?
 order by started_at asc, id asc
@@ -544,11 +587,32 @@ order by started_at asc, id asc
         .bind(review_run_id)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|row| DashboardTaskRun {
-                task_type: row.get("task_type"),
-                task_id: row.get("task_id"),
+        let mut tasks = Vec::new();
+        for row in rows {
+            let task_type: String = row.get("task_type");
+            let task_id: String = row.get("task_id");
+            let file_rows = sqlx::query(
+                r#"select path, status, reason, total_diff_bytes, reviewed_diff_bytes
+from review_coverage_files where review_run_id = ? and task_type = ? and task_id = ? order by id"#,
+            )
+            .bind(review_run_id)
+            .bind(&task_type)
+            .bind(&task_id)
+            .fetch_all(&self.pool)
+            .await?;
+            let incomplete_files = file_rows
+                .into_iter()
+                .map(|file| DashboardCoverageFile {
+                    path: file.get("path"),
+                    status: file.get("status"),
+                    reason: file.get("reason"),
+                    total_diff_bytes: file.get("total_diff_bytes"),
+                    reviewed_diff_bytes: file.get("reviewed_diff_bytes"),
+                })
+                .collect();
+            tasks.push(DashboardTaskRun {
+                task_type,
+                task_id,
                 title: row.get("title"),
                 status: row.get("status"),
                 findings: row.get("findings"),
@@ -556,8 +620,20 @@ order by started_at asc, id asc
                 error: row.get("error"),
                 started_at: row.get("started_at"),
                 finished_at: row.get("finished_at"),
-            })
-            .collect())
+                coverage_total_files: row.get("coverage_total_files"),
+                coverage_fully_reviewed_files: row.get("coverage_fully_reviewed_files"),
+                coverage_partially_reviewed_files: row.get("coverage_partially_reviewed_files"),
+                coverage_unreviewed_files: row.get("coverage_unreviewed_files"),
+                coverage_total_diff_bytes: row.get("coverage_total_diff_bytes"),
+                coverage_reviewed_diff_bytes: row.get("coverage_reviewed_diff_bytes"),
+                coverage_required_batches: row.get("coverage_required_batches"),
+                coverage_planned_batches: row.get("coverage_planned_batches"),
+                coverage_completed_batches: row.get("coverage_completed_batches"),
+                coverage_complete: row.get("coverage_complete"),
+                incomplete_files,
+            });
+        }
+        Ok(tasks)
     }
 
     async fn findings(&self, review_run_id: &str) -> AppResult<Vec<DashboardFinding>> {

@@ -16,7 +16,10 @@ use super::{
         is_retryable_ai_error, perform_ai_review_http_attempt, shared_ai_http_client,
         AiReviewHttpResponse,
     },
-    ai_prompt::{build_review_prompt_with_limit, change_diff_payload, initial_chat_messages},
+    ai_prompt::{
+        build_review_prompt_with_limit, formatted_change_payload, initial_chat_messages,
+        limited_diff_payload_details,
+    },
     ai_schema::{
         AiFindingsResponse, ChatMessage, OpenAiChatRequest, OpenAiChatResponse, OpenAiMessage,
         OpenAiToolCall, ResponseFormat,
@@ -31,6 +34,43 @@ const AI_RESPONSE_PREVIEW_CHARS: usize = 1000;
 const AI_HTTP_ATTEMPTS: usize = 2;
 const TOOL_ARGUMENT_SUMMARY_CHARS: usize = 160;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewCoverage {
+    pub total_files: usize,
+    pub fully_reviewed_files: usize,
+    pub partially_reviewed_files: usize,
+    pub unreviewed_files: usize,
+    pub total_diff_bytes: usize,
+    pub reviewed_diff_bytes: usize,
+    pub required_batches: usize,
+    pub planned_batches: usize,
+    pub completed_batches: usize,
+    pub complete: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewCoverageFile {
+    pub path: String,
+    pub status: &'static str,
+    pub reason: &'static str,
+    pub total_diff_bytes: usize,
+    pub reviewed_diff_bytes: usize,
+}
+
+#[derive(Debug)]
+pub struct AiReviewExecution {
+    pub result: AppResult<Vec<Finding>>,
+    pub coverage: Option<ReviewCoverage>,
+    pub incomplete_files: Vec<ReviewCoverageFile>,
+}
+
+#[derive(Clone, Debug)]
+struct AiReviewBatchPlan {
+    batches: Vec<Vec<GitLabChange>>,
+    coverage: ReviewCoverage,
+    incomplete_files: Vec<ReviewCoverageFile>,
+}
+
 pub async fn run_ai_review(
     config: &AiReviewConfig,
     changes: &[GitLabChange],
@@ -44,18 +84,49 @@ pub async fn run_ai_review_with_context(
     source_dir: Option<&Path>,
     review_request: Option<&str>,
 ) -> AppResult<Vec<Finding>> {
+    run_ai_review_execution_with_context(config, changes, source_dir, review_request)
+        .await
+        .result
+}
+
+pub async fn run_ai_review_execution_with_context(
+    config: &AiReviewConfig,
+    changes: &[GitLabChange],
+    source_dir: Option<&Path>,
+    review_request: Option<&str>,
+) -> AiReviewExecution {
     if config.batch_review {
         return run_batched_ai_review(config, changes, source_dir, review_request).await;
     }
-    run_ai_review_single(
-        config,
-        changes,
-        config.max_diff_bytes,
-        None,
-        source_dir,
-        review_request,
+    let result = match tokio::time::timeout(
+        Duration::from_secs(config.timeout_seconds.max(1)),
+        run_ai_review_single(
+            config,
+            changes,
+            config.max_diff_bytes,
+            None,
+            source_dir,
+            review_request,
+        ),
     )
     .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(ai_review_deadline_error(config)),
+    };
+    AiReviewExecution {
+        result,
+        coverage: None,
+        incomplete_files: Vec::new(),
+    }
+}
+
+fn ai_review_deadline_error(config: &AiReviewConfig) -> AppError {
+    AppError::AiReview(format!(
+        "AI review {} timed out after {} seconds",
+        config.id,
+        config.timeout_seconds.max(1)
+    ))
 }
 
 async fn run_ai_review_single(
@@ -278,37 +349,146 @@ async fn run_batched_ai_review(
     changes: &[GitLabChange],
     source_dir: Option<&Path>,
     review_request: Option<&str>,
-) -> AppResult<Vec<Finding>> {
-    let batches = split_ai_review_batches(
+) -> AiReviewExecution {
+    let deadline = Instant::now() + Duration::from_secs(config.timeout_seconds.max(1));
+    let mut plan = plan_ai_review_batches(
         changes,
         config.max_batch_diff_bytes.max(1),
         config.max_batches.max(1),
     );
+    let batches = &plan.batches;
     info!(
         ai_review_id = %config.id,
         model = %config.model,
-        batch_count = batches.len(),
+        total_files = plan.coverage.total_files,
+        reviewed_files = plan.coverage.fully_reviewed_files + plan.coverage.partially_reviewed_files,
+        total_diff_bytes = plan.coverage.total_diff_bytes,
+        reviewed_diff_bytes = plan.coverage.reviewed_diff_bytes,
+        required_batches = plan.coverage.required_batches,
+        planned_batches = plan.coverage.planned_batches,
+        coverage_complete = plan.coverage.complete,
         max_batch_diff_bytes = config.max_batch_diff_bytes,
         max_batches = config.max_batches,
-        "AI review batching enabled"
+        "AI review batch plan created"
     );
 
     let mut all_findings = Vec::new();
     let batch_count = batches.len();
     for (index, batch) in batches.iter().enumerate() {
         let batch_index = index + 1;
-        let mut findings = run_ai_review_single(
-            config,
-            batch,
-            config.max_batch_diff_bytes.max(1),
-            Some((batch_index, batch_count)),
-            source_dir,
-            review_request,
+        info!(
+            ai_review_id = %config.id,
+            batch_index,
+            batch_count,
+            file_count = batch.len(),
+            diff_bytes = batch.iter().map(|change| change.diff.len()).sum::<usize>(),
+            "AI review batch started"
+        );
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let result = match tokio::time::timeout(
+            remaining,
+            run_ai_review_single(
+                config,
+                batch,
+                config.max_batch_diff_bytes.max(1),
+                Some((batch_index, batch_count)),
+                source_dir,
+                review_request,
+            ),
         )
-        .await?;
-        all_findings.append(&mut findings);
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(ai_review_deadline_error(config)),
+        };
+        match result {
+            Ok(mut findings) => {
+                all_findings.append(&mut findings);
+                plan.coverage.completed_batches += 1;
+            }
+            Err(err) => {
+                apply_batch_failure_coverage(
+                    &mut plan,
+                    changes,
+                    index,
+                    config.max_batch_diff_bytes.max(1),
+                );
+                return AiReviewExecution {
+                    result: Err(err),
+                    coverage: Some(plan.coverage),
+                    incomplete_files: plan.incomplete_files,
+                };
+            }
+        }
     }
-    Ok(all_findings)
+    plan.coverage.complete = plan.coverage.partially_reviewed_files == 0
+        && plan.coverage.unreviewed_files == 0
+        && plan.coverage.completed_batches == plan.coverage.planned_batches;
+    info!(
+        ai_review_id = %config.id,
+        coverage_files = %format!("{}/{}", plan.coverage.fully_reviewed_files + plan.coverage.partially_reviewed_files, plan.coverage.total_files),
+        coverage_diff_bytes = %format!("{}/{}", plan.coverage.reviewed_diff_bytes, plan.coverage.total_diff_bytes),
+        required_batches = plan.coverage.required_batches,
+        planned_batches = plan.coverage.planned_batches,
+        completed_batches = plan.coverage.completed_batches,
+        partially_reviewed_files = plan.coverage.partially_reviewed_files,
+        unreviewed_files = plan.coverage.unreviewed_files,
+        coverage_complete = plan.coverage.complete,
+        "AI review completed"
+    );
+    AiReviewExecution {
+        result: Ok(all_findings),
+        coverage: Some(plan.coverage),
+        incomplete_files: plan.incomplete_files,
+    }
+}
+
+fn apply_batch_failure_coverage(
+    plan: &mut AiReviewBatchPlan,
+    changes: &[GitLabChange],
+    failed_batch_index: usize,
+    max_batch_diff_bytes: usize,
+) {
+    let successful_files = plan
+        .batches
+        .iter()
+        .take(failed_batch_index)
+        .map(Vec::len)
+        .sum::<usize>();
+    let planned_files = plan.batches.iter().map(Vec::len).sum::<usize>();
+    plan.incomplete_files
+        .retain(|file| file.reason == "max_batches_reached");
+    let mut reviewed_diff_bytes = 0;
+    let mut partial = 0;
+    for batch in plan.batches.iter().take(failed_batch_index) {
+        for file in limited_diff_payload_details(batch, max_batch_diff_bytes).files {
+            reviewed_diff_bytes += file.reviewed_diff_bytes;
+            if file.truncated {
+                partial += 1;
+                plan.incomplete_files.push(ReviewCoverageFile {
+                    path: file.path,
+                    status: "partial",
+                    reason: "single_file_diff_truncated",
+                    total_diff_bytes: file.total_diff_bytes,
+                    reviewed_diff_bytes: file.reviewed_diff_bytes,
+                });
+            }
+        }
+    }
+    for change in changes.iter().take(planned_files).skip(successful_files) {
+        plan.incomplete_files.push(ReviewCoverageFile {
+            path: change.new_path.clone(),
+            status: "unreviewed",
+            reason: "batch_execution_failed",
+            total_diff_bytes: change.diff.len(),
+            reviewed_diff_bytes: 0,
+        });
+    }
+    plan.coverage.fully_reviewed_files = successful_files.saturating_sub(partial);
+    plan.coverage.partially_reviewed_files = partial;
+    plan.coverage.unreviewed_files = changes.len().saturating_sub(successful_files);
+    plan.coverage.reviewed_diff_bytes = reviewed_diff_bytes;
+    plan.coverage.complete = false;
 }
 
 fn serialize_review_request_body(
@@ -685,24 +865,21 @@ fn effective_request_timeout_seconds(config: &AiReviewConfig) -> u64 {
         .max(1)
 }
 
-fn split_ai_review_batches(
+fn plan_ai_review_batches(
     changes: &[GitLabChange],
     max_batch_diff_bytes: usize,
     max_batches: usize,
-) -> Vec<Vec<GitLabChange>> {
+) -> AiReviewBatchPlan {
     let max_batch_diff_bytes = max_batch_diff_bytes.max(1);
     let max_batches = max_batches.max(1);
-    let mut batches = Vec::new();
+    let mut all_batches = Vec::new();
     let mut current = Vec::new();
     let mut current_bytes = 0_usize;
 
     for change in changes {
-        let change_bytes = change_diff_payload(change).len();
+        let change_bytes = formatted_change_payload(change).total_payload_bytes;
         if !current.is_empty() && current_bytes + change_bytes > max_batch_diff_bytes {
-            batches.push(current);
-            if batches.len() >= max_batches {
-                return batches;
-            }
+            all_batches.push(current);
             current = Vec::new();
             current_bytes = 0;
         }
@@ -710,10 +887,64 @@ fn split_ai_review_batches(
         current_bytes += change_bytes;
     }
 
-    if !current.is_empty() && batches.len() < max_batches {
-        batches.push(current);
+    if !current.is_empty() {
+        all_batches.push(current);
     }
-    batches
+    let required_batches = all_batches.len();
+    let planned_batches = required_batches.min(max_batches);
+    let planned_files = all_batches
+        .iter()
+        .take(planned_batches)
+        .map(Vec::len)
+        .sum::<usize>();
+    let total_diff_bytes = changes.iter().map(|change| change.diff.len()).sum();
+    let mut reviewed_diff_bytes = 0;
+    let mut partially_reviewed_files = 0;
+    let mut incomplete_files = Vec::new();
+
+    for batch in all_batches.iter().take(planned_batches) {
+        let limited = limited_diff_payload_details(batch, max_batch_diff_bytes);
+        for file in limited.files {
+            reviewed_diff_bytes += file.reviewed_diff_bytes;
+            if file.truncated {
+                partially_reviewed_files += 1;
+                incomplete_files.push(ReviewCoverageFile {
+                    path: file.path,
+                    status: "partial",
+                    reason: "single_file_diff_truncated",
+                    total_diff_bytes: file.total_diff_bytes,
+                    reviewed_diff_bytes: file.reviewed_diff_bytes,
+                });
+            }
+        }
+    }
+    for change in changes.iter().skip(planned_files) {
+        incomplete_files.push(ReviewCoverageFile {
+            path: change.new_path.clone(),
+            status: "unreviewed",
+            reason: "max_batches_reached",
+            total_diff_bytes: change.diff.len(),
+            reviewed_diff_bytes: 0,
+        });
+    }
+    let unreviewed_files = changes.len().saturating_sub(planned_files);
+    let fully_reviewed_files = planned_files.saturating_sub(partially_reviewed_files);
+    AiReviewBatchPlan {
+        batches: all_batches.into_iter().take(planned_batches).collect(),
+        coverage: ReviewCoverage {
+            total_files: changes.len(),
+            fully_reviewed_files,
+            partially_reviewed_files,
+            unreviewed_files,
+            total_diff_bytes,
+            reviewed_diff_bytes,
+            required_batches,
+            planned_batches,
+            completed_batches: 0,
+            complete: false,
+        },
+        incomplete_files,
+    }
 }
 
 #[cfg(test)]
@@ -963,7 +1194,7 @@ mod tests {
     use crate::{
         gitlab::GitLabChange,
         review::{
-            ai_prompt::{build_review_prompt, limited_diff_payload},
+            ai_prompt::{build_review_prompt, change_diff_payload, limited_diff_payload},
             ai_tools::{list_files_tool, read_file_tool, search_code_tool},
         },
         rules::AiReviewContextTools,
@@ -1156,6 +1387,90 @@ mod tests {
 
         assert!(truncated);
         assert!(std::str::from_utf8(payload.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn batch_plan_scans_all_changes_after_batch_limit() {
+        let changes = ["a.rs", "b.rs", "c.rs"]
+            .into_iter()
+            .map(|path| GitLabChange {
+                old_path: path.into(),
+                new_path: path.into(),
+                new_file: false,
+                renamed_file: false,
+                deleted_file: false,
+                diff: "+x\n".into(),
+            })
+            .collect::<Vec<_>>();
+        let one_payload = change_diff_payload(&changes[0]).len();
+
+        let plan = plan_ai_review_batches(&changes, one_payload, 2);
+
+        assert_eq!(plan.coverage.required_batches, 3);
+        assert_eq!(plan.coverage.planned_batches, 2);
+        assert_eq!(plan.batches.len(), 2);
+        assert_eq!(plan.coverage.fully_reviewed_files, 2);
+        assert_eq!(plan.coverage.unreviewed_files, 1);
+        assert_eq!(plan.incomplete_files[0].path, "c.rs");
+        assert_eq!(plan.incomplete_files[0].reason, "max_batches_reached");
+    }
+
+    #[test]
+    fn batch_plan_counts_only_raw_diff_bytes_in_truncated_payload() {
+        let change = GitLabChange {
+            old_path: "src/long.rs".into(),
+            new_path: "src/long.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "+abcdef\n".into(),
+        };
+        let formatted = formatted_change_payload(&change);
+        let limit = formatted.diff_start + 3;
+
+        let plan = plan_ai_review_batches(&[change], limit, 1);
+
+        assert_eq!(plan.coverage.total_diff_bytes, 8);
+        assert_eq!(plan.coverage.reviewed_diff_bytes, 3);
+        assert_eq!(plan.coverage.partially_reviewed_files, 1);
+        assert_eq!(plan.incomplete_files[0].reviewed_diff_bytes, 3);
+        assert_eq!(
+            plan.incomplete_files[0].reason,
+            "single_file_diff_truncated"
+        );
+    }
+
+    #[test]
+    fn batch_failure_keeps_limit_and_execution_reasons_distinct() {
+        let changes = ["a.rs", "b.rs", "c.rs"]
+            .into_iter()
+            .map(|path| GitLabChange {
+                old_path: path.into(),
+                new_path: path.into(),
+                new_file: false,
+                renamed_file: false,
+                deleted_file: false,
+                diff: "+x\n".into(),
+            })
+            .collect::<Vec<_>>();
+        let limit = formatted_change_payload(&changes[0]).total_payload_bytes;
+        let mut plan = plan_ai_review_batches(&changes, limit, 2);
+        plan.coverage.completed_batches = 1;
+
+        apply_batch_failure_coverage(&mut plan, &changes, 1, limit);
+
+        assert_eq!(plan.coverage.completed_batches, 1);
+        assert_eq!(plan.coverage.fully_reviewed_files, 1);
+        assert_eq!(plan.coverage.unreviewed_files, 2);
+        assert_eq!(plan.coverage.reviewed_diff_bytes, changes[0].diff.len());
+        assert!(plan
+            .incomplete_files
+            .iter()
+            .any(|file| { file.path == "b.rs" && file.reason == "batch_execution_failed" }));
+        assert!(plan
+            .incomplete_files
+            .iter()
+            .any(|file| { file.path == "c.rs" && file.reason == "max_batches_reached" }));
     }
 
     #[test]
@@ -1661,7 +1976,7 @@ mod tests {
 
         let config = AiReviewConfig {
             base_url: format!("http://{}", addr),
-            timeout_seconds: 2,
+            timeout_seconds: 4,
             request_timeout_seconds: Some(3),
             ..test_ai_review_config()
         };

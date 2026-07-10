@@ -7,7 +7,7 @@ use axum::{
     Json, Router,
 };
 use gitlab_work_runner::{
-    ai_review::run_ai_review,
+    ai_review::{run_ai_review, run_ai_review_execution_with_context},
     gitlab::GitLabChange,
     gitlab::GitLabClient,
     review::ReviewService,
@@ -896,12 +896,84 @@ async fn ai_review_batches_large_merge_request_by_file() {
         },
     ];
 
-    let findings = run_ai_review(&config, &changes).await.unwrap();
+    let execution = run_ai_review_execution_with_context(&config, &changes, None, None).await;
+    let coverage = execution.coverage.unwrap();
+    let incomplete_files = execution.incomplete_files;
+    let findings = execution.result.unwrap();
 
     assert_eq!(ai_request_count.load(Ordering::SeqCst), 2);
+    assert_eq!(coverage.required_batches, 3);
+    assert_eq!(coverage.planned_batches, 2);
+    assert_eq!(coverage.completed_batches, 2);
+    assert!(!coverage.complete);
+    assert_eq!(incomplete_files.len(), 1);
+    assert_eq!(incomplete_files[0].path, "src/c.rs");
+    assert_eq!(incomplete_files[0].reason, "max_batches_reached");
     assert_eq!(findings.len(), 2);
     assert_eq!(findings[0].path, "src/a.rs");
     assert_eq!(findings[1].path, "src/b.rs");
+}
+
+#[tokio::test]
+async fn batched_ai_review_preserves_coverage_when_total_deadline_fires() {
+    let ai_request_count = Arc::new(AtomicUsize::new(0));
+    let count_for_handler = Arc::clone(&ai_request_count);
+    let (listener, addr) = bind_test_listener().await;
+    let app = Router::new().route(
+        "/chat/completions",
+        post(move || {
+            let count = Arc::clone(&count_for_handler);
+            async move {
+                let request_index = count.fetch_add(1, Ordering::SeqCst);
+                if request_index > 0 {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                Json(json!({
+                    "choices": [{
+                        "message": {
+                            "content": "{\"findings\":[]}"
+                        }
+                    }]
+                }))
+            }
+        }),
+    );
+    spawn_server_on(listener, app);
+    let config = AiReviewConfig {
+        base_url: format!("http://{}", addr),
+        timeout_seconds: 1,
+        request_timeout_seconds: Some(5),
+        batch_review: true,
+        max_batch_diff_bytes: 160,
+        max_batches: 2,
+        ..test_ai_review_config(format!("http://{}", addr))
+    };
+    let changes = ["src/a.rs", "src/b.rs"]
+        .into_iter()
+        .map(|path| GitLabChange {
+            old_path: path.into(),
+            new_path: path.into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "@@ -1 +1 @@\n+let value = 1;\n".into(),
+        })
+        .collect::<Vec<_>>();
+
+    let execution = run_ai_review_execution_with_context(&config, &changes, None, None).await;
+    let coverage = execution.coverage.unwrap();
+
+    assert!(execution.result.is_err());
+    assert_eq!(coverage.required_batches, 2);
+    assert_eq!(coverage.planned_batches, 2);
+    assert_eq!(coverage.completed_batches, 1);
+    assert_eq!(coverage.fully_reviewed_files, 1);
+    assert_eq!(coverage.unreviewed_files, 1);
+    assert!(execution
+        .incomplete_files
+        .iter()
+        .any(|file| { file.path == "src/b.rs" && file.reason == "batch_execution_failed" }));
+    assert_eq!(ai_request_count.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

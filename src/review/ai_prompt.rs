@@ -2,6 +2,29 @@ use crate::{gitlab::GitLabChange, rules::AiReviewConfig};
 
 use super::ai_schema::ChatMessage;
 
+#[derive(Clone, Debug)]
+pub(crate) struct FormattedChangePayload {
+    pub content: String,
+    pub total_payload_bytes: usize,
+    pub diff_start: usize,
+    pub diff_end: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ReviewedFilePayload {
+    pub path: String,
+    pub total_diff_bytes: usize,
+    pub reviewed_diff_bytes: usize,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct LimitedDiffPayload {
+    pub content: String,
+    pub files: Vec<ReviewedFilePayload>,
+    pub truncated: bool,
+}
+
 const SYSTEM_PROMPT: &str = "You are a concise code reviewer. Review only added lines in the provided GitLab merge request diff. Return strict JSON only, with a top-level findings array. Do not include markdown.";
 
 #[cfg(test)]
@@ -19,9 +42,9 @@ pub(crate) fn build_review_prompt_with_limit(
     max_diff_bytes: usize,
     review_request: Option<&str>,
 ) -> (String, usize, bool) {
-    let (diff_text, truncated) = limited_diff_payload(changes, max_diff_bytes);
-    let diff_payload_bytes = diff_text.len();
-    let truncated_note = if truncated {
+    let limited = limited_diff_payload_details(changes, max_diff_bytes);
+    let diff_payload_bytes = limited.content.len();
+    let truncated_note = if limited.truncated {
         "\ndiff 内容因为超过配置的字节限制已被截断。"
     } else {
         ""
@@ -41,9 +64,10 @@ pub(crate) fn build_review_prompt_with_limit(
         format!("\n\n本次触发说明：\n{review_request}")
     };
     let prompt = format!(
-        "请用中文审查这个 GitLab Merge Request diff。只报告高置信度错误，例如会导致编译失败、运行时错误、数据损坏、安全漏洞或明显错误逻辑的问题。不要报告风格建议、可维护性建议、命名问题、性能微优化或不确定的问题。{response_instruction}severity 必须固定为 \"error\"。只能使用 diff 新增行的行号。{context_tool_instruction}{extra_instructions}{review_request}{truncated_note}\n\n{diff_text}",
+        "请用中文审查这个 GitLab Merge Request diff。只报告高置信度错误，例如会导致编译失败、运行时错误、数据损坏、安全漏洞或明显错误逻辑的问题。不要报告风格建议、可维护性建议、命名问题、性能微优化或不确定的问题。{response_instruction}severity 必须固定为 \"error\"。只能使用 diff 新增行的行号。{context_tool_instruction}{extra_instructions}{review_request}{truncated_note}\n\n{}",
+        limited.content,
     );
-    (prompt, diff_payload_bytes, truncated)
+    (prompt, diff_payload_bytes, limited.truncated)
 }
 
 fn context_tool_instruction(config: &AiReviewConfig) -> String {
@@ -92,37 +116,103 @@ pub(crate) fn configured_system_prompt(config: &AiReviewConfig) -> &str {
         .unwrap_or(SYSTEM_PROMPT)
 }
 
+#[cfg(test)]
 pub(crate) fn limited_diff_payload(changes: &[GitLabChange], max_bytes: usize) -> (String, bool) {
-    let mut output = String::new();
-    let mut truncated = false;
-    for change in changes {
-        let fragment = change_diff_payload(change);
-        if output.len() + fragment.len() <= max_bytes {
-            output.push_str(&fragment);
-            continue;
-        }
-        let remaining = max_bytes.saturating_sub(output.len());
-        if remaining > 0 {
-            let mut end = remaining;
-            while end > 0 && !fragment.is_char_boundary(end) {
-                end -= 1;
-            }
-            output.push_str(&fragment[..end]);
-        }
-        truncated = true;
-        break;
-    }
-    (output, truncated)
+    let payload = limited_diff_payload_details(changes, max_bytes);
+    (payload.content, payload.truncated)
 }
 
+pub(crate) fn limited_diff_payload_details(
+    changes: &[GitLabChange],
+    max_bytes: usize,
+) -> LimitedDiffPayload {
+    let mut output = String::new();
+    let mut truncated = false;
+    let mut files = Vec::new();
+    for change in changes {
+        if output.len() >= max_bytes {
+            files.push(skipped_reviewed_file_payload(change));
+            truncated = true;
+            continue;
+        }
+        let formatted = formatted_change_payload(change);
+        let remaining = max_bytes.saturating_sub(output.len());
+        let mut end = remaining.min(formatted.total_payload_bytes);
+        while end > 0 && !formatted.content.is_char_boundary(end) {
+            end -= 1;
+        }
+        output.push_str(&formatted.content[..end]);
+        let reviewed_diff_bytes = end
+            .min(formatted.diff_end)
+            .saturating_sub(formatted.diff_start.min(end));
+        let file_truncated = end < formatted.total_payload_bytes;
+        files.push(ReviewedFilePayload {
+            path: change.new_path.clone(),
+            total_diff_bytes: change.diff.len(),
+            reviewed_diff_bytes,
+            truncated: file_truncated,
+        });
+        if file_truncated {
+            truncated = true;
+        }
+    }
+    LimitedDiffPayload {
+        content: output,
+        files,
+        truncated,
+    }
+}
+
+fn skipped_reviewed_file_payload(change: &GitLabChange) -> ReviewedFilePayload {
+    ReviewedFilePayload {
+        path: change.new_path.clone(),
+        total_diff_bytes: change.diff.len(),
+        reviewed_diff_bytes: 0,
+        truncated: true,
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn change_diff_payload(change: &GitLabChange) -> String {
-    format!(
-        "File: {}\nOld path: {}\nNew file: {}\nRenamed: {}\nDeleted: {}\n```diff\n{}\n```\n\n",
-        change.new_path,
-        change.old_path,
-        change.new_file,
-        change.renamed_file,
-        change.deleted_file,
-        change.diff
-    )
+    formatted_change_payload(change).content
+}
+
+pub(crate) fn formatted_change_payload(change: &GitLabChange) -> FormattedChangePayload {
+    let prefix = format!(
+        "File: {}\nOld path: {}\nNew file: {}\nRenamed: {}\nDeleted: {}\n```diff\n",
+        change.new_path, change.old_path, change.new_file, change.renamed_file, change.deleted_file,
+    );
+    let diff_start = prefix.len();
+    let diff_end = diff_start + change.diff.len();
+    let content = format!("{prefix}{}\n```\n\n", change.diff);
+    FormattedChangePayload {
+        total_payload_bytes: content.len(),
+        content,
+        diff_start,
+        diff_end,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skipped_file_metadata_does_not_require_a_formatted_payload() {
+        let change = GitLabChange {
+            old_path: "src/large.rs".into(),
+            new_path: "src/large.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "+large diff\n".repeat(100),
+        };
+
+        let file = skipped_reviewed_file_payload(&change);
+
+        assert_eq!(file.path, "src/large.rs");
+        assert_eq!(file.total_diff_bytes, change.diff.len());
+        assert_eq!(file.reviewed_diff_bytes, 0);
+        assert!(file.truncated);
+    }
 }
