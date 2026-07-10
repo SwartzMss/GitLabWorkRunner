@@ -14,21 +14,8 @@ const SEARCH_MAX_FILE_BYTES: u64 = 1024 * 1024;
 const READ_MAX_FILE_BYTES: usize = 1024 * 1024;
 const LIST_MAX_FILES: usize = 200;
 
-pub(crate) fn enabled_context_tools(config: &AiReviewConfig) -> Vec<OpenAiTool> {
-    if config.max_tool_calls == 0 {
-        return Vec::new();
-    }
-    let mut tools = Vec::new();
-    if config.context_tools.read_file {
-        tools.push(read_file_tool());
-    }
-    if config.context_tools.search_code {
-        tools.push(search_code_tool());
-    }
-    if config.context_tools.list_files {
-        tools.push(list_files_tool());
-    }
-    tools
+pub(crate) fn enabled_context_tools(_config: &AiReviewConfig) -> Vec<OpenAiTool> {
+    vec![read_file_tool(), search_code_tool(), list_files_tool()]
 }
 
 pub(crate) fn read_file_tool() -> OpenAiTool {
@@ -159,23 +146,21 @@ pub(crate) struct AiReviewToolContext {
 impl AiReviewToolContext {
     pub(crate) fn new(config: &AiReviewConfig, source_dir: Option<&Path>) -> Self {
         let source_dir = source_dir.map(Path::to_path_buf);
-        if config.context_tools.any_enabled() {
-            info!(
-                ai_review_id = %config.id,
-                read_file = config.context_tools.read_file,
-                search_code = config.context_tools.search_code,
-                list_files = config.context_tools.list_files,
-                max_tool_calls = config.max_tool_calls,
-                max_tool_result_bytes = config.max_tool_result_bytes,
-                source_dir = %source_dir.as_ref().map(|path| path.display().to_string()).unwrap_or_default(),
-                "AI review context tools configured"
-            );
-        }
+        info!(
+            ai_review_id = %config.id,
+            read_file = true,
+            search_code = true,
+            list_files = true,
+            max_tool_calls = config.max_tool_calls,
+            max_tool_result_bytes = config.max_tool_result_bytes,
+            source_dir = %source_dir.as_ref().map(|path| path.display().to_string()).unwrap_or_default(),
+            "AI review context tools configured"
+        );
         Self {
             source_dir,
-            read_file: config.context_tools.read_file,
-            search_code: config.context_tools.search_code,
-            list_files: config.context_tools.list_files,
+            read_file: true,
+            search_code: true,
+            list_files: true,
             max_result_bytes: config.max_tool_result_bytes.max(1),
         }
     }
@@ -523,7 +508,7 @@ fn read_utf8_file_limited(path: &Path, max_bytes: usize) -> Result<(String, bool
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rules::{AiReviewConfig, AiReviewContextTools};
+    use crate::rules::AiReviewConfig;
     use std::io::Write;
 
     fn test_config() -> AiReviewConfig {
@@ -535,20 +520,13 @@ mod tests {
             model: "test-model".into(),
             timeout_seconds: 60,
             request_timeout_seconds: None,
-            max_diff_bytes: 60_000,
             second_pass_on_clean: false,
-            batch_review: false,
             max_batch_diff_bytes: 30_000,
             max_batches: 6,
             system_prompt: None,
             extra_instructions: String::new(),
             max_tool_calls: 8,
             max_tool_result_bytes: 60_000,
-            context_tools: AiReviewContextTools {
-                read_file: false,
-                search_code: true,
-                list_files: true,
-            },
         }
     }
 
@@ -628,11 +606,6 @@ mod tests {
         let path = temp.path().join("large.txt");
         std::fs::write(&path, "一二三四五六").unwrap();
         let config = AiReviewConfig {
-            context_tools: AiReviewContextTools {
-                read_file: true,
-                search_code: false,
-                list_files: false,
-            },
             max_tool_result_bytes: 10,
             ..test_config()
         };

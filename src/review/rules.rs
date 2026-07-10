@@ -33,12 +33,8 @@ pub struct AiReviewConfig {
     pub timeout_seconds: u64,
     #[serde(default)]
     pub request_timeout_seconds: Option<u64>,
-    #[serde(default = "default_ai_max_diff_bytes")]
-    pub max_diff_bytes: usize,
     #[serde(default)]
     pub second_pass_on_clean: bool,
-    #[serde(default)]
-    pub batch_review: bool,
     #[serde(default = "default_ai_max_batch_diff_bytes")]
     pub max_batch_diff_bytes: usize,
     #[serde(default = "default_ai_max_batches")]
@@ -51,8 +47,6 @@ pub struct AiReviewConfig {
     pub max_tool_calls: usize,
     #[serde(default = "default_ai_max_tool_result_bytes")]
     pub max_tool_result_bytes: usize,
-    #[serde(default)]
-    pub context_tools: AiReviewContextTools,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -65,8 +59,6 @@ pub struct AiReviewPromptConfig {
     pub max_tool_calls: usize,
     #[serde(default = "default_ai_max_tool_result_bytes")]
     pub max_tool_result_bytes: usize,
-    #[serde(default)]
-    pub context_tools: AiReviewContextTools,
 }
 
 impl Default for AiReviewPromptConfig {
@@ -76,24 +68,7 @@ impl Default for AiReviewPromptConfig {
             extra_instructions: String::new(),
             max_tool_calls: default_ai_max_tool_calls(),
             max_tool_result_bytes: default_ai_max_tool_result_bytes(),
-            context_tools: AiReviewContextTools::default(),
         }
-    }
-}
-
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
-pub struct AiReviewContextTools {
-    #[serde(default)]
-    pub read_file: bool,
-    #[serde(default)]
-    pub search_code: bool,
-    #[serde(default)]
-    pub list_files: bool,
-}
-
-impl AiReviewContextTools {
-    pub fn any_enabled(&self) -> bool {
-        self.read_file || self.search_code || self.list_files
     }
 }
 
@@ -149,7 +124,6 @@ impl Ruleset {
             config.extra_instructions = parsed.ai_review.extra_instructions.clone();
             config.max_tool_calls = parsed.ai_review.max_tool_calls;
             config.max_tool_result_bytes = parsed.ai_review.max_tool_result_bytes;
-            config.context_tools = parsed.ai_review.context_tools.clone();
             ai_reviews.push(CompiledAiReview { config });
         }
         let hash = format!("{:x}", Sha256::digest(text.as_bytes()));
@@ -195,10 +169,6 @@ fn default_script_timeout_seconds() -> u64 {
 
 fn default_ai_timeout_seconds() -> u64 {
     60
-}
-
-fn default_ai_max_diff_bytes() -> usize {
-    60_000
 }
 
 fn default_ai_max_batch_diff_bytes() -> usize {
@@ -286,16 +256,13 @@ model = "gpt-4.1-mini"
         assert_eq!(reviews[0].api_key, "test-api-key");
         assert_eq!(reviews[0].timeout_seconds, 60);
         assert_eq!(reviews[0].request_timeout_seconds, None);
-        assert_eq!(reviews[0].max_diff_bytes, 60_000);
         assert!(!reviews[0].second_pass_on_clean);
-        assert!(!reviews[0].batch_review);
         assert_eq!(reviews[0].max_batch_diff_bytes, 30_000);
         assert_eq!(reviews[0].max_batches, 6);
         assert_eq!(reviews[0].system_prompt, None);
         assert!(reviews[0].extra_instructions.is_empty());
         assert_eq!(reviews[0].max_tool_calls, 30);
         assert_eq!(reviews[0].max_tool_result_bytes, 60_000);
-        assert_eq!(reviews[0].context_tools, AiReviewContextTools::default());
     }
 
     #[test]
@@ -308,10 +275,6 @@ extra_instructions = "Focus on C++ lifetime bugs."
 max_tool_calls = 4
 max_tool_result_bytes = 12000
 
-[ai_review.context_tools]
-read_file = true
-search_code = true
-
 [[ai_reviews]]
 id = "ai-review"
 title = "AI Review"
@@ -320,7 +283,6 @@ api_key = "test-api-key"
 model = "gpt-4.1-mini"
 timeout_seconds = 180
 request_timeout_seconds = 90
-batch_review = true
 max_batch_diff_bytes = 30000
 max_batches = 6
 "#,
@@ -332,7 +294,6 @@ max_batches = 6
         assert_eq!(reviews.len(), 1);
         assert_eq!(reviews[0].timeout_seconds, 180);
         assert_eq!(reviews[0].request_timeout_seconds, Some(90));
-        assert!(reviews[0].batch_review);
         assert_eq!(reviews[0].max_batch_diff_bytes, 30_000);
         assert_eq!(reviews[0].max_batches, 6);
         assert_eq!(
@@ -342,9 +303,6 @@ max_batches = 6
         assert_eq!(reviews[0].extra_instructions, "Focus on C++ lifetime bugs.");
         assert_eq!(reviews[0].max_tool_calls, 4);
         assert_eq!(reviews[0].max_tool_result_bytes, 12_000);
-        assert!(reviews[0].context_tools.read_file);
-        assert!(reviews[0].context_tools.search_code);
-        assert!(!reviews[0].context_tools.list_files);
     }
 
     #[test]
