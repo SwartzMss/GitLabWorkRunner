@@ -33,16 +33,16 @@ pub(crate) fn build_review_prompt(
     changes: &[GitLabChange],
     review_request: Option<&str>,
 ) -> (String, usize, bool) {
-    build_review_prompt_with_limit(config, changes, config.max_diff_bytes, review_request)
+    build_review_prompt_with_limit(config, changes, config.max_batch_diff_bytes, review_request)
 }
 
 pub(crate) fn build_review_prompt_with_limit(
     config: &AiReviewConfig,
     changes: &[GitLabChange],
-    max_diff_bytes: usize,
+    diff_limit_bytes: usize,
     review_request: Option<&str>,
 ) -> (String, usize, bool) {
-    let limited = limited_diff_payload_details(changes, max_diff_bytes);
+    let limited = limited_diff_payload_details(changes, diff_limit_bytes);
     let diff_payload_bytes = limited.content.len();
     let truncated_note = if limited.truncated {
         "\ndiff 内容因为超过配置的字节限制已被截断。"
@@ -70,23 +70,10 @@ pub(crate) fn build_review_prompt_with_limit(
     (prompt, diff_payload_bytes, limited.truncated)
 }
 
-fn context_tool_instruction(config: &AiReviewConfig) -> String {
-    if config.max_tool_calls == 0 || !config.context_tools.any_enabled() {
-        return String::new();
-    }
-    let mut tools = Vec::new();
-    if config.context_tools.list_files {
-        tools.push("list_files");
-    }
-    if config.context_tools.search_code {
-        tools.push("search_code");
-    }
-    if config.context_tools.read_file {
-        tools.push("read_file");
-    }
+fn context_tool_instruction(_config: &AiReviewConfig) -> String {
     format!(
         "\n\n上下文工具已启用：{}。只有当 diff 信息不足以判断真实 bug 时才调用工具；不要为了风格、命名、微优化或不确定猜测调用工具。优先用 list_files/search_code 定位相关文件或符号，再用 read_file 读取必要文件。工具结果只能作为确认依据，最终仍然只提交高置信度、位于新增行的错误。",
-        tools.join(", ")
+        "list_files, search_code, read_file"
     )
 }
 

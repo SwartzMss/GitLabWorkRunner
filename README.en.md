@@ -119,6 +119,28 @@ target/release/gitlab-work-runner        # Linux / macOS release
 
 Before running the binary, still prepare `config.toml` and `rules.toml`.
 
+Run in the background on Linux:
+
+```bash
+cargo build --release
+./scripts/linux-background.sh start
+./scripts/linux-background.sh status
+```
+
+Stop or restart:
+
+```bash
+./scripts/linux-background.sh stop
+./scripts/linux-background.sh restart
+```
+
+The script manages runner and Dashboard together by default, runs from the project root, writes pid files to `run/`, and appends stdout/stderr to `logs/`. To manage one service only:
+
+```bash
+./scripts/linux-background.sh start runner
+./scripts/linux-background.sh start dashboard
+```
+
 ## Service Config
 
 `config.toml` controls the service, GitLab access, storage, and rules file:
@@ -217,11 +239,6 @@ Do not report style suggestions, naming suggestions, or uncertain issues.
 max_tool_calls = 30
 max_tool_result_bytes = 60000
 
-[ai_review.context_tools]
-read_file = false
-search_code = false
-list_files = false
-
 [[ai_reviews]]
 id = "ai-review"
 title = "AI Review"
@@ -230,9 +247,7 @@ api_key = "<your-ai-api-key>"
 model = "gpt-4.1-mini"
 timeout_seconds = 1200
 request_timeout_seconds = 420
-max_diff_bytes = 60000
 second_pass_on_clean = false
-batch_review = true
 max_batch_diff_bytes = 15000
 max_batches = 10
 ```
@@ -240,15 +255,15 @@ max_batches = 10
 Posting a standalone `@ai-review` in an MR comment triggers the entry whose `id = "ai-review"`. MR update events are accepted and ignored; they do not enter the review queue.
 
 `[ai_review]` is the global AI Review prompt configuration. `system_prompt` replaces the built-in system prompt; `extra_instructions` is appended to the user prompt. If omitted, the built-in prompt is used.
-`[ai_review.context_tools]` configures built-in read-only context tools. They are disabled by default. When enabled, the service downloads the MR head archive and lets the model request `read_file`, `search_code`, or `list_files` through tool calls. The runner only returns text content inside the repository directory; it does not execute shell commands and skips `.env` and `.git`.
-`max_tool_calls` defaults to `30`, and `max_tool_result_bytes` defaults to `60000`.
-When context tools are enabled, logs include each tool call's tool name, argument summary, returned bytes, result truncation status, tool-call limit status, batch index/count, and cumulative tool-call count. This makes it clear whether the model actually called `read_file`, `search_code`, or `list_files`.
+Built-in read-only context tools are enabled by default. The service downloads the MR head archive and lets the model request `read_file`, `search_code`, or `list_files` through tool calls. The runner only returns text content inside the repository directory; it does not execute shell commands and skips `.env` and `.git`.
+`max_tool_calls` defaults to `30`; `0` means unlimited tool calls. `max_tool_result_bytes` defaults to `60000`.
+Logs include each tool call's tool name, argument summary, returned bytes, result truncation status, tool-call limit status, batch index/count, and cumulative tool-call count. This makes it clear whether the model actually called `read_file`, `search_code`, or `list_files`.
 `request_timeout_seconds` is the timeout for one AI API request. If omitted, it defaults to `timeout_seconds / 2` so one retry still fits inside the total review deadline.
 `second_pass_on_clean` defaults to `false`; set it to `true` to run one confirmation pass when the first AI Review finds nothing.
 AI Review requests Chat Completions `tool_calls` structured output by default and parses findings from `submit_review_findings` arguments. If no tool call is returned, it falls back to parsing JSON in `content`. Built-in context tools do not require MCP.
-`batch_review` defaults to `false`; set it to `true` to split large MR diffs by complete file diffs. `max_batch_diff_bytes` controls the per-batch diff byte limit, and `max_batches` controls the maximum number of AI requests.
+AI Review splits MR diffs by complete file diffs by default. `max_batch_diff_bytes` controls the per-batch diff byte limit, and `max_batches` controls the maximum number of AI requests; `0` means unlimited batches.
 
-When batching is enabled, the runner scans all MR changes and stores file counts, raw diff byte counts, and required/planned/completed batch counts in SQLite. Files omitted by `max_batches` and files partially reviewed because a single diff exceeded the batch limit appear in Dashboard run details. Coverage is never added to GitLab comments.
+The runner scans all MR changes and stores file counts, raw diff byte counts, and required/planned/completed batch counts in SQLite. Files omitted by `max_batches` and files partially reviewed because a single diff exceeded the batch limit appear in Dashboard run details. Coverage is never added to GitLab comments.
 
 Do not commit a real `rules.toml` that contains an actual `api_key`.
 

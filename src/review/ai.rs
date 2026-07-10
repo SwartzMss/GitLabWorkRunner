@@ -95,30 +95,7 @@ pub async fn run_ai_review_execution_with_context(
     source_dir: Option<&Path>,
     review_request: Option<&str>,
 ) -> AiReviewExecution {
-    if config.batch_review {
-        return run_batched_ai_review(config, changes, source_dir, review_request).await;
-    }
-    let result = match tokio::time::timeout(
-        Duration::from_secs(config.timeout_seconds.max(1)),
-        run_ai_review_single(
-            config,
-            changes,
-            config.max_diff_bytes,
-            None,
-            source_dir,
-            review_request,
-        ),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(_) => Err(ai_review_deadline_error(config)),
-    };
-    AiReviewExecution {
-        result,
-        coverage: None,
-        incomplete_files: Vec::new(),
-    }
+    run_batched_ai_review(config, changes, source_dir, review_request).await
 }
 
 fn ai_review_deadline_error(config: &AiReviewConfig) -> AppError {
@@ -135,7 +112,7 @@ fn ai_review_deadline_error(config: &AiReviewConfig) -> AppError {
 async fn run_ai_review_single(
     config: &AiReviewConfig,
     changes: &[GitLabChange],
-    max_diff_bytes: usize,
+    diff_limit_bytes: usize,
     batch: Option<(usize, usize)>,
     source_dir: Option<&Path>,
     review_request: Option<&str>,
@@ -148,7 +125,7 @@ async fn run_ai_review_single(
         ));
     }
     let (prompt, diff_payload_bytes, diff_payload_truncated) =
-        build_review_prompt_with_limit(config, changes, max_diff_bytes, review_request);
+        build_review_prompt_with_limit(config, changes, diff_limit_bytes, review_request);
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
     let request_timeout_seconds = effective_request_timeout_seconds(config);
     let request_timeout = Duration::from_secs(request_timeout_seconds);
@@ -164,7 +141,7 @@ async fn run_ai_review_single(
         timeout_seconds = config.timeout_seconds,
         request_timeout_seconds,
         request_guard_timeout_seconds = request_guard_timeout.as_secs(),
-        max_diff_bytes = config.max_diff_bytes,
+        diff_limit_bytes,
         change_count = changes.len(),
         diff_payload_bytes,
         diff_payload_truncated,
@@ -377,7 +354,7 @@ async fn run_batched_ai_review(
     let mut plan = plan_ai_review_batches(
         changes,
         config.max_batch_diff_bytes.max(1),
-        config.max_batches.max(1),
+        config.max_batches,
     );
     let batches = &plan.batches;
     info!(
@@ -657,8 +634,13 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
             batch_count = batch.map(|(_, count)| count),
             "AI review context tool calls requested"
         );
-        let remaining_tool_calls = config.max_tool_calls.saturating_sub(tool_calls_used);
-        if remaining_tool_calls == 0 && tool_call_limit_notice_sent {
+        let unlimited_tool_calls = config.max_tool_calls == 0;
+        let remaining_tool_calls = if unlimited_tool_calls {
+            usize::MAX
+        } else {
+            config.max_tool_calls.saturating_sub(tool_calls_used)
+        };
+        if !unlimited_tool_calls && remaining_tool_calls == 0 && tool_call_limit_notice_sent {
             warn!(
                 ai_review_id = %config.id,
                 model = %config.model,
@@ -677,7 +659,7 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                 ),
             ));
         }
-        if context_tool_calls.len() > remaining_tool_calls {
+        if !unlimited_tool_calls && context_tool_calls.len() > remaining_tool_calls {
             warn!(
                 ai_review_id = %config.id,
                 model = %config.model,
@@ -924,7 +906,6 @@ fn plan_ai_review_batches(
     max_batches: usize,
 ) -> AiReviewBatchPlan {
     let max_batch_diff_bytes = max_batch_diff_bytes.max(1);
-    let max_batches = max_batches.max(1);
     let mut all_batches = Vec::new();
     let mut current = Vec::new();
     let mut current_bytes = 0_usize;
@@ -944,7 +925,11 @@ fn plan_ai_review_batches(
         all_batches.push(current);
     }
     let required_batches = all_batches.len();
-    let planned_batches = required_batches.min(max_batches);
+    let planned_batches = if max_batches == 0 {
+        required_batches
+    } else {
+        required_batches.min(max_batches)
+    };
     let planned_files = all_batches
         .iter()
         .take(planned_batches)
@@ -1270,7 +1255,6 @@ mod tests {
             ai_prompt::{build_review_prompt, change_diff_payload, limited_diff_payload},
             ai_tools::{list_files_tool, read_file_tool, search_code_tool},
         },
-        rules::AiReviewContextTools,
         rules::Severity,
     };
     use serde_json::Value;
@@ -1298,16 +1282,13 @@ mod tests {
             model: "test-model".into(),
             timeout_seconds: 60,
             request_timeout_seconds: None,
-            max_diff_bytes: 60_000,
             second_pass_on_clean: false,
-            batch_review: false,
             max_batch_diff_bytes: 30_000,
             max_batches: 6,
             system_prompt: None,
             extra_instructions: String::new(),
             max_tool_calls: 8,
             max_tool_result_bytes: 60_000,
-            context_tools: AiReviewContextTools::default(),
         }
     }
 
@@ -1489,6 +1470,30 @@ mod tests {
     }
 
     #[test]
+    fn batch_plan_treats_zero_max_batches_as_unlimited() {
+        let changes = ["a.rs", "b.rs", "c.rs"]
+            .into_iter()
+            .map(|path| GitLabChange {
+                old_path: path.into(),
+                new_path: path.into(),
+                new_file: false,
+                renamed_file: false,
+                deleted_file: false,
+                diff: "+x\n".into(),
+            })
+            .collect::<Vec<_>>();
+        let one_payload = change_diff_payload(&changes[0]).len();
+
+        let plan = plan_ai_review_batches(&changes, one_payload, 0);
+
+        assert_eq!(plan.coverage.required_batches, 3);
+        assert_eq!(plan.coverage.planned_batches, 3);
+        assert_eq!(plan.batches.len(), 3);
+        assert_eq!(plan.coverage.unreviewed_files, 0);
+        assert!(plan.incomplete_files.is_empty());
+    }
+
+    #[test]
     fn batch_plan_counts_only_raw_diff_bytes_in_truncated_payload() {
         let change = GitLabChange {
             old_path: "src/long.rs".into(),
@@ -1609,15 +1614,8 @@ mod tests {
     }
 
     #[test]
-    fn prompt_guides_context_tool_usage_when_enabled() {
-        let config = AiReviewConfig {
-            context_tools: AiReviewContextTools {
-                read_file: true,
-                search_code: true,
-                list_files: true,
-            },
-            ..test_ai_review_config()
-        };
+    fn prompt_guides_context_tool_usage_by_default() {
+        let config = test_ai_review_config();
         let changes = vec![GitLabChange {
             old_path: "src/lib.rs".into(),
             new_path: "src/lib.rs".into(),
@@ -1655,24 +1653,15 @@ mod tests {
         assert_eq!(json["model"], "test-model");
         assert_eq!(json["messages"][1]["content"], prompt);
         assert!(json.get("response_format").is_none());
-        assert_eq!(json["tools"][0]["type"], "function");
-        assert_eq!(
-            json["tools"][0]["function"]["name"],
-            "submit_review_findings"
-        );
+        assert!(json["tools"].as_array().unwrap().iter().any(|tool| {
+            tool["type"] == "function" && tool["function"]["name"] == "submit_review_findings"
+        }));
         assert!(json.get("tool_choice").is_none());
     }
 
     #[test]
     fn serializes_enabled_context_tools() {
-        let config = AiReviewConfig {
-            context_tools: AiReviewContextTools {
-                read_file: true,
-                search_code: true,
-                list_files: true,
-            },
-            ..test_ai_review_config()
-        };
+        let config = test_ai_review_config();
         let messages = initial_chat_messages(&config, "prompt");
         let body = serialize_review_request_body(&config, &messages, true).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
@@ -1744,14 +1733,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("lib.rs"), "pub fn value() {}\n").unwrap();
         std::fs::write(temp.path().join(".env"), "SECRET=1\n").unwrap();
-        let config = AiReviewConfig {
-            context_tools: AiReviewContextTools {
-                read_file: true,
-                search_code: false,
-                list_files: false,
-            },
-            ..test_ai_review_config()
-        };
+        let config = test_ai_review_config();
         let context = AiReviewToolContext::new(&config, Some(temp.path()));
 
         let parent_result = context.read_file(r#"{"path":"../lib.rs"}"#);
@@ -1866,11 +1848,6 @@ mod tests {
         let config = AiReviewConfig {
             base_url: format!("http://{}", addr),
             max_tool_calls: 1,
-            context_tools: AiReviewContextTools {
-                read_file: false,
-                search_code: true,
-                list_files: false,
-            },
             ..test_ai_review_config()
         };
         let changes = vec![GitLabChange {
@@ -1950,11 +1927,6 @@ mod tests {
 
         let config = AiReviewConfig {
             base_url: format!("http://{}", addr),
-            context_tools: AiReviewContextTools {
-                read_file: false,
-                search_code: true,
-                list_files: false,
-            },
             ..test_ai_review_config()
         };
         let changes = vec![GitLabChange {
@@ -1985,8 +1957,7 @@ mod tests {
                 let attempt_count = Arc::clone(&attempt_count_for_server);
                 tokio::spawn(async move {
                     let attempt = attempt_count.fetch_add(1, Ordering::SeqCst) + 1;
-                    let mut buffer = [0_u8; 4096];
-                    let _ = stream.read(&mut buffer).await.unwrap();
+                    let _ = read_http_json_request(&mut stream).await;
                     if attempt == 1 {
                         sleep(Duration::from_secs(2)).await;
                         return;
@@ -2032,8 +2003,7 @@ mod tests {
             loop {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 tokio::spawn(async move {
-                    let mut buffer = [0_u8; 4096];
-                    let _ = stream.read(&mut buffer).await.unwrap();
+                    let _ = read_http_json_request(&mut stream).await;
                     sleep(Duration::from_secs(2)).await;
                     let body =
                         b"{\"choices\":[{\"message\":{\"content\":\"{\\\"findings\\\":[]}\"}}]}";
@@ -2079,8 +2049,7 @@ mod tests {
                 let attempt_count = Arc::clone(&attempt_count_for_server);
                 tokio::spawn(async move {
                     attempt_count.fetch_add(1, Ordering::SeqCst);
-                    let mut buffer = [0_u8; 4096];
-                    let _ = stream.read(&mut buffer).await.unwrap();
+                    let _ = read_http_json_request(&mut stream).await;
                     sleep(Duration::from_secs(2)).await;
                 });
             }
@@ -2122,8 +2091,7 @@ mod tests {
                 let request_count = Arc::clone(&request_count_for_server);
                 tokio::spawn(async move {
                     let request_index = request_count.fetch_add(1, Ordering::SeqCst) + 1;
-                    let mut buffer = [0_u8; 4096];
-                    let _ = stream.read(&mut buffer).await.unwrap();
+                    let _ = read_http_json_request(&mut stream).await;
                     if request_index == 1 {
                         let body = br#"{"choices":[{"message":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"search_code","arguments":"{\"query\":\"panic\"}"}}]}}]}"#;
                         let response = format!(
@@ -2143,11 +2111,6 @@ mod tests {
             base_url: format!("http://{}", addr),
             timeout_seconds: 10,
             request_timeout_seconds: Some(1),
-            context_tools: AiReviewContextTools {
-                read_file: false,
-                search_code: true,
-                list_files: false,
-            },
             ..test_ai_review_config()
         };
         let changes = vec![GitLabChange {

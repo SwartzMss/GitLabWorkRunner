@@ -8,15 +8,10 @@ extra_instructions = """
 重点关注编译错误、运行时错误、资源生命周期、线程安全和安全漏洞。
 不要报告风格建议、命名建议、頭文件依賴或不确定的问题。
 """
-# Built-in read-only context tools are disabled by default. Enable them when the model may need
-# repository context beyond the diff. The runner controls call count and result size.
+# Built-in read-only context tools are enabled by default. The runner controls call count
+# and result size.
 max_tool_calls = 30
 max_tool_result_bytes = 60000
-
-[ai_review.context_tools]
-read_file = true
-search_code = true
-list_files = true
 
 [[ai_reviews]]
 id = "ai-review"
@@ -26,11 +21,9 @@ api_key = "<your-ai-api-key>"
 model = "gpt-4.1-mini"
 timeout_seconds = 1200
 request_timeout_seconds = 420
-max_diff_bytes = 60000
 second_pass_on_clean = false
 # AI Review requests Chat Completions tool_calls by default and falls back to JSON content parsing when needed.
 # This does not require MCP; findings are read from submit_review_findings arguments when tool_calls are returned.
-batch_review = true
 max_batch_diff_bytes = 30000
 max_batches = 10
 

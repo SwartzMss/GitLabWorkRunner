@@ -119,6 +119,28 @@ target/release/gitlab-work-runner        # Linux / macOS release
 
 运行前仍需要准备 `config.toml` 和 `rules.toml`。
 
+Linux 后台运行：
+
+```bash
+cargo build --release
+./scripts/linux-background.sh start
+./scripts/linux-background.sh status
+```
+
+停止或重启：
+
+```bash
+./scripts/linux-background.sh stop
+./scripts/linux-background.sh restart
+```
+
+脚本默认同时管理 runner 和 Dashboard，在项目根目录运行，pid 写入 `run/`，stdout/stderr 追加到 `logs/`。如果只需要管理单个服务：
+
+```bash
+./scripts/linux-background.sh start runner
+./scripts/linux-background.sh start dashboard
+```
+
 ## 服务配置
 
 `config.toml` 控制服务、GitLab、存储和规则文件：
@@ -217,11 +239,6 @@ extra_instructions = """
 max_tool_calls = 30
 max_tool_result_bytes = 60000
 
-[ai_review.context_tools]
-read_file = true
-search_code = true
-list_files = true
-
 [[ai_reviews]]
 id = "ai-review"
 title = "AI Review"
@@ -230,25 +247,22 @@ api_key = "<your-ai-api-key>"
 model = "gpt-4.1-mini"
 timeout_seconds = 1200
 request_timeout_seconds = 420
-max_diff_bytes = 60000
 second_pass_on_clean = false
-batch_review = true
 max_batch_diff_bytes = 15000
 max_batches = 10
 ```
 
 在 MR 评论中发送独立的 `@ai-review` 会触发 `id = "ai-review"` 的配置。MR 更新事件会被接收并忽略，不会进入 review 队列。
 `[ai_review]` 是全局 AI Review prompt 配置：`system_prompt` 可以替换内置 system prompt，`extra_instructions` 会追加到用户 prompt。缺省时使用内置 prompt，不需要配置。
-`[ai_review.context_tools]` 是进程内只读上下文工具配置，默认全部关闭。开启后，服务会下载 MR head archive，让模型可以通过 tool call 请求 `read_file`、`search_code` 或 `list_files`；runner 只返回仓库目录内的文本内容，不执行 shell，也不会读取 `.env` 或 `.git`。
-`max_tool_calls` 默认是 `30`，`max_tool_result_bytes` 默认是 `60000`。如果 context tools 都关闭，不会额外下载 archive，也不会增加中间 AI 请求。
-开启 context tools 后，日志会记录每次工具调用的工具名、参数摘要、返回 bytes、结果是否截断、是否触发调用上限、batch index/count 和累计 tool call 次数，便于确认模型是否真的调用了 `read_file`、`search_code` 或 `list_files`。
+内置只读上下文工具默认启用。服务会下载 MR head archive，让模型可以通过 tool call 请求 `read_file`、`search_code` 或 `list_files`；runner 只返回仓库目录内的文本内容，不执行 shell，也不会读取 `.env` 或 `.git`。
+`max_tool_calls` 默认是 `30`，`0` 表示不限制工具调用次数；`max_tool_result_bytes` 默认是 `60000`。
+日志会记录每次工具调用的工具名、参数摘要、返回 bytes、结果是否截断、是否触发调用上限、batch index/count 和累计 tool call 次数，便于确认模型是否真的调用了 `read_file`、`search_code` 或 `list_files`。
 `request_timeout_seconds` 是单次 AI API 请求的超时；不配置时默认使用 `timeout_seconds / 2`，用于保留一次失败重试机会。
 `second_pass_on_clean` 默认是 `false`；设置为 `true` 时，第一次 AI Review 没有发现问题会再执行一次确认。
 AI Review 默认请求 Chat Completions `tool_calls` 结构化输出，并从 `submit_review_findings` 的 arguments 解析 findings；如果响应没有 tool call，会回退解析 `content` 中的 JSON。内置 context tools 不需要 MCP，也不会调用外部服务。
-`batch_review` 默认是 `false`；设置为 `true` 时，会按完整文件 diff 分批调用 AI Review。`max_batch_diff_bytes` 控制单批 diff 字节上限，`max_batches` 控制最多请求批次数。
+AI Review 默认按完整文件 diff 分批调用。`max_batch_diff_bytes` 控制单批 diff 字节上限，`max_batches` 控制最多请求批次数；`0` 表示不限制批次数。
 
-启用分批后，runner 会完整扫描 MR changes，并把文件数、原始 diff 字节数以及 required/planned/completed batches 保存到 SQLite。达到 `max_batches` 而未送审的文件和因单文件 diff 过大而被截断的文件会记录在 Review 运行明细中，可从 Dashboard 查看；这些 coverage 信息不会写入 GitLab comments。
-上面的示例是面向较大 MR 的推荐配置；代码缺省值仍保持保守，不写 `batch_review` 时不会自动分批，也不会增加额外 AI 请求。
+runner 会完整扫描 MR changes，并把文件数、原始 diff 字节数以及 required/planned/completed batches 保存到 SQLite。达到 `max_batches` 而未送审的文件和因单文件 diff 过大而被截断的文件会记录在 Review 运行明细中，可从 Dashboard 查看；这些 coverage 信息不会写入 GitLab comments。
 
 内置 context tools 说明：
 

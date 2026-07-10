@@ -870,9 +870,6 @@ impl ReviewService {
         changes: &crate::gitlab::MergeRequestChanges,
         event: &MergeRequestEvent,
     ) -> AppResult<Option<AiReviewContextWorkDir>> {
-        if !review.context_tools.any_enabled() || review.max_tool_calls == 0 {
-            return Ok(None);
-        }
         let archive_sha = changes
             .diff_refs
             .head_sha

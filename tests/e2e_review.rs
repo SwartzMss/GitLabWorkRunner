@@ -11,8 +11,7 @@ use gitlab_work_runner::{
     gitlab::GitLabChange,
     gitlab::GitLabClient,
     review::ReviewService,
-    rules::Ruleset,
-    rules::{AiReviewConfig, AiReviewContextTools},
+    rules::{AiReviewConfig, Ruleset},
     storage::StateStore,
     webhook::MergeRequestNoteEvent,
 };
@@ -106,6 +105,10 @@ async fn reviews_merge_request_and_records_state() {
                     .expect("valid fixture");
                 Json(body)
             }),
+        )
+        .route(
+            "/api/v4/projects/123/repository/archive.zip",
+            get(|| async { test_archive() }),
         )
         .route(
             "/api/v4/projects/123/merge_requests/45/discussions",
@@ -205,6 +208,10 @@ async fn continues_publishing_review_comments_after_one_comment_fails() {
                     }
                 }))
             }),
+        )
+        .route(
+            "/api/v4/projects/123/repository/archive.zip",
+            get(|| async { test_archive() }),
         )
         .route(
             "/api/v4/projects/123/merge_requests/45/discussions",
@@ -472,6 +479,10 @@ async fn reviews_merge_request_with_ai_review() {
             }),
         )
         .route(
+            "/api/v4/projects/123/repository/archive.zip",
+            get(|| async { test_archive() }),
+        )
+        .route(
             "/chat/completions",
             post(move |body: Bytes| {
                 let ai_request_count = Arc::clone(&ai_request_count_for_handler);
@@ -596,6 +607,10 @@ async fn manual_ai_review_posts_summary_when_one_review_fails() {
             }),
         )
         .route(
+            "/api/v4/projects/123/repository/archive.zip",
+            get(|| async { test_archive() }),
+        )
+        .route(
             "/chat/completions",
             post(move |body: Bytes| {
                 let ai_request_count = Arc::clone(&ai_request_count_for_handler);
@@ -697,16 +712,13 @@ fn test_ai_review_config(base_url: String) -> AiReviewConfig {
         model: "test-model".into(),
         timeout_seconds: 10,
         request_timeout_seconds: None,
-        max_diff_bytes: 60_000,
         second_pass_on_clean: false,
-        batch_review: false,
         max_batch_diff_bytes: 30_000,
         max_batches: 6,
         system_prompt: None,
         extra_instructions: String::new(),
         max_tool_calls: 8,
         max_tool_result_bytes: 60_000,
-        context_tools: AiReviewContextTools::default(),
     }
 }
 
@@ -737,6 +749,10 @@ async fn runs_second_ai_review_pass_when_first_pass_is_clean() {
                     }
                 }))
             }),
+        )
+        .route(
+            "/api/v4/projects/123/repository/archive.zip",
+            get(|| async { test_archive() }),
         )
         .route(
             "/chat/completions",
@@ -864,7 +880,6 @@ async fn ai_review_batches_large_merge_request_by_file() {
 
     let config = AiReviewConfig {
         base_url: format!("http://{}", addr),
-        batch_review: true,
         max_batch_diff_bytes: 160,
         max_batches: 2,
         ..test_ai_review_config(format!("http://{}", addr))
@@ -943,7 +958,6 @@ async fn batched_ai_review_preserves_coverage_when_total_deadline_fires() {
         base_url: format!("http://{}", addr),
         timeout_seconds: 1,
         request_timeout_seconds: Some(5),
-        batch_review: true,
         max_batch_diff_bytes: 160,
         max_batches: 2,
         ..test_ai_review_config(format!("http://{}", addr))
@@ -1251,11 +1265,6 @@ async fn ai_review_synthesizes_matching_ids_for_empty_context_tool_calls() {
 
     let config = AiReviewConfig {
         base_url: format!("http://{}", addr),
-        context_tools: AiReviewContextTools {
-            read_file: false,
-            search_code: true,
-            list_files: false,
-        },
         ..test_ai_review_config(format!("http://{}", addr))
     };
     let changes = vec![GitLabChange {
@@ -1407,9 +1416,6 @@ async fn ai_review_uses_builtin_read_file_context_tool() {
 [ai_review]
 max_tool_calls = 4
 
-[ai_review.context_tools]
-read_file = true
-
 [[ai_reviews]]
 id = "ai-review"
 title = "AI Review"
@@ -1460,6 +1466,10 @@ async fn ai_review_timeout_does_not_block_merge_request_review() {
                     }
                 }))
             }),
+        )
+        .route(
+            "/api/v4/projects/123/repository/archive.zip",
+            get(|| async { test_archive() }),
         )
         .route(
             "/chat/completions",
@@ -1605,6 +1615,10 @@ async fn manual_note_runs_ai_review() {
             }),
         )
         .route(
+            "/api/v4/projects/123/repository/archive.zip",
+            get(|| async { test_archive() }),
+        )
+        .route(
             "/api/v4/projects/123/merge_requests/45/notes/987/award_emoji",
             post(move |Query(query): Query<HashMap<String, String>>| {
                 let emoji_count = Arc::clone(&emoji_count_for_handler);
@@ -1740,6 +1754,10 @@ async fn manual_note_posts_summary_when_one_ai_review_fails() {
                     }
                 }))
             }),
+        )
+        .route(
+            "/api/v4/projects/123/repository/archive.zip",
+            get(|| async { test_archive() }),
         )
         .route(
             "/api/v4/projects/123/merge_requests/45/notes/989/award_emoji",
@@ -1888,6 +1906,10 @@ async fn manual_note_posts_ai_review_completion_when_no_findings() {
                     }
                 }))
             }),
+        )
+        .route(
+            "/api/v4/projects/123/repository/archive.zip",
+            get(|| async { test_archive() }),
         )
         .route(
             "/chat/completions",
