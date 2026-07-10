@@ -267,7 +267,10 @@ mod tests {
             mr_iid: 45,
             commit_sha: "abc123",
             review_run_id: "rr-failed",
-            error: &AppError::AiReview("bad `json`".into()),
+            error: &AppError::ai_review(
+                crate::error::ReviewErrorCode::AiResponseParseFailed,
+                "bad `json`",
+            ),
         });
         assert!(failure.body.contains("Review 执行失败"));
         assert!(failure.body.contains("commit: `abc123`"));

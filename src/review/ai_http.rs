@@ -1,5 +1,5 @@
 use crate::{
-    error::{AppError, AppResult},
+    error::{AppError, AppResult, ReviewErrorCode},
     rules::AiReviewConfig,
 };
 use std::{
@@ -26,7 +26,12 @@ pub(crate) fn shared_ai_http_client() -> AppResult<&'static ureq::Agent> {
                 .build())
         })
         .as_ref()
-        .map_err(|err| AppError::AiReview(format!("failed to build shared AI HTTP client: {err}")))
+        .map_err(|err| {
+            AppError::ai_review(
+                ReviewErrorCode::AiRequestFailed,
+                format!("failed to build shared AI HTTP client: {err}"),
+            )
+        })
 }
 
 pub(crate) async fn perform_ai_review_http_attempt(
@@ -71,17 +76,23 @@ pub(crate) async fn perform_ai_review_http_attempt(
             );
         })
         .map_err(|err| {
-            AppError::AiReview(format!(
-                "AI review {} failed to spawn blocking HTTP worker: {err}",
-                config.id
-            ))
+            AppError::ai_review(
+                ReviewErrorCode::AiRequestFailed,
+                format!(
+                    "AI review {} failed to spawn blocking HTTP worker: {err}",
+                    config.id
+                ),
+            )
         })?;
 
     let response = receiver.await.map_err(|err| {
-        AppError::AiReview(format!(
-            "AI review {} blocking HTTP worker dropped result channel: {err}",
-            config.id
-        ))
+        AppError::ai_review(
+            ReviewErrorCode::AiRequestFailed,
+            format!(
+                "AI review {} blocking HTTP worker dropped result channel: {err}",
+                config.id
+            ),
+        )
     })??;
     info!(
         ai_review_id = %review_id,
@@ -99,10 +110,12 @@ pub(crate) fn is_retryable_ai_error(err: &AppError) -> bool {
         AppError::Reqwest(err) => {
             err.is_timeout() || err.is_connect() || err.is_request() || err.is_body()
         }
-        AppError::AiReview(message) => {
-            message.contains("blocking API request failed")
-                || message.contains("blocking API response body read failed")
-                || message.contains("blocking HTTP task failed")
+        AppError::AiReview(failure) => {
+            failure.message.contains("blocking API request failed")
+                || failure
+                    .message
+                    .contains("blocking API response body read failed")
+                || failure.message.contains("blocking HTTP task failed")
         }
         _ => false,
     }
@@ -177,9 +190,10 @@ fn perform_ai_review_http_attempt_blocking(
                 error = %err,
                 "AI review blocking API response body read failed"
             );
-            return Err(AppError::AiReview(format!(
-                "AI review blocking API response body read failed: {err}"
-            )));
+            return Err(AppError::ai_review(
+                ReviewErrorCode::AiRequestFailed,
+                format!("AI review blocking API response body read failed: {err}"),
+            ));
         }
     };
     info!(
@@ -199,8 +213,9 @@ fn ureq_response_from_result(
     match result {
         Ok(response) => Ok(response),
         Err(ureq::Error::Status(_, response)) => Ok(response),
-        Err(err) => Err(AppError::AiReview(format!(
-            "AI review blocking API request failed before response headers: {err}"
-        ))),
+        Err(err) => Err(AppError::ai_review(
+            ReviewErrorCode::AiRequestFailed,
+            format!("AI review blocking API request failed before response headers: {err}"),
+        )),
     }
 }

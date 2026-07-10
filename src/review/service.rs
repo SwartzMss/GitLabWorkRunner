@@ -3,7 +3,7 @@ use crate::{
         run_ai_review_execution_with_context, AiReviewExecution, ReviewCoverage, ReviewCoverageFile,
     },
     comments::{build_comment_drafts, CommentDraft},
-    error::{AppError, AppResult},
+    error::{AppError, AppResult, ReviewErrorCode, ReviewFailure},
     gitlab::{CreateDiscussionRequest, DiscussionPosition, GitLabClient},
     rules::{AiReviewConfig, Finding, Ruleset, Severity},
     script_tasks::{
@@ -163,8 +163,15 @@ impl ReviewService {
                     .await?;
             }
             Err(err) => {
+                let failure = failure_for_error(err, ReviewErrorCode::Internal);
                 self.store
-                    .finish_review_request(review_run_id, "failed", 0, 0)
+                    .finish_review_request_with_failure(
+                        review_run_id,
+                        "failed",
+                        0,
+                        0,
+                        Some(&failure),
+                    )
                     .await?;
                 warn!(
                     review_run_id,
@@ -355,6 +362,7 @@ impl ReviewService {
                             status: "completed",
                             findings: review_findings,
                             comments,
+                            error_code: None,
                             error: None,
                         },
                         coverage.as_ref(),
@@ -372,6 +380,7 @@ impl ReviewService {
                     );
                 }
                 Err(err) => {
+                    let failure = failure_for_error(&err, ReviewErrorCode::AiRequestFailed);
                     self.finish_ai_task_run(
                         &TaskRunFinish {
                             review_run_id: self.review_run_id(),
@@ -380,7 +389,8 @@ impl ReviewService {
                             status: "failed",
                             findings: 0,
                             comments: 0,
-                            error: Some(&err.to_string()),
+                            error_code: Some(failure.code.as_str()),
+                            error: Some(&failure.message),
                         },
                         coverage.as_ref(),
                         &incomplete_files,
@@ -640,6 +650,7 @@ impl ReviewService {
             let result = match runner.run(&task, &context, &archive).await {
                 Ok(result) => result,
                 Err(err) => {
+                    let failure = failure_for_error(&err, ReviewErrorCode::ScriptTaskFailed);
                     self.store
                         .finish_task_run(&TaskRunFinish {
                             review_run_id: self.review_run_id(),
@@ -648,7 +659,8 @@ impl ReviewService {
                             status: "failed",
                             findings: 0,
                             comments: 0,
-                            error: Some(&err.to_string()),
+                            error_code: Some(failure.code.as_str()),
+                            error: Some(&failure.message),
                         })
                         .await?;
                     return Err(err);
@@ -668,6 +680,7 @@ impl ReviewService {
                         status: "completed",
                         findings,
                         comments,
+                        error_code: None,
                         error: None,
                     })
                     .await?;
@@ -680,6 +693,7 @@ impl ReviewService {
                         status: "completed",
                         findings: 0,
                         comments: 0,
+                        error_code: None,
                         error: None,
                     })
                     .await?;
@@ -1097,6 +1111,13 @@ struct AiReviewFailureSummary {
 struct ScriptTaskRunSummary {
     findings: usize,
     comments: usize,
+}
+
+fn failure_for_error(error: &AppError, fallback: ReviewErrorCode) -> ReviewFailure {
+    error
+        .review_failure()
+        .cloned()
+        .unwrap_or_else(|| ReviewFailure::new(fallback, error.to_string()))
 }
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
 use crate::{
-    error::{AppError, AppResult},
+    error::{AppError, AppResult, ReviewErrorCode},
     rules::ScriptTaskConfig,
 };
 use serde::Deserialize;
@@ -478,20 +478,24 @@ pub(crate) fn extract_zip_archive(
     limits: &ArchiveLimits,
 ) -> AppResult<usize> {
     if bytes.len() > limits.max_archive_bytes {
-        return Err(AppError::Archive(format!(
-            "repository archive size {} exceeded max_archive_bytes {}",
-            bytes.len(),
-            limits.max_archive_bytes
-        )));
+        return Err(AppError::archive(
+            ReviewErrorCode::ArchiveLimitExceeded,
+            format!(
+                "repository archive size {} exceeded max_archive_bytes {}",
+                bytes.len(),
+                limits.max_archive_bytes
+            ),
+        ));
     }
     let reader = Cursor::new(bytes);
-    let mut archive = ZipArchive::new(reader).map_err(|err| AppError::Archive(err.to_string()))?;
+    let mut archive = ZipArchive::new(reader)
+        .map_err(|err| AppError::archive(ReviewErrorCode::ArchiveExtractFailed, err.to_string()))?;
     let mut extracted_files = 0_usize;
     let mut extracted_bytes = 0_usize;
     for index in 0..archive.len() {
-        let mut file = archive
-            .by_index(index)
-            .map_err(|err| AppError::Archive(err.to_string()))?;
+        let mut file = archive.by_index(index).map_err(|err| {
+            AppError::archive(ReviewErrorCode::ArchiveExtractFailed, err.to_string())
+        })?;
         let Some(path) = file.enclosed_name() else {
             continue;
         };
@@ -501,12 +505,15 @@ pub(crate) fn extract_zip_archive(
         }
         let relative_text = relative.to_string_lossy();
         if relative_text.len() > limits.max_entry_path_bytes {
-            return Err(AppError::Archive(format!(
-                "archive entry path length {} exceeded max_entry_path_bytes {}: {}",
-                relative_text.len(),
-                limits.max_entry_path_bytes,
-                relative_text
-            )));
+            return Err(AppError::archive(
+                ReviewErrorCode::ArchiveLimitExceeded,
+                format!(
+                    "archive entry path length {} exceeded max_entry_path_bytes {}: {}",
+                    relative_text.len(),
+                    limits.max_entry_path_bytes,
+                    relative_text
+                ),
+            ));
         }
         let output_path = destination.join(relative);
         if file.is_dir() {
@@ -514,10 +521,13 @@ pub(crate) fn extract_zip_archive(
             continue;
         }
         if extracted_files >= limits.max_extracted_files {
-            return Err(AppError::Archive(format!(
-                "archive extracted file count exceeded max_extracted_files {}",
-                limits.max_extracted_files
-            )));
+            return Err(AppError::archive(
+                ReviewErrorCode::ArchiveLimitExceeded,
+                format!(
+                    "archive extracted file count exceeded max_extracted_files {}",
+                    limits.max_extracted_files
+                ),
+            ));
         }
         if let Some(parent) = output_path.parent() {
             fs::create_dir_all(parent)?;
@@ -553,14 +563,18 @@ fn copy_zip_file_with_limits<R: Read, W: Write>(
             return Ok(copied);
         }
         if copied.saturating_add(read) > max_single_file_bytes {
-            return Err(AppError::Archive(format!(
-                "archive file exceeded max_single_file_bytes {}",
-                max_single_file_bytes
-            )));
+            return Err(AppError::archive(
+                ReviewErrorCode::ArchiveLimitExceeded,
+                format!(
+                    "archive file exceeded max_single_file_bytes {}",
+                    max_single_file_bytes
+                ),
+            ));
         }
         if read > remaining_total_bytes.saturating_sub(copied) {
-            return Err(AppError::Archive(
-                "archive extracted bytes exceeded max_extracted_bytes".into(),
+            return Err(AppError::archive(
+                ReviewErrorCode::ArchiveLimitExceeded,
+                "archive extracted bytes exceeded max_extracted_bytes",
             ));
         }
         writer.write_all(&buffer[..read])?;
