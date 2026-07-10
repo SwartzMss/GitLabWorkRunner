@@ -314,12 +314,11 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
 
     function renderFindingsPage() {
       return `<section class="panel"><div class="panel-header"><div class="panel-title">◌ 问题</div><span>${state.findings.length} 行</span></div>
-        <table><thead><tr><th>创建时间</th><th>级别</th><th>项目</th><th>MR</th><th>路径</th><th>标题</th><th>运行 ID</th></tr></thead><tbody>${state.findings.length ? state.findings.map((finding) => row([
+        <table><thead><tr><th>创建时间</th><th>级别</th><th>项目</th><th>MR</th><th>路径</th><th>标题</th></tr></thead><tbody>${state.findings.length ? state.findings.map((finding) => row([
           fmtTime(finding.created_at), severityBadge(finding.severity), esc(projectLabel(finding)), `!${esc(finding.mr_iid)}`,
           `${esc(finding.path)}${finding.new_line ? `:${esc(finding.new_line)}` : ""}`,
-          `<div class="wrap"><strong>${esc(finding.title)}</strong><br><span class="subtitle">${esc(finding.message)}</span></div>`,
-          `<button class="link" data-run="${esc(finding.review_run_id)}">${esc(short(finding.review_run_id, 12))}</button>`
-        ], `class="clickable" data-run="${esc(finding.review_run_id)}"`)).join("") : empty(7)}</tbody></table>
+          `<div class="wrap"><strong>${esc(finding.title)}</strong><br><span class="subtitle">${esc(finding.message)}</span></div>`
+        ], `class="clickable" data-run="${esc(finding.review_run_id)}"`)).join("") : empty(6)}</tbody></table>
       </section>`;
     }
 
@@ -328,12 +327,10 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     }
 
     function runsTable(items) {
-      return `<table><thead><tr><th>开始时间</th><th>状态</th><th>项目</th><th>MR</th><th>Commit</th><th>任务</th><th>问题</th><th>耗时</th><th>运行 ID</th></tr></thead><tbody>${items.length ? items.map((run) => {
-        const totalTasks = run.total_task_runs || run.selected_ai_reviews + run.selected_script_tasks;
-        const completedTasks = run.completed_task_runs || (run.status === "completed" ? totalTasks : 0);
+      return `<table><thead><tr><th>开始时间</th><th>状态</th><th>项目</th><th>MR</th><th>Commit</th><th>问题</th><th>耗时</th></tr></thead><tbody>${items.length ? items.map((run) => {
         const findingColor = run.findings > 0 ? (run.status === "failed" ? "var(--red)" : "var(--amber)") : "var(--green)";
-        return row([fmtTime(run.started_at), badge(run.status), esc(projectLabel(run)), `!${esc(run.mr_iid)}`, `<code>${esc(short(run.commit_sha))}</code>`, `${completedTasks}/${totalTasks}`, `<span style="color:${findingColor}">${run.findings || "-"}</span>`, fmtMs(run.duration_ms), `<code>${esc(short(run.review_run_id, 12))}</code>`], `class="clickable" data-run="${esc(run.review_run_id)}"`);
-      }).join("") : empty(9)}</tbody></table>`;
+        return row([fmtTime(run.started_at), badge(run.status), esc(projectLabel(run)), `!${esc(run.mr_iid)}`, `<code>${esc(short(run.commit_sha))}</code>`, `<span style="color:${findingColor}">${run.findings || "-"}</span>`, fmtMs(run.duration_ms)], `class="clickable" data-run="${esc(run.review_run_id)}"`);
+      }).join("") : empty(7)}</tbody></table>`;
     }
 
     function projectsTable(items) {
@@ -459,6 +456,16 @@ mod tests {
         assert!(DASHBOARD_HTML.contains("达到批次上限"));
         assert!(DASHBOARD_HTML.contains("单文件 Diff 超过批次限制"));
         assert!(DASHBOARD_HTML.contains("批次执行失败"));
+    }
+
+    #[test]
+    fn run_id_and_task_count_are_hidden_from_lists() {
+        assert!(!DASHBOARD_HTML.contains("<th>运行 ID</th>"));
+        assert!(!DASHBOARD_HTML.contains("<th>任务</th>"));
+        assert!(!DASHBOARD_HTML.contains("${completedTasks}/${totalTasks}"));
+        assert!(DASHBOARD_HTML.contains(
+            r#"<div class="detail-row"><span>运行 ID</span><code>${esc(detail.run.review_run_id)}</code></div>"#
+        ));
     }
 
     #[test]
