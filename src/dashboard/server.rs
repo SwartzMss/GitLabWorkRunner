@@ -322,6 +322,7 @@ mod tests {
             status: "completed",
             findings: 0,
             comments: 1,
+            error_code: None,
             error: None,
         };
         writer
@@ -518,6 +519,7 @@ mod tests {
                 status: "completed",
                 findings: 0,
                 comments: 0,
+                error_code: None,
                 error: None,
             })
             .await
@@ -539,12 +541,17 @@ mod tests {
                 status: "failed",
                 findings: 0,
                 comments: 0,
+                error_code: Some("ai_request_timeout"),
                 error: Some("AI request timed out"),
             })
             .await
             .unwrap();
+        let run_failure = crate::error::ReviewFailure::new(
+            crate::error::ReviewErrorCode::ReviewRunTimeout,
+            "review exceeded its deadline",
+        );
         writer
-            .finish_review_request("rr-partial", "completed", 0, 1)
+            .finish_review_request_with_failure("rr-partial", "failed", 0, 1, Some(&run_failure))
             .await
             .unwrap();
         drop(writer);
@@ -575,6 +582,18 @@ mod tests {
         assert_eq!(body["runs"][0]["status"], "failed");
         assert_eq!(body["runs"][0]["completed_task_runs"], 1);
         assert_eq!(body["runs"][0]["total_task_runs"], 2);
+
+        let response = axum::http::Request::builder()
+            .uri("/api/runs/rr-partial")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(response).await.unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["tasks"][1]["error_code"], "ai_request_timeout");
+        assert_eq!(body["tasks"][1]["error"], "AI request timed out");
+        assert_eq!(body["failure"]["code"], "review_run_timeout");
+        assert_eq!(body["failure"]["message"], "review exceeded its deadline");
 
         let response = axum::http::Request::builder()
             .uri("/api/merge-requests")

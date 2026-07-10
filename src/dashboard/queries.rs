@@ -114,6 +114,7 @@ pub struct DashboardTaskRun {
     pub status: String,
     pub findings: i64,
     pub comments: i64,
+    pub error_code: Option<String>,
     pub error: Option<String>,
     pub started_at: String,
     pub finished_at: Option<String>,
@@ -175,9 +176,16 @@ pub struct DashboardComment {
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct DashboardRunDetail {
     pub run: DashboardRun,
+    pub failure: Option<DashboardFailure>,
     pub tasks: Vec<DashboardTaskRun>,
     pub findings: Vec<DashboardFinding>,
     pub comments: Vec<DashboardComment>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct DashboardFailure {
+    pub code: Option<String>,
+    pub message: String,
 }
 
 impl DashboardStore {
@@ -225,7 +233,15 @@ impl DashboardStore {
                 )));
             }
         }
+        for column in ["error_code", "error"] {
+            if !self.column_exists("review_requests", column).await? {
+                return Err(AppError::Storage(format!(
+                    "dashboard database is missing required column `review_requests.{column}`; start gitlab-work-runner once to run migrations"
+                )));
+            }
+        }
         for column in [
+            "error_code",
             "coverage_total_files",
             "coverage_fully_reviewed_files",
             "coverage_partially_reviewed_files",
@@ -372,7 +388,7 @@ select
             then 'completed'
         else 'failed'
     end as status,
-    rr.findings, rr.comments, rr.started_at, rr.finished_at,
+    rr.findings, rr.comments, rr.error_code, rr.error, rr.started_at, rr.finished_at,
     cast((julianday(coalesce(rr.finished_at, datetime('now'))) - julianday(rr.started_at)) * 86400000 as integer) as duration_ms,
     coalesce((select count(*) from review_task_runs task where task.review_run_id = rr.review_run_id), 0) as total_task_runs,
     coalesce((select count(*) from review_task_runs task where task.review_run_id = rr.review_run_id and task.status = 'completed'), 0) as completed_task_runs
@@ -382,16 +398,21 @@ where review_run_id = ?
         )
         .bind(review_run_id)
         .fetch_optional(&self.pool)
-        .await?
-        .map(row_to_run);
-        let Some(run) = run else {
+        .await?;
+        let Some(row) = run else {
             return Ok(None);
         };
+        let failure = dashboard_failure(
+            row.get::<Option<String>, _>("error_code"),
+            row.get::<Option<String>, _>("error"),
+        );
+        let run = row_to_run(row);
         let tasks = self.tasks(review_run_id).await?;
         let findings = self.findings(review_run_id).await?;
         let comments = self.comments(review_run_id).await?;
         Ok(Some(DashboardRunDetail {
             run,
+            failure,
             tasks,
             findings,
             comments,
@@ -574,7 +595,7 @@ where 1 = 1
     async fn tasks(&self, review_run_id: &str) -> AppResult<Vec<DashboardTaskRun>> {
         let rows = sqlx::query(
             r#"
-select task_type, task_id, title, status, findings, comments, error, started_at, finished_at,
+select task_type, task_id, title, status, findings, comments, error_code, error, started_at, finished_at,
     coverage_total_files, coverage_fully_reviewed_files, coverage_partially_reviewed_files,
     coverage_unreviewed_files, coverage_total_diff_bytes, coverage_reviewed_diff_bytes,
     coverage_required_batches, coverage_planned_batches, coverage_completed_batches,
@@ -617,7 +638,8 @@ from review_coverage_files where review_run_id = ? and task_type = ? and task_id
                 status: row.get("status"),
                 findings: row.get("findings"),
                 comments: row.get("comments"),
-                error: row.get("error"),
+                error_code: row.get("error_code"),
+                error: error_preview(row.get("error")),
                 started_at: row.get("started_at"),
                 finished_at: row.get("finished_at"),
                 coverage_total_files: row.get("coverage_total_files"),
@@ -679,6 +701,34 @@ limit 500
         .await?;
         Ok(rows.into_iter().map(row_to_comment).collect())
     }
+}
+
+const ERROR_PREVIEW_MAX_BYTES: usize = 4 * 1024;
+
+fn dashboard_failure(code: Option<String>, message: Option<String>) -> Option<DashboardFailure> {
+    if code.is_none() && message.is_none() {
+        return None;
+    }
+    Some(DashboardFailure {
+        code,
+        message: error_preview(message).unwrap_or_default(),
+    })
+}
+
+fn error_preview(value: Option<String>) -> Option<String> {
+    value.map(|value| truncate_utf8_bytes(value, ERROR_PREVIEW_MAX_BYTES))
+}
+
+fn truncate_utf8_bytes(mut value: String, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    value
 }
 
 fn push_run_filters(builder: &mut QueryBuilder<'_, Sqlite>, params: &RunListParams) {
@@ -814,5 +864,26 @@ fn row_to_comment(row: SqliteRow) -> DashboardComment {
         discussion_id: row.get("discussion_id"),
         note_id: row.get("note_id"),
         created_at: row.get("created_at"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_preview_is_utf8_safe_and_limited_to_four_kibibytes() {
+        let preview = error_preview(Some("錯".repeat(2_000))).unwrap();
+
+        assert!(preview.len() <= ERROR_PREVIEW_MAX_BYTES);
+        assert!(preview.is_char_boundary(preview.len()));
+    }
+
+    #[test]
+    fn dashboard_failure_keeps_legacy_message_without_code() {
+        let failure = dashboard_failure(None, Some("legacy failure".into())).unwrap();
+
+        assert_eq!(failure.code, None);
+        assert_eq!(failure.message, "legacy failure");
     }
 }

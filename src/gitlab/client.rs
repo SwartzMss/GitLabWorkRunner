@@ -1,4 +1,4 @@
-use crate::error::{AppError, AppResult};
+use crate::error::{AppError, AppResult, ReviewErrorCode};
 use serde::{Deserialize, Serialize};
 use std::{
     io::Read,
@@ -137,6 +137,8 @@ impl GitLabClient {
             .with_timeout_guard(
                 "fetch merge request changes from gitlab",
                 timeout,
+                ReviewErrorCode::GitLabApiTimeout,
+                ReviewErrorCode::GitLabApiFailed,
                 move || {
                     let response = http
                         .get(&url)
@@ -210,6 +212,8 @@ impl GitLabClient {
             .with_timeout_guard(
                 "download repository archive from gitlab",
                 timeout,
+                ReviewErrorCode::ArchiveDownloadTimeout,
+                ReviewErrorCode::ArchiveDownloadFailed,
                 move || {
                     let response = http
                         .get(&url)
@@ -226,7 +230,8 @@ impl GitLabClient {
                     Ok((status, archive))
                 },
             )
-            .await?;
+            .await
+            .map_err(reclassify_archive_download_failure)?;
         let (status, archive): (u16, Vec<u8>) = response;
         info!(
             project_id,
@@ -278,6 +283,8 @@ impl GitLabClient {
             .with_timeout_guard(
                 "create gitlab merge request discussion",
                 timeout,
+                ReviewErrorCode::GitLabCommentFailed,
+                ReviewErrorCode::GitLabCommentFailed,
                 move || {
                     let body = serde_json::to_string(&request)?;
                     let response = http
@@ -317,7 +324,8 @@ impl GitLabClient {
                     Ok((status, Some(created)))
                 },
             )
-            .await?;
+            .await
+            .map_err(reclassify_gitlab_comment_failure)?;
         let (status, created): (u16, Option<CreatedDiscussion>) = response;
         info!(
             project_id,
@@ -390,6 +398,8 @@ impl GitLabClient {
             .with_timeout_guard(
                 "award gitlab merge request note emoji",
                 timeout,
+                ReviewErrorCode::GitLabCommentFailed,
+                ReviewErrorCode::GitLabCommentFailed,
                 move || {
                     let response = http
                         .post(&url)
@@ -409,7 +419,8 @@ impl GitLabClient {
                     Ok(status)
                 },
             )
-            .await?;
+            .await
+            .map_err(reclassify_gitlab_comment_failure)?;
         info!(
             project_id,
             mr_iid,
@@ -426,6 +437,8 @@ impl GitLabClient {
         &self,
         operation: &'static str,
         timeout: Duration,
+        timeout_code: ReviewErrorCode,
+        failure_code: ReviewErrorCode,
         task: F,
     ) -> AppResult<T>
     where
@@ -439,14 +452,39 @@ impl GitLabClient {
         };
         match tokio::time::timeout(timeout, tokio::task::spawn_blocking(task)).await {
             Ok(Ok(result)) => result,
-            Ok(Err(err)) => Err(AppError::GitLab(format!(
-                "{operation} blocking task failed: {err}"
-            ))),
-            Err(_) => Err(AppError::GitLab(format!(
-                "{operation} timed out after {} ms",
-                timeout.as_millis()
-            ))),
+            Ok(Err(err)) => Err(AppError::gitlab(
+                failure_code,
+                format!("{operation} blocking task failed: {err}"),
+            )),
+            Err(_) => Err(AppError::gitlab(
+                timeout_code,
+                format!("{operation} timed out after {} ms", timeout.as_millis()),
+            )),
         }
+    }
+}
+
+fn reclassify_archive_download_failure(error: AppError) -> AppError {
+    match error.review_failure() {
+        Some(failure) if failure.code == ReviewErrorCode::PermissionDenied => error,
+        Some(failure) if failure.code == ReviewErrorCode::ArchiveLimitExceeded => error,
+        Some(failure) if failure.code == ReviewErrorCode::ArchiveDownloadTimeout => error,
+        Some(failure) => AppError::archive(
+            ReviewErrorCode::ArchiveDownloadFailed,
+            failure.message.clone(),
+        ),
+        None => AppError::archive(ReviewErrorCode::ArchiveDownloadFailed, error.to_string()),
+    }
+}
+
+fn reclassify_gitlab_comment_failure(error: AppError) -> AppError {
+    match error.review_failure() {
+        Some(failure) if failure.code == ReviewErrorCode::PermissionDenied => error,
+        Some(failure) => AppError::gitlab(
+            ReviewErrorCode::GitLabCommentFailed,
+            failure.message.clone(),
+        ),
+        None => AppError::gitlab(ReviewErrorCode::GitLabCommentFailed, error.to_string()),
     }
 }
 
@@ -460,9 +498,10 @@ fn response_from_ureq_result(
     match result {
         Ok(response) => Ok(response),
         Err(ureq::Error::Status(_, response)) => Ok(response),
-        Err(err) => Err(AppError::GitLab(format!(
-            "GitLab HTTP request failed: {err}"
-        ))),
+        Err(err) => Err(AppError::gitlab(
+            ReviewErrorCode::GitLabApiFailed,
+            format!("GitLab HTTP request failed: {err}"),
+        )),
     }
 }
 
@@ -475,10 +514,18 @@ fn ensure_gitlab_success_response(
         return Ok(response);
     }
     let body = read_ureq_text(response).unwrap_or_else(|err| err.to_string());
-    Err(AppError::GitLab(format!(
-        "{operation} returned HTTP status {status}: {}",
-        preview_log_text(&body, 500)
-    )))
+    let code = if matches!(status, 401 | 403) {
+        ReviewErrorCode::PermissionDenied
+    } else {
+        ReviewErrorCode::GitLabApiFailed
+    };
+    Err(AppError::gitlab(
+        code,
+        format!(
+            "{operation} returned HTTP status {status}: {}",
+            preview_log_text(&body, 500)
+        ),
+    ))
 }
 
 fn read_ureq_text(response: ureq::Response) -> AppResult<String> {
@@ -492,9 +539,10 @@ fn read_ureq_bytes_limited(response: ureq::Response, max_bytes: usize) -> AppRes
     let mut bytes = Vec::new();
     reader.read_to_end(&mut bytes)?;
     if bytes.len() > max_bytes {
-        return Err(AppError::Archive(format!(
-            "repository archive download exceeded max_archive_bytes {max_bytes}"
-        )));
+        return Err(AppError::archive(
+            ReviewErrorCode::ArchiveLimitExceeded,
+            format!("repository archive download exceeded max_archive_bytes {max_bytes}"),
+        ));
     }
     Ok(bytes)
 }

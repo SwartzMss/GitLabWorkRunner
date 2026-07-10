@@ -1,4 +1,4 @@
-use crate::error::AppResult;
+use crate::error::{AppResult, ReviewFailure};
 use chrono::Utc;
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
@@ -45,6 +45,7 @@ pub struct TaskRunFinish<'a> {
     pub status: &'a str,
     pub findings: usize,
     pub comments: usize,
+    pub error_code: Option<&'a str>,
     pub error: Option<&'a str>,
 }
 
@@ -139,6 +140,10 @@ create table if not exists review_requests (
             .await?;
         self.ensure_column("review_requests", "project_path_with_namespace", "text")
             .await?;
+        self.ensure_column("review_requests", "error_code", "text")
+            .await?;
+        self.ensure_column("review_requests", "error", "text")
+            .await?;
         sqlx::query(
             r#"
 create table if not exists review_task_runs (
@@ -159,6 +164,8 @@ create table if not exists review_task_runs (
         )
         .execute(&self.pool)
         .await?;
+        self.ensure_column("review_task_runs", "error_code", "text")
+            .await?;
         for column in [
             "coverage_total_files",
             "coverage_fully_reviewed_files",
@@ -285,6 +292,8 @@ on conflict(review_run_id) do update set
     status = 'running',
     project_name = excluded.project_name,
     project_path_with_namespace = excluded.project_path_with_namespace,
+    error_code = null,
+    error = null,
     finished_at = null
 "#,
         )
@@ -321,17 +330,31 @@ on conflict(review_run_id) do update set
         findings: usize,
         comments: usize,
     ) -> AppResult<()> {
+        self.finish_review_request_with_failure(review_run_id, status, findings, comments, None)
+            .await
+    }
+
+    pub async fn finish_review_request_with_failure(
+        &self,
+        review_run_id: &str,
+        status: &str,
+        findings: usize,
+        comments: usize,
+        failure: Option<&ReviewFailure>,
+    ) -> AppResult<()> {
         let now = now_rfc3339();
         sqlx::query(
             r#"
 update review_requests
-set status = ?, findings = ?, comments = ?, finished_at = ?
+set status = ?, findings = ?, comments = ?, error_code = ?, error = ?, finished_at = ?
 where review_run_id = ?
 "#,
         )
         .bind(status)
         .bind(findings as i64)
         .bind(comments as i64)
+        .bind(failure.map(|failure| failure.code.as_str()))
+        .bind(failure.map(|failure| failure.message.as_str()))
         .bind(&now)
         .bind(review_run_id)
         .execute(&self.pool)
@@ -353,6 +376,7 @@ values (?, ?, ?, ?, 'running', 0, 0, ?)
 on conflict(review_run_id, task_type, task_id) do update set
     title = excluded.title,
     status = 'running',
+    error_code = null,
     error = null,
     finished_at = null
 "#,
@@ -372,13 +396,14 @@ on conflict(review_run_id, task_type, task_id) do update set
         sqlx::query(
             r#"
 update review_task_runs
-set status = ?, findings = ?, comments = ?, error = ?, finished_at = ?
+set status = ?, findings = ?, comments = ?, error_code = ?, error = ?, finished_at = ?
 where review_run_id = ? and task_type = ? and task_id = ?
 "#,
         )
         .bind(task.status)
         .bind(task.findings as i64)
         .bind(task.comments as i64)
+        .bind(task.error_code)
         .bind(task.error)
         .bind(&now)
         .bind(task.review_run_id)
@@ -400,7 +425,7 @@ where review_run_id = ? and task_type = ? and task_id = ?
         sqlx::query(
             r#"
 update review_task_runs set
-    status = ?, findings = ?, comments = ?, error = ?, finished_at = ?,
+    status = ?, findings = ?, comments = ?, error_code = ?, error = ?, finished_at = ?,
     coverage_total_files = ?, coverage_fully_reviewed_files = ?,
     coverage_partially_reviewed_files = ?, coverage_unreviewed_files = ?,
     coverage_total_diff_bytes = ?, coverage_reviewed_diff_bytes = ?,
@@ -412,6 +437,7 @@ where review_run_id = ? and task_type = ? and task_id = ?
         .bind(task.status)
         .bind(task.findings as i64)
         .bind(task.comments as i64)
+        .bind(task.error_code)
         .bind(task.error)
         .bind(&now)
         .bind(coverage.total_files as i64)
@@ -564,6 +590,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn records_structured_review_request_failure() {
+        let store = StateStore::connect("sqlite::memory:").await.unwrap();
+        store.migrate().await.unwrap();
+        store
+            .start_review_request(&ReviewRequestStart {
+                review_run_id: "rr-failed",
+                trigger_type: "manual_note",
+                project_id: 1,
+                project_name: None,
+                project_path_with_namespace: None,
+                mr_iid: 2,
+                commit_sha: "abc",
+                note_id: None,
+                requested_ids_json: "[]",
+                selected_ai_reviews: 1,
+                selected_script_tasks: 0,
+            })
+            .await
+            .unwrap();
+        let failure = ReviewFailure::new(
+            crate::error::ReviewErrorCode::ReviewRunTimeout,
+            "review exceeded its deadline",
+        );
+
+        store
+            .finish_review_request_with_failure("rr-failed", "failed", 0, 0, Some(&failure))
+            .await
+            .unwrap();
+
+        let row =
+            sqlx::query("select error_code, error from review_requests where review_run_id = ?")
+                .bind("rr-failed")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(row.get::<String, _>("error_code"), "review_run_timeout");
+        assert_eq!(
+            row.get::<String, _>("error"),
+            "review exceeded its deadline"
+        );
+    }
+
+    #[tokio::test]
     async fn records_and_replaces_task_coverage_atomically() {
         let store = StateStore::connect("sqlite::memory:").await.unwrap();
         store.migrate().await.unwrap();
@@ -602,6 +671,7 @@ mod tests {
             status: "completed",
             findings: 0,
             comments: 0,
+            error_code: None,
             error: None,
         };
 

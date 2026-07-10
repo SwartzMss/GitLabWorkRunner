@@ -96,6 +96,8 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     .progress span { display: block; height: 100%; background: #16a05d; }
     .empty { padding: 20px; color: var(--muted); }
     .wrap { white-space: normal; max-width: 520px; }
+    .failure { margin: 0 20px 18px; padding: 14px; border-left: 3px solid #cf3131; background: #fff7f7; display: grid; gap: 8px; }
+    .failure-message { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; color: #5f2930; font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     .hidden { display: none !important; }
     @media (max-width: 1500px) {
       table { display: block; overflow-x: auto; }
@@ -213,10 +215,21 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       single_file_diff_truncated: "单文件 Diff 超过批次限制",
       batch_execution_failed: "批次执行失败"
     }[reason] || reason || "-");
+    const errorCodeText = (code) => ({
+      gitlab_api_timeout: "GitLab API 超时", gitlab_api_failed: "GitLab API 失败",
+      archive_download_timeout: "Archive 下载超时", archive_download_failed: "Archive 下载失败",
+      archive_extract_failed: "Archive 解压失败", archive_limit_exceeded: "Archive 超出限制",
+      ai_request_timeout: "AI 请求超时", ai_request_failed: "AI 请求失败",
+      ai_tool_loop_timeout: "AI 工具循环超时", ai_response_parse_failed: "AI 响应解析失败",
+      review_run_timeout: "Review 整体超时", gitlab_comment_failed: "GitLab 发布失败", permission_denied: "权限不足",
+      invalid_configuration: "配置无效", script_task_failed: "脚本任务失败", internal: "内部错误"
+    }[code] || code || "未分类错误");
+    const renderFailure = (failure) => failure ? `<div class="failure"><div><span class="badge failed">${esc(errorCodeText(failure.code))}</span>${failure.code ? ` <code>${esc(failure.code)}</code>` : ""}</div><pre class="failure-message">${esc(failure.message || "-")}</pre></div>` : "";
+    const taskFailure = (task) => (task.error_code || task.error) ? { code: task.error_code, message: task.error } : null;
 
     function renderTaskCoverage(task) {
       if (task.coverage_total_files == null) {
-        return `<div class="detail-list"><div class="detail-row"><span>${esc(task.title)}</span><span class="badge unknown">未记录</span></div></div>`;
+        return `<div class="detail-list"><div class="detail-row"><span>${esc(task.title)}</span>${badge(task.status)}</div></div>${renderFailure(taskFailure(task))}`;
       }
       const state = task.coverage_complete ? "完整" : "部分";
       const files = task.incomplete_files || [];
@@ -226,7 +239,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         <div class="detail-row"><span>文件</span><span>${task.coverage_fully_reviewed_files} 完整 / ${task.coverage_partially_reviewed_files} 部分 / ${task.coverage_unreviewed_files} 未审查 / ${task.coverage_total_files} 总计</span></div>
         <div class="detail-row"><span>Diff</span><span>${fmtBytes(task.coverage_reviewed_diff_bytes)} / ${fmtBytes(task.coverage_total_diff_bytes)} (${pct(task.coverage_reviewed_diff_bytes, task.coverage_total_diff_bytes)}%)</span></div>
         <div class="detail-row"><span>批次</span><span>${task.coverage_completed_batches} 完成 / ${task.coverage_planned_batches} 计划 / ${task.coverage_required_batches} 所需</span></div>
-      </div>${incomplete}`;
+      </div>${renderFailure(taskFailure(task))}${incomplete}`;
     }
 
     function params(includeStatus = true) {
@@ -383,7 +396,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
           <div class="detail-row"><span>项目 / MR</span><span>${esc(projectLabel(detail.run))} / !${esc(detail.run.mr_iid)}</span></div>
           <div class="detail-row"><span>Commit</span><code>${esc(detail.run.commit_sha)}</code></div>
           <div class="detail-row"><span>问题</span><span>${esc(detail.run.findings)}</span></div>
-        </div></section>
+        </div>${renderFailure(detail.failure)}</section>
         <section class="panel"><div class="panel-header"><div class="panel-title">Review 覆盖</div></div>${detail.tasks.length ? detail.tasks.map(renderTaskCoverage).join("") : `<div class="empty">暂无任务数据</div>`}</section>
         <section class="panel"><div class="panel-header"><div class="panel-title">问题</div></div><table><thead><tr><th>级别</th><th>路径</th><th>标题</th><th>消息</th></tr></thead><tbody>${detail.findings.length ? detail.findings.map((finding) => row([severityBadge(finding.severity), `${esc(finding.path)}${finding.new_line ? `:${esc(finding.new_line)}` : ""}`, esc(finding.title), `<span class="wrap">${esc(finding.message)}</span>`])).join("") : empty(4)}</tbody></table></section>
       </div>`;
@@ -456,6 +469,13 @@ mod tests {
         assert!(DASHBOARD_HTML.contains("达到批次上限"));
         assert!(DASHBOARD_HTML.contains("单文件 Diff 超过批次限制"));
         assert!(DASHBOARD_HTML.contains("批次执行失败"));
+    }
+
+    #[test]
+    fn run_detail_renders_legacy_failures_without_codes() {
+        assert!(DASHBOARD_HTML.contains(r#"}[code] || code || "未分类错误""#));
+        assert!(DASHBOARD_HTML.contains("failure.code ?"));
+        assert!(DASHBOARD_HTML.contains("(task.error_code || task.error)"));
     }
 
     #[test]
