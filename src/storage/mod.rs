@@ -606,7 +606,7 @@ mod tests {
         };
 
         store
-            .finish_task_run_with_coverage(&finish, &coverage, &[file.clone()])
+            .finish_task_run_with_coverage(&finish, &coverage, std::slice::from_ref(&file))
             .await
             .unwrap();
         store
