@@ -123,20 +123,21 @@ Linux 后台运行：
 
 ```bash
 cargo build --release
-./scripts/linux-background.sh start runner
-./scripts/linux-background.sh status runner
+./scripts/linux-background.sh start
+./scripts/linux-background.sh status
 ```
 
 停止或重启：
 
 ```bash
-./scripts/linux-background.sh stop runner
-./scripts/linux-background.sh restart runner
+./scripts/linux-background.sh stop
+./scripts/linux-background.sh restart
 ```
 
-脚本默认使用 `target/release/gitlab-work-runner`，在项目根目录运行，pid 写入 `run/gitlab-work-runner.pid`，stdout/stderr 追加到 `logs/gitlab-work-runner.out`。如果需要启动 Dashboard：
+脚本默认同时管理 runner 和 Dashboard，在项目根目录运行，pid 写入 `run/`，stdout/stderr 追加到 `logs/`。如果只需要管理单个服务：
 
 ```bash
+./scripts/linux-background.sh start runner
 ./scripts/linux-background.sh start dashboard
 ```
 

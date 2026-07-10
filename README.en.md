@@ -123,20 +123,21 @@ Run in the background on Linux:
 
 ```bash
 cargo build --release
-./scripts/linux-background.sh start runner
-./scripts/linux-background.sh status runner
+./scripts/linux-background.sh start
+./scripts/linux-background.sh status
 ```
 
 Stop or restart:
 
 ```bash
-./scripts/linux-background.sh stop runner
-./scripts/linux-background.sh restart runner
+./scripts/linux-background.sh stop
+./scripts/linux-background.sh restart
 ```
 
-The script uses `target/release/gitlab-work-runner` by default, runs from the project root, writes the pid to `run/gitlab-work-runner.pid`, and appends stdout/stderr to `logs/gitlab-work-runner.out`. To start the Dashboard:
+The script manages runner and Dashboard together by default, runs from the project root, writes pid files to `run/`, and appends stdout/stderr to `logs/`. To manage one service only:
 
 ```bash
+./scripts/linux-background.sh start runner
 ./scripts/linux-background.sh start dashboard
 ```
 
