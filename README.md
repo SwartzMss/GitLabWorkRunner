@@ -119,6 +119,27 @@ target/release/gitlab-work-runner        # Linux / macOS release
 
 运行前仍需要准备 `config.toml` 和 `rules.toml`。
 
+Linux 后台运行：
+
+```bash
+cargo build --release
+./scripts/linux-background.sh start runner
+./scripts/linux-background.sh status runner
+```
+
+停止或重启：
+
+```bash
+./scripts/linux-background.sh stop runner
+./scripts/linux-background.sh restart runner
+```
+
+脚本默认使用 `target/release/gitlab-work-runner`，在项目根目录运行，pid 写入 `run/gitlab-work-runner.pid`，stdout/stderr 追加到 `logs/gitlab-work-runner.out`。如果需要启动 Dashboard：
+
+```bash
+./scripts/linux-background.sh start dashboard
+```
+
 ## 服务配置
 
 `config.toml` 控制服务、GitLab、存储和规则文件：

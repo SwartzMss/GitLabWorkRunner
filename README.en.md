@@ -119,6 +119,27 @@ target/release/gitlab-work-runner        # Linux / macOS release
 
 Before running the binary, still prepare `config.toml` and `rules.toml`.
 
+Run in the background on Linux:
+
+```bash
+cargo build --release
+./scripts/linux-background.sh start runner
+./scripts/linux-background.sh status runner
+```
+
+Stop or restart:
+
+```bash
+./scripts/linux-background.sh stop runner
+./scripts/linux-background.sh restart runner
+```
+
+The script uses `target/release/gitlab-work-runner` by default, runs from the project root, writes the pid to `run/gitlab-work-runner.pid`, and appends stdout/stderr to `logs/gitlab-work-runner.out`. To start the Dashboard:
+
+```bash
+./scripts/linux-background.sh start dashboard
+```
+
 ## Service Config
 
 `config.toml` controls the service, GitLab access, storage, and rules file:
