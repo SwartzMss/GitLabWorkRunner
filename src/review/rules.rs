@@ -40,8 +40,6 @@ pub struct AiReviewConfig {
     #[serde(default = "default_ai_max_batches")]
     pub max_batches: usize,
     #[serde(default)]
-    pub system_prompt: Option<String>,
-    #[serde(default)]
     pub extra_instructions: String,
     #[serde(default = "default_ai_max_tool_calls")]
     pub max_tool_calls: usize,
@@ -51,8 +49,6 @@ pub struct AiReviewConfig {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct AiReviewPromptConfig {
-    #[serde(default)]
-    pub system_prompt: Option<String>,
     #[serde(default)]
     pub extra_instructions: String,
     #[serde(default = "default_ai_max_tool_calls")]
@@ -64,7 +60,6 @@ pub struct AiReviewPromptConfig {
 impl Default for AiReviewPromptConfig {
     fn default() -> Self {
         Self {
-            system_prompt: None,
             extra_instructions: String::new(),
             max_tool_calls: default_ai_max_tool_calls(),
             max_tool_result_bytes: default_ai_max_tool_result_bytes(),
@@ -120,7 +115,6 @@ impl Ruleset {
         }
         let mut ai_reviews = Vec::new();
         for mut config in parsed.ai_reviews {
-            config.system_prompt = parsed.ai_review.system_prompt.clone();
             config.extra_instructions = parsed.ai_review.extra_instructions.clone();
             config.max_tool_calls = parsed.ai_review.max_tool_calls;
             config.max_tool_result_bytes = parsed.ai_review.max_tool_result_bytes;
@@ -259,7 +253,6 @@ model = "gpt-4.1-mini"
         assert!(!reviews[0].second_pass_on_clean);
         assert_eq!(reviews[0].max_batch_diff_bytes, 30_000);
         assert_eq!(reviews[0].max_batches, 6);
-        assert_eq!(reviews[0].system_prompt, None);
         assert!(reviews[0].extra_instructions.is_empty());
         assert_eq!(reviews[0].max_tool_calls, 30);
         assert_eq!(reviews[0].max_tool_result_bytes, 60_000);
@@ -270,7 +263,6 @@ model = "gpt-4.1-mini"
         let rules = Ruleset::from_toml(
             r#"
 [ai_review]
-system_prompt = "Custom system prompt"
 extra_instructions = "Focus on C++ lifetime bugs."
 max_tool_calls = 4
 max_tool_result_bytes = 12000
@@ -296,13 +288,21 @@ max_batches = 6
         assert_eq!(reviews[0].request_timeout_seconds, Some(90));
         assert_eq!(reviews[0].max_batch_diff_bytes, 30_000);
         assert_eq!(reviews[0].max_batches, 6);
-        assert_eq!(
-            reviews[0].system_prompt.as_deref(),
-            Some("Custom system prompt")
-        );
         assert_eq!(reviews[0].extra_instructions, "Focus on C++ lifetime bugs.");
         assert_eq!(reviews[0].max_tool_calls, 4);
         assert_eq!(reviews[0].max_tool_result_bytes, 12_000);
+    }
+
+    #[test]
+    fn parses_checked_in_rules_example() {
+        let rules = Ruleset::from_toml(include_str!("../../rules.example.toml")).unwrap();
+
+        assert_eq!(rules.ai_review_count(), 1);
+        assert_eq!(rules.script_task_count(), 1);
+        let reviews = rules.ai_reviews_by_ids(&["ai-review".into()]);
+        assert_eq!(reviews.len(), 1);
+        assert!(reviews[0].extra_instructions.is_empty());
+        assert_eq!(reviews[0].max_tool_calls, 30);
     }
 
     #[test]

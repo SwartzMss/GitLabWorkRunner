@@ -54,7 +54,7 @@ struct FormattedChangePayload {
 }
 ```
 
-`total_payload_bytes` includes the path, file status, Markdown fence, and diff. The planner uses it for batch boundaries. `diff_start..diff_end` identifies only the original `GitLabChange.diff` bytes in `content`.
+`total_payload_bytes` includes the path, file status, diff header, and diff. The planner uses it for batch boundaries. `diff_start..diff_end` identifies only the original `GitLabChange.diff` bytes in `content`.
 
 Prompt truncation occurs at a UTF-8 boundary. The reviewed diff byte count is the overlap between the included content range and `diff_start..diff_end`; payload metadata is excluded. This makes `total_diff_bytes` and `reviewed_diff_bytes` consistently represent raw GitLab diff UTF-8 bytes.
 

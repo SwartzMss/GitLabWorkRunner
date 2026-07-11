@@ -1,13 +1,10 @@
 # Default example: manual AI Review plus an optional manually triggered script task.
 
 # Global AI review prompt settings shared by every [[ai_reviews]] entry.
-# The built-in reviewer system prompt always applies; system_prompt only appends extra system constraints.
+# The built-in reviewer system prompt always applies; extra_instructions is appended
+# to the system prompt as administrator review policy.
 [ai_review]
-# system_prompt = "You are a careful code reviewer. Return only high-confidence bugs."
-extra_instructions = """
-重点关注编译错误、运行时错误、资源生命周期、线程安全和安全漏洞。
-不要报告风格建议、命名建议、頭文件依賴或不确定的问题。
-"""
+extra_instructions = ""
 # Built-in read-only context tools are enabled by default. The runner controls call count
 # and result size.
 max_tool_calls = 30

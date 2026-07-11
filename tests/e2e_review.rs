@@ -715,7 +715,6 @@ fn test_ai_review_config(base_url: String) -> AiReviewConfig {
         second_pass_on_clean: false,
         max_batch_diff_bytes: 30_000,
         max_batches: 6,
-        system_prompt: None,
         extra_instructions: String::new(),
         max_tool_calls: 8,
         max_tool_result_bytes: 60_000,
