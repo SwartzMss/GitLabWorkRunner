@@ -266,6 +266,13 @@ impl DashboardStore {
                 )));
             }
         }
+        for column in ["publish_position"] {
+            if !self.column_exists("review_comment_records", column).await? {
+                return Err(AppError::Storage(format!(
+                    "dashboard database is missing required column `review_comment_records.{column}`; start gitlab-work-runner once to run migrations"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -908,5 +915,125 @@ mod tests {
 
         assert_eq!(failure.code, None);
         assert_eq!(failure.message, "legacy failure");
+    }
+
+    #[tokio::test]
+    async fn schema_check_requires_comment_publish_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("old-dashboard.db");
+        let database_url = format!("sqlite://{}", db_path.display());
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::from_str(&database_url)
+                    .unwrap()
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+create table review_requests (
+    id integer primary key autoincrement,
+    review_run_id text not null unique,
+    trigger_type text not null,
+    project_id integer not null,
+    project_name text,
+    project_path_with_namespace text,
+    mr_iid integer not null,
+    commit_sha text not null,
+    note_id integer,
+    requested_ids_json text not null,
+    selected_ai_reviews integer not null,
+    selected_script_tasks integer not null,
+    status text not null,
+    findings integer not null default 0,
+    comments integer not null default 0,
+    timezone text not null,
+    error_code text,
+    error text,
+    started_at text not null,
+    finished_at text
+);
+create table review_task_runs (
+    id integer primary key autoincrement,
+    review_run_id text not null,
+    task_type text not null,
+    task_id text not null,
+    title text not null,
+    status text not null,
+    findings integer not null default 0,
+    comments integer not null default 0,
+    error text,
+    error_code text,
+    coverage_total_files integer,
+    coverage_fully_reviewed_files integer,
+    coverage_partially_reviewed_files integer,
+    coverage_unreviewed_files integer,
+    coverage_total_diff_bytes integer,
+    coverage_reviewed_diff_bytes integer,
+    coverage_required_batches integer,
+    coverage_planned_batches integer,
+    coverage_completed_batches integer,
+    coverage_max_batches integer,
+    tool_calls_used integer,
+    max_tool_calls integer,
+    coverage_complete integer,
+    started_at text not null,
+    finished_at text
+);
+create table review_findings (
+    id integer primary key autoincrement,
+    review_run_id text not null,
+    task_type text not null,
+    task_id text not null,
+    rule_id text not null,
+    severity text not null,
+    path text not null,
+    new_line integer,
+    title text not null,
+    message text not null,
+    created_at text not null
+);
+create table review_comment_records (
+    id integer primary key autoincrement,
+    review_run_id text not null,
+    project_id integer not null,
+    mr_iid integer not null,
+    commit_sha text not null,
+    rule_id text not null,
+    path text not null,
+    new_line integer,
+    discussion_id text,
+    note_id integer,
+    created_at text not null
+);
+create table review_coverage_files (
+    id integer primary key autoincrement,
+    review_run_id text not null,
+    task_type text not null,
+    task_id text not null,
+    path text not null,
+    status text not null,
+    reason text not null,
+    total_diff_bytes integer not null,
+    reviewed_diff_bytes integer not null,
+    created_at text not null
+);
+"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        drop(pool);
+
+        let err = match DashboardStore::connect(&database_url).await {
+            Ok(_) => panic!("dashboard schema check unexpectedly passed"),
+            Err(err) => err,
+        };
+
+        assert!(err
+            .to_string()
+            .contains("review_comment_records.publish_position"));
     }
 }

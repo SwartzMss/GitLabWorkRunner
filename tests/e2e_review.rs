@@ -457,9 +457,12 @@ async fn skips_review_when_diff_refs_are_incomplete() {
                 let discussion_count = Arc::clone(&discussion_count_for_handler);
                 async move {
                     let body: Value = serde_json::from_slice(&body).unwrap();
-                    assert!(body["body"].as_str().unwrap().contains("Review 已跳过"));
-                    assert!(body["body"].as_str().unwrap().contains("请先解决冲突"));
-                    assert!(body.get("position").is_none());
+                    let body = body["body"].as_str().unwrap();
+                    assert!(body.contains("GitLabWorkRunner Review"));
+                    assert!(body.contains("**状态：** 已跳过"));
+                    assert!(body.contains("AI Review 未执行，GitLab diff refs 不完整"));
+                    assert!(!body.contains("**状态：** 完成"));
+                    assert!(!body.contains("未发现高置信度问题"));
                     discussion_count.fetch_add(1, Ordering::SeqCst);
                     (
                         StatusCode::CREATED,
@@ -495,8 +498,8 @@ model = "test-model"
 
     assert!(!summary.skipped);
     assert_eq!(summary.findings, 0);
-    assert_eq!(summary.comments, 0);
-    assert_eq!(discussion_count.load(Ordering::SeqCst), 0);
+    assert_eq!(summary.comments, 1);
+    assert_eq!(discussion_count.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

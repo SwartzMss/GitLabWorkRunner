@@ -322,7 +322,9 @@ impl ReviewService {
                 commit_sha = %event.commit_sha,
                 "AI review skipped because gitlab diff refs are incomplete"
             );
-            return Ok(AiReviewRunSummary::default());
+            let mut summary = AiReviewRunSummary::default();
+            summary.skipped_reviews = reviews.len();
+            return Ok(summary);
         }
 
         let mut summary = AiReviewRunSummary::default();
@@ -823,10 +825,17 @@ fn build_manual_review_summary_body(
     let findings = ai_summary.findings + script_summary.findings;
     let status = if ai_summary.failed_reviews > 0 {
         "部分失败"
+    } else if ai_summary.skipped_reviews > 0 {
+        "已跳过"
     } else {
         "完成"
     };
-    let result = if findings == 0 {
+    let result = if ai_summary.skipped_reviews > 0
+        && ai_summary.successful_reviews == 0
+        && script_summary.findings == 0
+    {
+        "AI Review 未执行，GitLab diff refs 不完整".to_string()
+    } else if findings == 0 {
         "未发现高置信度问题".to_string()
     } else {
         format!("发现 {findings} 个问题")
@@ -1207,6 +1216,7 @@ struct AiReviewRunSummary {
     comments: usize,
     successful_reviews: usize,
     failed_reviews: usize,
+    skipped_reviews: usize,
     failed_review_items: Vec<AiReviewFailureSummary>,
     reviewed_diff_bytes: usize,
     completed_batches: Option<usize>,
