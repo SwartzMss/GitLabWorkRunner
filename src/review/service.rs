@@ -322,9 +322,10 @@ impl ReviewService {
                 commit_sha = %event.commit_sha,
                 "AI review skipped because gitlab diff refs are incomplete"
             );
-            let mut summary = AiReviewRunSummary::default();
-            summary.skipped_reviews = reviews.len();
-            return Ok(summary);
+            return Ok(AiReviewRunSummary {
+                skipped_reviews: reviews.len(),
+                ..AiReviewRunSummary::default()
+            });
         }
 
         let mut summary = AiReviewRunSummary::default();
