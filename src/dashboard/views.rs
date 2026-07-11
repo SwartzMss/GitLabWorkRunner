@@ -234,7 +234,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         return `<div class="detail-list"><div class="detail-row"><span>覆盖情况</span><span></span></div></div>`;
       }
       const batchStats = `${task.coverage_completed_batches ?? 0} 已用 / ${fmtLimit(task.coverage_max_batches)} 上限`;
-      const toolCallStats = `${task.tool_calls_used ?? 0} 已用 / ${fmtLimit(task.max_tool_calls)} 上限`;
+      const toolCallStats = `${task.tool_calls_used ?? 0} 单批峰值 / ${fmtLimit(task.max_tool_calls)} 每批上限`;
       if (task.status === "failed" && (task.coverage_completed_batches === 0 || task.coverage_reviewed_diff_bytes === 0)) {
         return `<div class="detail-list">
           <div class="detail-row"><span>覆盖情况</span><span></span></div>

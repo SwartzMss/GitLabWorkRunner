@@ -388,7 +388,7 @@ async fn run_batched_ai_review(
     );
 
     let mut all_findings = Vec::new();
-    let mut tool_calls_used = 0_usize;
+    let mut max_tool_calls_used_in_batch = 0_usize;
     let batch_count = batches.len();
     for (index, batch) in batches.iter().enumerate() {
         let batch_index = index + 1;
@@ -419,12 +419,13 @@ async fn run_batched_ai_review(
         };
         match result {
             Ok(mut batch_result) => {
-                tool_calls_used += batch_result.tool_calls_used;
+                max_tool_calls_used_in_batch =
+                    max_tool_calls_used_in_batch.max(batch_result.tool_calls_used);
                 all_findings.append(&mut batch_result.findings);
                 plan.coverage.completed_batches += 1;
             }
             Err(err) => {
-                plan.coverage.tool_calls_used = tool_calls_used;
+                plan.coverage.tool_calls_used = max_tool_calls_used_in_batch;
                 apply_batch_failure_coverage(
                     &mut plan,
                     changes,
@@ -442,7 +443,7 @@ async fn run_batched_ai_review(
     plan.coverage.complete = plan.coverage.partially_reviewed_files == 0
         && plan.coverage.unreviewed_files == 0
         && plan.coverage.completed_batches == plan.coverage.planned_batches;
-    plan.coverage.tool_calls_used = tool_calls_used;
+    plan.coverage.tool_calls_used = max_tool_calls_used_in_batch;
     info!(
         ai_review_id = %config.id,
         coverage_files = %format!("{}/{}", plan.coverage.fully_reviewed_files + plan.coverage.partially_reviewed_files, plan.coverage.total_files),
@@ -451,7 +452,7 @@ async fn run_batched_ai_review(
         planned_batches = plan.coverage.planned_batches,
         completed_batches = plan.coverage.completed_batches,
         max_batches = plan.coverage.max_batches,
-        tool_calls_used = plan.coverage.tool_calls_used,
+        max_tool_calls_used_in_batch = plan.coverage.tool_calls_used,
         max_tool_calls = plan.coverage.max_tool_calls,
         partially_reviewed_files = plan.coverage.partially_reviewed_files,
         unreviewed_files = plan.coverage.unreviewed_files,
