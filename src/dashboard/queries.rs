@@ -173,6 +173,7 @@ pub struct DashboardComment {
     pub new_line: Option<i64>,
     pub discussion_id: Option<String>,
     pub note_id: Option<i64>,
+    pub publish_position: String,
     pub created_at: String,
 }
 
@@ -586,6 +587,7 @@ select
     coalesce(nullif(request.project_path_with_namespace, ''), nullif(request.project_name, ''), '#' || request.project_id) as project_label,
     request.mr_iid, request.commit_sha,
     comment.rule_id, comment.path, comment.new_line, comment.discussion_id, comment.note_id,
+    comment.publish_position,
     comment.created_at
 from review_comment_records comment
 join review_requests request on request.review_run_id = comment.review_run_id
@@ -700,6 +702,7 @@ select
     coalesce(nullif(request.project_path_with_namespace, ''), nullif(request.project_name, ''), '#' || request.project_id) as project_label,
     request.mr_iid, request.commit_sha,
     comment.rule_id, comment.path, comment.new_line, comment.discussion_id, comment.note_id,
+    comment.publish_position,
     comment.created_at
 from review_comment_records comment
 join review_requests request on request.review_run_id = comment.review_run_id
@@ -882,6 +885,7 @@ fn row_to_comment(row: SqliteRow) -> DashboardComment {
         new_line: row.get("new_line"),
         discussion_id: row.get("discussion_id"),
         note_id: row.get("note_id"),
+        publish_position: row.get("publish_position"),
         created_at: row.get("created_at"),
     }
 }

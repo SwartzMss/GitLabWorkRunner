@@ -8,6 +8,7 @@ use axum::{
 };
 use gitlab_work_runner::{
     ai_review::{run_ai_review, run_ai_review_execution_with_context},
+    dashboard::queries::DashboardStore,
     gitlab::GitLabChange,
     gitlab::GitLabClient,
     review::ReviewService,
@@ -297,6 +298,134 @@ model = "test-model"
 }
 
 #[tokio::test]
+async fn rename_inline_comment_uses_old_path_and_records_fallback_position() {
+    let discussion_count = Arc::new(AtomicUsize::new(0));
+    let discussion_count_for_handler = Arc::clone(&discussion_count);
+    let ai_request_count = Arc::new(AtomicUsize::new(0));
+    let ai_request_count_for_handler = Arc::clone(&ai_request_count);
+    let app = Router::new()
+        .route(
+            "/api/v4/projects/123/merge_requests/45/changes",
+            get(|| async {
+                Json(json!({
+                    "changes": [{
+                        "old_path": "src/old.rs",
+                        "new_path": "src/new.rs",
+                        "new_file": false,
+                        "renamed_file": true,
+                        "deleted_file": false,
+                        "diff": "@@ -1 +1 @@\n+let value = unwrap_input();\n"
+                    }],
+                    "diff_refs": {
+                        "base_sha": "base",
+                        "start_sha": "start",
+                        "head_sha": "head"
+                    }
+                }))
+            }),
+        )
+        .route(
+            "/api/v4/projects/123/repository/archive.zip",
+            get(|| async { test_archive() }),
+        )
+        .route(
+            "/api/v4/projects/123/merge_requests/45/discussions",
+            post(move |body: Bytes| {
+                let discussion_count = Arc::clone(&discussion_count_for_handler);
+                async move {
+                    let attempt = discussion_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    if attempt == 1 {
+                        assert_eq!(body["position"]["old_path"], "src/old.rs");
+                        assert_eq!(body["position"]["new_path"], "src/new.rs");
+                        return StatusCode::BAD_REQUEST.into_response();
+                    }
+                    assert!(body["position"].is_null());
+                    (
+                        StatusCode::CREATED,
+                        Json(json!({
+                            "id": format!("discussion-{attempt}"),
+                            "notes": [{ "id": 100 + attempt }]
+                        })),
+                    )
+                        .into_response()
+                }
+            }),
+        )
+        .route(
+            "/chat/completions",
+            post(move |_body: Bytes| {
+                let ai_request_count = Arc::clone(&ai_request_count_for_handler);
+                async move {
+                    ai_request_count.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({
+                        "choices": [{
+                            "message": {
+                                "content": serde_json::json!({
+                                    "findings": [{
+                                        "path": "src/new.rs",
+                                        "line": 1,
+                                        "severity": "error",
+                                        "title": "Bad unwrap",
+                                        "message": "Do not unwrap."
+                                    }]
+                                }).to_string()
+                            }
+                        }]
+                    }))
+                }
+            }),
+        );
+    let base_url = spawn_server(app).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("rename-fallback.db");
+    let database_url = format!("sqlite://{}", db_path.display());
+    let store = StateStore::connect(&database_url).await.unwrap();
+    store.migrate().await.unwrap();
+    let ruleset = Ruleset::from_toml(&format!(
+        r#"
+[[ai_reviews]]
+id = "ai-review"
+title = "AI Review"
+base_url = "{}"
+api_key = "test-api-key"
+model = "test-model"
+"#,
+        base_url
+    ))
+    .unwrap();
+    let service = ReviewService::new(
+        GitLabClient::new(base_url, "token".into()),
+        store.clone(),
+        ruleset,
+    )
+    .with_review_run_id("rr-rename-fallback".into());
+    let event = manual_note_event("@ai-review");
+
+    let summary = service.review_merge_request_note(&event).await.unwrap();
+
+    assert_eq!(summary.findings, 1);
+    assert_eq!(summary.comments, 2);
+    assert_eq!(ai_request_count.load(Ordering::SeqCst), 1);
+    assert_eq!(discussion_count.load(Ordering::SeqCst), 3);
+    let dashboard = DashboardStore::connect(&database_url).await.unwrap();
+    let detail = dashboard
+        .run_detail("rr-rename-fallback")
+        .await
+        .unwrap()
+        .unwrap();
+    let grouped = detail
+        .comments
+        .iter()
+        .find(|comment| comment.rule_id == "grouped")
+        .unwrap();
+    assert_eq!(grouped.path, "");
+    assert_eq!(grouped.new_line, None);
+    assert_eq!(grouped.publish_position, "merge_request_fallback");
+}
+
+#[tokio::test]
 async fn skips_review_when_diff_refs_are_incomplete() {
     let discussion_count = Arc::new(AtomicUsize::new(0));
     let discussion_count_for_handler = Arc::clone(&discussion_count);
@@ -410,11 +539,24 @@ async fn runs_script_task_without_posting_comment_when_it_fails() {
         )
         .route(
             "/api/v4/projects/123/merge_requests/45/discussions",
-            post(move || {
+            post(move |body: Bytes| {
                 let discussion_count = Arc::clone(&discussion_count_for_handler);
                 async move {
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    assert!(body["body"]
+                        .as_str()
+                        .unwrap()
+                        .contains("GitLabWorkRunner Review"));
+                    assert!(body["body"].as_str().unwrap().contains("**状态：** 完成"));
+                    assert!(body["position"].is_null());
                     discussion_count.fetch_add(1, Ordering::SeqCst);
-                    StatusCode::INTERNAL_SERVER_ERROR
+                    (
+                        StatusCode::CREATED,
+                        Json(json!({
+                            "id": "discussion-summary",
+                            "notes": [{ "id": 100 }]
+                        })),
+                    )
                 }
             }),
         );
@@ -445,9 +587,9 @@ timeout_seconds = 10
     let summary = service.review_merge_request_note(&event).await.unwrap();
 
     assert_eq!(summary.findings, 0);
-    assert_eq!(summary.comments, 0);
+    assert_eq!(summary.comments, 1);
     assert!(!summary.skipped);
-    assert_eq!(discussion_count.load(Ordering::SeqCst), 0);
+    assert_eq!(discussion_count.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -646,12 +788,14 @@ async fn manual_ai_review_posts_summary_when_one_review_fails() {
                 async move {
                     let body: Value = serde_json::from_slice(&body).unwrap();
                     let message = body["body"].as_str().unwrap();
-                    assert!(message.contains("部分 AI Review 失败"));
+                    assert!(message.contains("GitLabWorkRunner Review"));
+                    assert!(message.contains("**状态：** 部分失败"));
                     assert!(message.contains("- `bad-review` Bad Review"));
-                    assert!(message.contains("commit: `abc123`"));
-                    assert!(message.contains("review_run_id: `rr-partial-auto`"));
-                    assert!(message.contains("runner 日志"));
-                    assert!(message.contains("gitlab-work-runner:ai-review-partial-failed"));
+                    assert!(
+                        message.contains("Commit：** `abc123`")
+                            || message.contains("**Commit：** `abc123`")
+                    );
+                    assert!(message.contains("gitlab-work-runner:summary run=rr-partial-auto"));
                     assert!(body["position"].is_null());
                     discussion_count.fetch_add(1, Ordering::SeqCst);
                     (
@@ -787,18 +931,26 @@ async fn runs_second_ai_review_pass_when_first_pass_is_clean() {
             post(move |body: Bytes| {
                 let discussion_count = Arc::clone(&discussion_count_for_handler);
                 async move {
+                    let attempt = discussion_count.fetch_add(1, Ordering::SeqCst) + 1;
                     let body: Value = serde_json::from_slice(&body).unwrap();
-                    assert!(body["body"].as_str().unwrap().contains("Avoid unwrap"));
-                    assert!(body["body"]
-                        .as_str()
-                        .unwrap()
-                        .contains("gitlab-work-runner:rule=ai:ai-review"));
-                    discussion_count.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 1 {
+                        assert!(body["body"].as_str().unwrap().contains("Avoid unwrap"));
+                        assert!(body["body"]
+                            .as_str()
+                            .unwrap()
+                            .contains("gitlab-work-runner:rule=ai:ai-review"));
+                    } else {
+                        assert!(body["body"]
+                            .as_str()
+                            .unwrap()
+                            .contains("GitLabWorkRunner Review"));
+                        assert!(body["body"].as_str().unwrap().contains("发现 1 个问题"));
+                    }
                     (
                         StatusCode::CREATED,
                         Json(json!({
-                            "id": "discussion-1",
-                            "notes": [{ "id": 99 }]
+                            "id": format!("discussion-{attempt}"),
+                            "notes": [{ "id": 99 + attempt }]
                         })),
                     )
                 }
@@ -829,10 +981,10 @@ second_pass_on_clean = true
     let summary = service.review_merge_request_note(&event).await.unwrap();
 
     assert_eq!(summary.findings, 1);
-    assert_eq!(summary.comments, 1);
+    assert_eq!(summary.comments, 2);
     assert!(!summary.skipped);
     assert_eq!(ai_request_count.load(Ordering::SeqCst), 2);
-    assert_eq!(discussion_count.load(Ordering::SeqCst), 1);
+    assert_eq!(discussion_count.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -1502,10 +1654,11 @@ async fn ai_review_timeout_does_not_block_merge_request_review() {
                 async move {
                     let body: Value = serde_json::from_slice(&body).unwrap();
                     let message = body["body"].as_str().unwrap();
-                    assert!(message.contains("部分 AI Review 失败"));
+                    assert!(message.contains("GitLabWorkRunner Review"));
+                    assert!(message.contains("**状态：** 部分失败"));
                     assert!(message.contains("- `ai-review` AI Review"));
-                    assert!(message.contains("commit: `abc123`"));
-                    assert!(message.contains("review_run_id: `rr-timeout`"));
+                    assert!(message.contains("**Commit：** `abc123`"));
+                    assert!(message.contains("gitlab-work-runner:summary run=rr-timeout"));
                     discussion_count.fetch_add(1, Ordering::SeqCst);
                     (
                         StatusCode::CREATED,
@@ -1811,12 +1964,11 @@ async fn manual_note_posts_summary_when_one_ai_review_fails() {
                 async move {
                     let body: Value = serde_json::from_slice(&body).unwrap();
                     let message = body["body"].as_str().unwrap();
-                    assert!(message.contains("部分 AI Review 失败"));
+                    assert!(message.contains("GitLabWorkRunner Review"));
+                    assert!(message.contains("**状态：** 部分失败"));
                     assert!(message.contains("- `bad-review` Bad Review"));
-                    assert!(message.contains("commit: `event123`"));
-                    assert!(message.contains("review_run_id: `rr-partial-manual`"));
-                    assert!(message.contains("runner 日志"));
-                    assert!(message.contains("gitlab-work-runner:ai-review-partial-failed"));
+                    assert!(message.contains("**Commit：** `event123`"));
+                    assert!(message.contains("gitlab-work-runner:summary run=rr-partial-manual"));
                     assert!(body["position"].is_null());
                     discussion_count.fetch_add(1, Ordering::SeqCst);
                     (
@@ -1936,7 +2088,11 @@ async fn manual_note_posts_ai_review_completion_when_no_findings() {
                 let discussion_count = Arc::clone(&discussion_count_for_handler);
                 async move {
                     let body: Value = serde_json::from_slice(&body).unwrap();
-                    assert!(body["body"].as_str().unwrap().contains("AI Review 完成"));
+                    assert!(body["body"]
+                        .as_str()
+                        .unwrap()
+                        .contains("GitLabWorkRunner Review"));
+                    assert!(body["body"].as_str().unwrap().contains("**状态：** 完成"));
                     assert!(body["body"]
                         .as_str()
                         .unwrap()
@@ -1944,7 +2100,7 @@ async fn manual_note_posts_ai_review_completion_when_no_findings() {
                     assert!(body["body"]
                         .as_str()
                         .unwrap()
-                        .contains("gitlab-work-runner:rule=ai:ai-review:clean"));
+                        .contains("gitlab-work-runner:summary"));
                     assert!(body["position"].is_null());
                     discussion_count.fetch_add(1, Ordering::SeqCst);
                     (
