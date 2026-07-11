@@ -45,6 +45,9 @@ pub struct ReviewCoverage {
     pub required_batches: usize,
     pub planned_batches: usize,
     pub completed_batches: usize,
+    pub max_batches: usize,
+    pub tool_calls_used: usize,
+    pub max_tool_calls: usize,
     pub complete: bool,
 }
 
@@ -69,6 +72,12 @@ struct AiReviewBatchPlan {
     batches: Vec<Vec<GitLabChange>>,
     coverage: ReviewCoverage,
     incomplete_files: Vec<ReviewCoverageFile>,
+}
+
+#[derive(Debug)]
+struct AiReviewSingleResult {
+    findings: Vec<Finding>,
+    tool_calls_used: usize,
 }
 
 pub async fn run_ai_review(
@@ -116,7 +125,7 @@ async fn run_ai_review_single(
     batch: Option<(usize, usize)>,
     source_dir: Option<&Path>,
     review_request: Option<&str>,
-) -> AppResult<Vec<Finding>> {
+) -> AppResult<AiReviewSingleResult> {
     let api_key = config.api_key.trim();
     if api_key.is_empty() {
         return Err(AppError::ai_review(
@@ -265,6 +274,7 @@ async fn run_ai_review_single(
                             ),
                         ));
                     }
+                    let mut tool_calls_used = 0_usize;
                     let findings = complete_ai_review_response(AiReviewCompletion {
                         client,
                         config,
@@ -278,6 +288,7 @@ async fn run_ai_review_single(
                         request_timeout,
                         request_guard_timeout,
                         batch,
+                        tool_calls_used: &mut tool_calls_used,
                     })
                     .await?;
                     let raw_finding_count = findings.len();
@@ -292,7 +303,10 @@ async fn run_ai_review_single(
                         elapsed_ms = attempt_started.elapsed().as_millis(),
                         "AI review API completed"
                     );
-                    return Ok(filtered);
+                    return Ok(AiReviewSingleResult {
+                        findings: filtered,
+                        tool_calls_used,
+                    });
                 }
                 Ok(Err(err)) => {
                     let retryable = attempt < AI_HTTP_ATTEMPTS && is_retryable_ai_error(&err);
@@ -356,6 +370,7 @@ async fn run_batched_ai_review(
         config.max_batch_diff_bytes.max(1),
         config.max_batches,
     );
+    plan.coverage.max_tool_calls = config.max_tool_calls;
     let batches = &plan.batches;
     info!(
         ai_review_id = %config.id,
@@ -373,6 +388,7 @@ async fn run_batched_ai_review(
     );
 
     let mut all_findings = Vec::new();
+    let mut tool_calls_used = 0_usize;
     let batch_count = batches.len();
     for (index, batch) in batches.iter().enumerate() {
         let batch_index = index + 1;
@@ -402,11 +418,13 @@ async fn run_batched_ai_review(
             Err(_) => Err(ai_review_deadline_error(config)),
         };
         match result {
-            Ok(mut findings) => {
-                all_findings.append(&mut findings);
+            Ok(mut batch_result) => {
+                tool_calls_used += batch_result.tool_calls_used;
+                all_findings.append(&mut batch_result.findings);
                 plan.coverage.completed_batches += 1;
             }
             Err(err) => {
+                plan.coverage.tool_calls_used = tool_calls_used;
                 apply_batch_failure_coverage(
                     &mut plan,
                     changes,
@@ -424,6 +442,7 @@ async fn run_batched_ai_review(
     plan.coverage.complete = plan.coverage.partially_reviewed_files == 0
         && plan.coverage.unreviewed_files == 0
         && plan.coverage.completed_batches == plan.coverage.planned_batches;
+    plan.coverage.tool_calls_used = tool_calls_used;
     info!(
         ai_review_id = %config.id,
         coverage_files = %format!("{}/{}", plan.coverage.fully_reviewed_files + plan.coverage.partially_reviewed_files, plan.coverage.total_files),
@@ -431,6 +450,9 @@ async fn run_batched_ai_review(
         required_batches = plan.coverage.required_batches,
         planned_batches = plan.coverage.planned_batches,
         completed_batches = plan.coverage.completed_batches,
+        max_batches = plan.coverage.max_batches,
+        tool_calls_used = plan.coverage.tool_calls_used,
+        max_tool_calls = plan.coverage.max_tool_calls,
         partially_reviewed_files = plan.coverage.partially_reviewed_files,
         unreviewed_files = plan.coverage.unreviewed_files,
         coverage_complete = plan.coverage.complete,
@@ -558,6 +580,7 @@ struct AiReviewCompletion<'a> {
     request_timeout: Duration,
     request_guard_timeout: Duration,
     batch: Option<(usize, usize)>,
+    tool_calls_used: &'a mut usize,
 }
 
 async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResult<Vec<Finding>> {
@@ -574,9 +597,9 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
         request_timeout,
         request_guard_timeout,
         batch,
+        tool_calls_used,
     } = context;
     let mut body = first_body.to_string();
-    let mut tool_calls_used = 0_usize;
     let mut tool_call_limit_notice_sent = false;
     loop {
         let response: OpenAiChatResponse = serde_json::from_str(&body).map_err(|err| {
@@ -593,12 +616,12 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                 )
             })?;
         if has_submit_review_findings(message) || !use_tool_calls {
-            if tool_calls_used > 0 {
+            if *tool_calls_used > 0 {
                 info!(
                     ai_review_id = %config.id,
                     model = %config.model,
                     attempt,
-                    total_tool_calls_used = tool_calls_used,
+                    total_tool_calls_used = *tool_calls_used,
                     max_tool_calls = config.max_tool_calls,
                     batch_index = batch.map(|(index, _)| index),
                     batch_count = batch.map(|(_, count)| count),
@@ -628,7 +651,7 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
             attempt,
             requested_tool_calls = context_tool_calls.len(),
             tool_call_names = %tool_call_names,
-            tool_calls_used,
+            tool_calls_used = *tool_calls_used,
             max_tool_calls = config.max_tool_calls,
             batch_index = batch.map(|(index, _)| index),
             batch_count = batch.map(|(_, count)| count),
@@ -638,14 +661,14 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
         let remaining_tool_calls = if unlimited_tool_calls {
             usize::MAX
         } else {
-            config.max_tool_calls.saturating_sub(tool_calls_used)
+            config.max_tool_calls.saturating_sub(*tool_calls_used)
         };
         if !unlimited_tool_calls && remaining_tool_calls == 0 && tool_call_limit_notice_sent {
             warn!(
                 ai_review_id = %config.id,
                 model = %config.model,
                 requested_tool_calls = context_tool_calls.len(),
-                tool_calls_used,
+                tool_calls_used = *tool_calls_used,
                 max_tool_calls = config.max_tool_calls,
                 batch_index = batch.map(|(index, _)| index),
                 batch_count = batch.map(|(_, count)| count),
@@ -665,7 +688,7 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                 model = %config.model,
                 requested_tool_calls = context_tool_calls.len(),
                 remaining_tool_calls,
-                tool_calls_used,
+                tool_calls_used = *tool_calls_used,
                 max_tool_calls = config.max_tool_calls,
                 batch_index = batch.map(|(index, _)| index),
                 batch_count = batch.map(|(_, count)| count),
@@ -687,7 +710,7 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                 tool_call_argument_summary(tool_name, &tool_call.function.arguments);
             let result = if tool_call_index < remaining_tool_calls {
                 let result = tool_context.call(&tool_call);
-                tool_calls_used += 1;
+                *tool_calls_used += 1;
                 info!(
                     ai_review_id = %config.id,
                     model = %config.model,
@@ -698,8 +721,8 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                     result_truncated = tool_result_truncated(&result),
                     result_limit_reached = tool_result_limit_reached(&result, config.max_tool_result_bytes),
                     tool_call_limit_reached = false,
-                    tool_calls_used,
-                    total_tool_calls_used = tool_calls_used,
+                    tool_calls_used = *tool_calls_used,
+                    total_tool_calls_used = *tool_calls_used,
                     max_tool_calls = config.max_tool_calls,
                     batch_index = batch.map(|(index, _)| index),
                     batch_count = batch.map(|(_, count)| count),
@@ -719,8 +742,8 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                     result_truncated = tool_result_truncated(&result),
                     result_limit_reached = tool_result_limit_reached(&result, config.max_tool_result_bytes),
                     tool_call_limit_reached = true,
-                    tool_calls_used,
-                    total_tool_calls_used = tool_calls_used,
+                    tool_calls_used = *tool_calls_used,
+                    total_tool_calls_used = *tool_calls_used,
                     max_tool_calls = config.max_tool_calls,
                     batch_index = batch.map(|(index, _)| index),
                     batch_count = batch.map(|(_, count)| count),
@@ -979,6 +1002,9 @@ fn plan_ai_review_batches(
             required_batches,
             planned_batches,
             completed_batches: 0,
+            max_batches,
+            tool_calls_used: 0,
+            max_tool_calls: 0,
             complete: false,
         },
         incomplete_files,

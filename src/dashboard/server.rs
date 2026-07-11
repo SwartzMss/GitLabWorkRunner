@@ -338,6 +338,9 @@ mod tests {
                     required_batches: 3,
                     planned_batches: 2,
                     completed_batches: 2,
+                    max_batches: 4,
+                    tool_calls_used: 5,
+                    max_tool_calls: 8,
                     complete: false,
                 },
                 &[StoredReviewCoverageFile {
@@ -357,6 +360,9 @@ mod tests {
 
         assert_eq!(detail.tasks[0].coverage_required_batches, Some(3));
         assert_eq!(detail.tasks[0].coverage_completed_batches, Some(2));
+        assert_eq!(detail.tasks[0].coverage_max_batches, Some(4));
+        assert_eq!(detail.tasks[0].tool_calls_used, Some(5));
+        assert_eq!(detail.tasks[0].max_tool_calls, Some(8));
         assert_eq!(detail.tasks[0].coverage_complete, Some(false));
         assert_eq!(detail.tasks[0].incomplete_files[0].path, "src/c.rs");
         assert_eq!(
@@ -605,5 +611,75 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["merge_requests"][0]["failed_runs"], 1);
         assert_eq!(body["merge_requests"][0]["last_status"], "failed");
+    }
+
+    #[tokio::test]
+    async fn dashboard_run_detail_uses_failed_task_as_failure_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("dashboard-task-failure.db");
+        let database_url = format!("sqlite://{}", db_path.display());
+        let writer = StateStore::connect(&database_url).await.unwrap();
+        writer.migrate().await.unwrap();
+        writer
+            .start_review_request(&ReviewRequestStart {
+                review_run_id: "rr-task-failure",
+                trigger_type: "manual_note",
+                project_id: 123,
+                project_name: Some("Runner"),
+                project_path_with_namespace: Some("platform/runner"),
+                mr_iid: 45,
+                commit_sha: "abc123",
+                note_id: Some(987),
+                requested_ids_json: r#"["ai-review"]"#,
+                selected_ai_reviews: 1,
+                selected_script_tasks: 0,
+            })
+            .await
+            .unwrap();
+        writer
+            .start_task_run(&TaskRunStart {
+                review_run_id: "rr-task-failure",
+                task_type: "ai_review",
+                task_id: "ai-review",
+                title: "AI Review",
+            })
+            .await
+            .unwrap();
+        writer
+            .finish_task_run(&TaskRunFinish {
+                review_run_id: "rr-task-failure",
+                task_type: "ai_review",
+                task_id: "ai-review",
+                status: "failed",
+                findings: 0,
+                comments: 0,
+                error_code: Some("permission_denied"),
+                error: Some("AI review API returned HTTP status 401"),
+            })
+            .await
+            .unwrap();
+        writer
+            .finish_review_request("rr-task-failure", "completed", 0, 1)
+            .await
+            .unwrap();
+        drop(writer);
+
+        let store = DashboardStore::connect(&database_url).await.unwrap();
+        let app = router(store);
+        let response = axum::http::Request::builder()
+            .uri("/api/runs/rr-task-failure")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(response).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(body["run"]["status"], "failed");
+        assert_eq!(body["failure"]["code"], "permission_denied");
+        assert_eq!(
+            body["failure"]["message"],
+            "AI review API returned HTTP status 401"
+        );
     }
 }

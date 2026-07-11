@@ -51,6 +51,9 @@ impl ReviewService {
             required_batches: coverage.required_batches,
             planned_batches: coverage.planned_batches,
             completed_batches: coverage.completed_batches,
+            max_batches: coverage.max_batches,
+            tool_calls_used: coverage.tool_calls_used,
+            max_tool_calls: coverage.max_tool_calls,
             complete: coverage.complete,
         };
         let stored_files = files
@@ -403,6 +406,8 @@ impl ReviewService {
                     summary.failed_review_items.push(AiReviewFailureSummary {
                         id: review.id.clone(),
                         title: review.title.clone(),
+                        error_code: failure.code.as_str().to_string(),
+                        error: failure.message.clone(),
                     });
                     warn!(
                         project_id = event.project_id,
@@ -796,15 +801,17 @@ fn build_ai_review_partial_failure_body(
         .iter()
         .map(|failure| {
             format!(
-                "- `{}` {}",
+                "- `{}` {}\n  - 原因: `{}`\n  - 详情: {}",
                 sanitize_comment_inline(&failure.id),
-                sanitize_comment_inline(&failure.title)
+                sanitize_comment_inline(&failure.title),
+                sanitize_comment_inline(&failure.error_code),
+                sanitize_comment_detail(&failure.error, 500)
             )
         })
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "**部分 AI Review 失败**\n\n以下 AI review 执行失败，本次 review 已继续处理其它任务。请查看 runner 日志定位具体原因。\n\n{}\n\ncommit: `{}`\nreview_run_id: `{}`\n\n<!-- gitlab-work-runner:ai-review-partial-failed review_run_id={} commit={} -->",
+        "**部分 AI Review 失败**\n\n以下 AI review 执行失败，本次 review 已继续处理其它任务。失败原因如下，完整上下文请查看 runner 日志。\n\n{}\n\ncommit: `{}`\nreview_run_id: `{}`\n\n<!-- gitlab-work-runner:ai-review-partial-failed review_run_id={} commit={} -->",
         failed_reviews,
         sanitize_comment_inline(commit_sha),
         sanitize_comment_inline(review_run_id),
@@ -815,6 +822,19 @@ fn build_ai_review_partial_failure_body(
 
 fn sanitize_comment_inline(value: &str) -> String {
     value.replace('`', "'")
+}
+
+fn sanitize_comment_detail(value: &str, max_chars: usize) -> String {
+    let sanitized = sanitize_comment_inline(value)
+        .replace(['\r', '\n'], " ")
+        .trim()
+        .to_string();
+    if sanitized.chars().count() <= max_chars {
+        return sanitized;
+    }
+    let mut truncated = sanitized.chars().take(max_chars).collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 fn severity_name(severity: &Severity) -> &'static str {
@@ -1102,6 +1122,8 @@ struct AiReviewRunSummary {
 struct AiReviewFailureSummary {
     id: String,
     title: String,
+    error_code: String,
+    error: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1173,5 +1195,24 @@ mod tests {
         let normalized = path.to_string_lossy().replace('\\', "/");
 
         assert!(normalized.contains("/abc123/ai-review/run_1"));
+    }
+
+    #[test]
+    fn partial_ai_review_failure_comment_includes_failure_details() {
+        let body = build_ai_review_partial_failure_body(
+            "abc123",
+            "rr-1",
+            &[AiReviewFailureSummary {
+                id: "ai-review".into(),
+                title: "AI Review".into(),
+                error_code: "permission_denied".into(),
+                error: "AI review API returned 401\ninvalid token".into(),
+            }],
+        );
+
+        assert!(body.contains("- `ai-review` AI Review"));
+        assert!(body.contains("原因: `permission_denied`"));
+        assert!(body.contains("详情: AI review API returned 401 invalid token"));
+        assert!(body.contains("review_run_id: `rr-1`"));
     }
 }

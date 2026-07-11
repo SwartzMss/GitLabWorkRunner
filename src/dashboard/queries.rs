@@ -127,6 +127,9 @@ pub struct DashboardTaskRun {
     pub coverage_required_batches: Option<i64>,
     pub coverage_planned_batches: Option<i64>,
     pub coverage_completed_batches: Option<i64>,
+    pub coverage_max_batches: Option<i64>,
+    pub tool_calls_used: Option<i64>,
+    pub max_tool_calls: Option<i64>,
     pub coverage_complete: Option<bool>,
     pub incomplete_files: Vec<DashboardCoverageFile>,
 }
@@ -251,6 +254,9 @@ impl DashboardStore {
             "coverage_required_batches",
             "coverage_planned_batches",
             "coverage_completed_batches",
+            "coverage_max_batches",
+            "tool_calls_used",
+            "max_tool_calls",
             "coverage_complete",
         ] {
             if !self.column_exists("review_task_runs", column).await? {
@@ -402,12 +408,15 @@ where review_run_id = ?
         let Some(row) = run else {
             return Ok(None);
         };
-        let failure = dashboard_failure(
+        let mut failure = dashboard_failure(
             row.get::<Option<String>, _>("error_code"),
             row.get::<Option<String>, _>("error"),
         );
         let run = row_to_run(row);
         let tasks = self.tasks(review_run_id).await?;
+        if failure.is_none() && run.status == "failed" {
+            failure = tasks.iter().find_map(dashboard_task_failure);
+        }
         let findings = self.findings(review_run_id).await?;
         let comments = self.comments(review_run_id).await?;
         Ok(Some(DashboardRunDetail {
@@ -599,7 +608,7 @@ select task_type, task_id, title, status, findings, comments, error_code, error,
     coverage_total_files, coverage_fully_reviewed_files, coverage_partially_reviewed_files,
     coverage_unreviewed_files, coverage_total_diff_bytes, coverage_reviewed_diff_bytes,
     coverage_required_batches, coverage_planned_batches, coverage_completed_batches,
-    coverage_complete
+    coverage_max_batches, tool_calls_used, max_tool_calls, coverage_complete
 from review_task_runs
 where review_run_id = ?
 order by started_at asc, id asc
@@ -651,6 +660,9 @@ from review_coverage_files where review_run_id = ? and task_type = ? and task_id
                 coverage_required_batches: row.get("coverage_required_batches"),
                 coverage_planned_batches: row.get("coverage_planned_batches"),
                 coverage_completed_batches: row.get("coverage_completed_batches"),
+                coverage_max_batches: row.get("coverage_max_batches"),
+                tool_calls_used: row.get("tool_calls_used"),
+                max_tool_calls: row.get("max_tool_calls"),
                 coverage_complete: row.get("coverage_complete"),
                 incomplete_files,
             });
@@ -713,6 +725,13 @@ fn dashboard_failure(code: Option<String>, message: Option<String>) -> Option<Da
         code,
         message: error_preview(message).unwrap_or_default(),
     })
+}
+
+fn dashboard_task_failure(task: &DashboardTaskRun) -> Option<DashboardFailure> {
+    if task.status == "completed" {
+        return None;
+    }
+    dashboard_failure(task.error_code.clone(), task.error.clone())
 }
 
 fn error_preview(value: Option<String>) -> Option<String> {

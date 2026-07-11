@@ -28,8 +28,10 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     nav { display: grid; gap: 7px; }
     .nav-item { display: flex; align-items: center; gap: 12px; height: 44px; padding: 0 14px; color: #25324a; border-radius: 7px; font-size: 14px; cursor: pointer; user-select: none; }
     .nav-item:hover { background: #f4f7fb; }
-    .nav-item.active { background: #eef2ff; color: #2448df; font-weight: 650; }
-    .nav-icon { width: 18px; text-align: center; color: inherit; }
+    .nav-item.active { background: #fff1df; color: #f05a1a; font-weight: 650; }
+    .nav-icon { width: 20px; height: 20px; display: inline-grid; place-items: center; flex: 0 0 20px; color: #526176; }
+    .nav-item.active .nav-icon { color: #ff5a1f; }
+    .nav-icon svg { width: 19px; height: 19px; display: block; stroke: currentColor; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; fill: none; }
     .aside-footer { margin-top: auto; border: 1px solid #e1e6f0; border-radius: 8px; padding: 15px; font-size: 13px; color: var(--muted); }
     .aside-footer strong { display: block; color: #111827; margin-bottom: 7px; }
     .aside-footer a { color: #2448df; text-decoration: none; display: inline-block; margin-top: 10px; }
@@ -129,12 +131,12 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         <div><div class="brand-title">GitLab Work Runner</div><div class="brand-subtitle">MR Review 自动化</div></div>
       </div>
       <nav id="nav">
-        <div class="nav-item active" data-view="dashboard"><span class="nav-icon">⌂</span>仪表盘</div>
-        <div class="nav-item" data-view="projects"><span class="nav-icon">□</span>项目</div>
-        <div class="nav-item" data-view="mrs"><span class="nav-icon">⌘</span>合并请求</div>
-        <div class="nav-item" data-view="runs"><span class="nav-icon">▷</span>Review 运行</div>
-        <div class="nav-item" data-view="findings"><span class="nav-icon">◌</span>问题</div>
-        <div class="nav-item" data-view="system"><span class="nav-icon">▣</span>系统</div>
+        <div class="nav-item active" data-view="dashboard"><span class="nav-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 11.5 12 4l9 7.5"/><path d="M5.5 10.5V20h13v-9.5"/><path d="M9.5 20v-5h5v5"/></svg></span>仪表盘</div>
+        <div class="nav-item" data-view="projects"><span class="nav-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4.5" y="5.5" width="15" height="13" rx="2"/><path d="M8 9h8M8 13h5"/></svg></span>项目</div>
+        <div class="nav-item" data-view="mrs"><span class="nav-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="7" cy="6" r="2"/><circle cx="17" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><path d="M7 8v3a4 4 0 0 0 4 4h1"/><path d="M17 8v3a4 4 0 0 1-4 4h-1"/><path d="M12 15v1"/></svg></span>合并请求</div>
+        <div class="nav-item" data-view="runs"><span class="nav-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 11 7-11 7z"/></svg></span>Review 运行</div>
+        <div class="nav-item" data-view="findings"><span class="nav-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 8v4"/><path d="M12 16h.01"/></svg></span>问题</div>
+        <div class="nav-item" data-view="system"><span class="nav-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="2"/><path d="M9 9h6v6H9z"/></svg></span>系统</div>
       </nav>
       <div class="aside-footer">
         <strong>GitLab Work Runner</strong>
@@ -210,6 +212,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     const row = (cells, attrs = "") => `<tr ${attrs}>${cells.map((cell) => `<td>${cell ?? ""}</td>`).join("")}</tr>`;
     const pct = (part, total) => total ? ((part / total) * 100).toFixed(1) : "0.0";
     const fmtBytes = (value) => value == null ? "-" : value < 1024 ? `${value} B` : `${(value / 1024).toFixed(1)} KB`;
+    const fmtLimit = (value) => value === 0 ? "不限制" : esc(value ?? "-");
     const coverageReason = (reason) => ({
       max_batches_reached: "达到批次上限",
       single_file_diff_truncated: "单文件 Diff 超过批次限制",
@@ -225,21 +228,30 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       invalid_configuration: "配置无效", script_task_failed: "脚本任务失败", internal: "内部错误"
     }[code] || code || "未分类错误");
     const renderFailure = (failure) => failure ? `<div class="failure"><div><span class="badge failed">${esc(errorCodeText(failure.code))}</span>${failure.code ? ` <code>${esc(failure.code)}</code>` : ""}</div><pre class="failure-message">${esc(failure.message || "-")}</pre></div>` : "";
-    const taskFailure = (task) => (task.error_code || task.error) ? { code: task.error_code, message: task.error } : null;
 
     function renderTaskCoverage(task) {
       if (task.coverage_total_files == null) {
-        return `<div class="detail-list"><div class="detail-row"><span>${esc(task.title)}</span>${badge(task.status)}</div></div>${renderFailure(taskFailure(task))}`;
+        return `<div class="detail-list"><div class="detail-row"><span>覆盖情况</span><span></span></div></div>`;
+      }
+      const batchStats = `${task.coverage_completed_batches ?? 0} 已用 / ${fmtLimit(task.coverage_max_batches)} 上限`;
+      const toolCallStats = `${task.tool_calls_used ?? 0} 已用 / ${fmtLimit(task.max_tool_calls)} 上限`;
+      if (task.status === "failed" && (task.coverage_completed_batches === 0 || task.coverage_reviewed_diff_bytes === 0)) {
+        return `<div class="detail-list">
+          <div class="detail-row"><span>覆盖情况</span><span></span></div>
+          <div class="detail-row"><span>批次</span><span>${batchStats}</span></div>
+          <div class="detail-row"><span>工具调用</span><span>${toolCallStats}</span></div>
+        </div>`;
       }
       const state = task.coverage_complete ? "完整" : "部分";
       const files = task.incomplete_files || [];
       const incomplete = files.length ? `<table><thead><tr><th>文件</th><th>状态</th><th>原因</th><th>已审查 Diff</th><th>总 Diff</th></tr></thead><tbody>${files.map((file) => row([esc(file.path), file.status === "partial" ? "部分" : "未审查", coverageReason(file.reason), fmtBytes(file.reviewed_diff_bytes), fmtBytes(file.total_diff_bytes)])).join("")}</tbody></table>` : "";
       return `<div class="detail-list">
-        <div class="detail-row"><span>${esc(task.title)}</span><span class="badge ${task.coverage_complete ? "completed" : "warning"}">${state}</span></div>
+        <div class="detail-row"><span>覆盖情况</span><span class="badge ${task.coverage_complete ? "completed" : "warning"}">${state}</span></div>
         <div class="detail-row"><span>文件</span><span>${task.coverage_fully_reviewed_files} 完整 / ${task.coverage_partially_reviewed_files} 部分 / ${task.coverage_unreviewed_files} 未审查 / ${task.coverage_total_files} 总计</span></div>
         <div class="detail-row"><span>Diff</span><span>${fmtBytes(task.coverage_reviewed_diff_bytes)} / ${fmtBytes(task.coverage_total_diff_bytes)} (${pct(task.coverage_reviewed_diff_bytes, task.coverage_total_diff_bytes)}%)</span></div>
-        <div class="detail-row"><span>批次</span><span>${task.coverage_completed_batches} 完成 / ${task.coverage_planned_batches} 计划 / ${task.coverage_required_batches} 所需</span></div>
-      </div>${renderFailure(taskFailure(task))}${incomplete}`;
+        <div class="detail-row"><span>批次</span><span>${batchStats}</span></div>
+        <div class="detail-row"><span>工具调用</span><span>${toolCallStats}</span></div>
+      </div>${incomplete}`;
     }
 
     function params(includeStatus = true) {
@@ -466,6 +478,7 @@ mod tests {
         assert!(DASHBOARD_HTML.contains("detail.findings"));
         assert!(DASHBOARD_HTML.contains("detail.tasks"));
         assert!(DASHBOARD_HTML.contains("Review 覆盖"));
+        assert!(DASHBOARD_HTML.contains("coverage_completed_batches === 0"));
         assert!(DASHBOARD_HTML.contains("达到批次上限"));
         assert!(DASHBOARD_HTML.contains("单文件 Diff 超过批次限制"));
         assert!(DASHBOARD_HTML.contains("批次执行失败"));
@@ -475,7 +488,7 @@ mod tests {
     fn run_detail_renders_legacy_failures_without_codes() {
         assert!(DASHBOARD_HTML.contains(r#"}[code] || code || "未分类错误""#));
         assert!(DASHBOARD_HTML.contains("failure.code ?"));
-        assert!(DASHBOARD_HTML.contains("(task.error_code || task.error)"));
+        assert!(DASHBOARD_HTML.contains("renderFailure(detail.failure)"));
     }
 
     #[test]

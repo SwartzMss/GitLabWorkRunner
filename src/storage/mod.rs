@@ -60,6 +60,9 @@ pub struct StoredReviewCoverage {
     pub required_batches: usize,
     pub planned_batches: usize,
     pub completed_batches: usize,
+    pub max_batches: usize,
+    pub tool_calls_used: usize,
+    pub max_tool_calls: usize,
     pub complete: bool,
 }
 
@@ -176,6 +179,9 @@ create table if not exists review_task_runs (
             "coverage_required_batches",
             "coverage_planned_batches",
             "coverage_completed_batches",
+            "coverage_max_batches",
+            "tool_calls_used",
+            "max_tool_calls",
             "coverage_complete",
         ] {
             self.ensure_column("review_task_runs", column, "integer")
@@ -430,7 +436,8 @@ update review_task_runs set
     coverage_partially_reviewed_files = ?, coverage_unreviewed_files = ?,
     coverage_total_diff_bytes = ?, coverage_reviewed_diff_bytes = ?,
     coverage_required_batches = ?, coverage_planned_batches = ?,
-    coverage_completed_batches = ?, coverage_complete = ?
+    coverage_completed_batches = ?, coverage_max_batches = ?,
+    tool_calls_used = ?, max_tool_calls = ?, coverage_complete = ?
 where review_run_id = ? and task_type = ? and task_id = ?
 "#,
         )
@@ -449,6 +456,9 @@ where review_run_id = ? and task_type = ? and task_id = ?
         .bind(coverage.required_batches as i64)
         .bind(coverage.planned_batches as i64)
         .bind(coverage.completed_batches as i64)
+        .bind(coverage.max_batches as i64)
+        .bind(coverage.tool_calls_used as i64)
+        .bind(coverage.max_tool_calls as i64)
         .bind(coverage.complete)
         .bind(task.review_run_id)
         .bind(task.task_type)
@@ -655,6 +665,9 @@ mod tests {
             required_batches: 3,
             planned_batches: 2,
             completed_batches: 2,
+            max_batches: 4,
+            tool_calls_used: 5,
+            max_tool_calls: 8,
             complete: false,
         };
         let file = StoredReviewCoverageFile {
@@ -690,9 +703,12 @@ mod tests {
         .fetch_one(&store.pool)
         .await
         .unwrap();
-        let reviewed: i64 = sqlx::query_scalar("select coverage_reviewed_diff_bytes from review_task_runs where review_run_id = 'rr-coverage'")
+        let task_row = sqlx::query("select coverage_reviewed_diff_bytes, coverage_max_batches, tool_calls_used, max_tool_calls from review_task_runs where review_run_id = 'rr-coverage'")
             .fetch_one(&store.pool).await.unwrap();
         assert_eq!(rows, 1);
-        assert_eq!(reviewed, 15);
+        assert_eq!(task_row.get::<i64, _>("coverage_reviewed_diff_bytes"), 15);
+        assert_eq!(task_row.get::<i64, _>("coverage_max_batches"), 4);
+        assert_eq!(task_row.get::<i64, _>("tool_calls_used"), 5);
+        assert_eq!(task_row.get::<i64, _>("max_tool_calls"), 8);
     }
 }
