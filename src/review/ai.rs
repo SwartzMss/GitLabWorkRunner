@@ -1618,7 +1618,10 @@ mod tests {
         let json: Value = serde_json::from_slice(&body).unwrap();
 
         assert!(prompt.contains("Focus on C++ lifetime bugs."));
-        assert_eq!(json["messages"][0]["content"], "Custom system prompt");
+        let system_prompt = json["messages"][0]["content"].as_str().unwrap();
+        assert!(system_prompt.contains("严格、低误报"));
+        assert!(system_prompt.contains("## 附加系统约束"));
+        assert!(system_prompt.contains("Custom system prompt"));
     }
 
     #[test]

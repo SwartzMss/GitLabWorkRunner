@@ -1,7 +1,7 @@
 # Default example: manual AI Review plus an optional manually triggered script task.
 
 # Global AI review prompt settings shared by every [[ai_reviews]] entry.
-# Leave these empty to use the built-in reviewer prompt.
+# The built-in reviewer system prompt always applies; system_prompt only appends extra system constraints.
 [ai_review]
 # system_prompt = "You are a careful code reviewer. Return only high-confidence bugs."
 extra_instructions = """

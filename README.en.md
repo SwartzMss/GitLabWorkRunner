@@ -231,6 +231,7 @@ Recommended `rules.toml` example:
 ```toml
 [ai_review]
 # Optional global AI Review prompt settings shared by every [[ai_reviews]] entry.
+# The built-in system prompt always applies; system_prompt only appends extra system constraints.
 # system_prompt = "You are a careful code reviewer. Return only high-confidence bugs."
 extra_instructions = """
 Focus on compile errors, runtime errors, resource lifetime issues, thread safety, and security bugs.
@@ -254,7 +255,7 @@ max_batches = 10
 
 Posting a standalone `@ai-review` in an MR comment triggers the entry whose `id = "ai-review"`. MR update events are accepted and ignored; they do not enter the review queue.
 
-`[ai_review]` is the global AI Review prompt configuration. `system_prompt` replaces the built-in system prompt; `extra_instructions` is appended to the user prompt. If omitted, the built-in prompt is used.
+`[ai_review]` is the global AI Review prompt configuration. The built-in system prompt always applies; `system_prompt` only appends extra system constraints, and `extra_instructions` is appended to the user prompt. If omitted, only the built-in prompt is used.
 Built-in read-only context tools are enabled by default. The service downloads the MR head archive and lets the model request `read_file`, `search_code`, or `list_files` through tool calls. The runner only returns text content inside the repository directory; it does not execute shell commands and skips `.env` and `.git`.
 `max_tool_calls` defaults to `30`; `0` means unlimited tool calls. `max_tool_result_bytes` defaults to `60000`.
 Logs include each tool call's tool name, argument summary, returned bytes, result truncation status, tool-call limit status, batch index/count, and cumulative tool-call count. This makes it clear whether the model actually called `read_file`, `search_code`, or `list_files`.

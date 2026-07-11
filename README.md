@@ -231,6 +231,7 @@ dashboard 进程不会执行 migration。如果数据库或统计表不存在，
 ```toml
 [ai_review]
 # 可选：全局 AI Review prompt 配置，所有 [[ai_reviews]] 共用。
+# 内置 system prompt 始终生效；system_prompt 只会追加为附加系统约束。
 # system_prompt = "You are a careful code reviewer. Return only high-confidence bugs."
 extra_instructions = """
 重点关注编译错误、运行时错误、资源生命周期、线程安全和安全漏洞。
@@ -253,7 +254,7 @@ max_batches = 10
 ```
 
 在 MR 评论中发送独立的 `@ai-review` 会触发 `id = "ai-review"` 的配置。MR 更新事件会被接收并忽略，不会进入 review 队列。
-`[ai_review]` 是全局 AI Review prompt 配置：`system_prompt` 可以替换内置 system prompt，`extra_instructions` 会追加到用户 prompt。缺省时使用内置 prompt，不需要配置。
+`[ai_review]` 是全局 AI Review prompt 配置：内置 system prompt 始终生效，`system_prompt` 只会追加为附加系统约束，`extra_instructions` 会追加到用户 prompt。缺省时只使用内置 prompt，不需要配置。
 内置只读上下文工具默认启用。服务会下载 MR head archive，让模型可以通过 tool call 请求 `read_file`、`search_code` 或 `list_files`；runner 只返回仓库目录内的文本内容，不执行 shell，也不会读取 `.env` 或 `.git`。
 `max_tool_calls` 默认是 `30`，`0` 表示不限制工具调用次数；`max_tool_result_bytes` 默认是 `60000`。
 日志会记录每次工具调用的工具名、参数摘要、返回 bytes、结果是否截断、是否触发调用上限、batch index/count 和累计 tool call 次数，便于确认模型是否真的调用了 `read_file`、`search_code` 或 `list_files`。
