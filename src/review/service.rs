@@ -851,31 +851,11 @@ fn build_manual_review_summary_body(
     } else {
         total_diff_bytes
     };
-    let batch_line = ai_summary
-        .planned_batches
-        .map(|planned| {
-            format!(
-                "{} / {}",
-                ai_summary.completed_batches.unwrap_or(0),
-                planned
-            )
-        })
-        .unwrap_or_else(|| "-".into());
-    let tool_line = ai_summary
-        .max_tool_calls
-        .map(|max| {
-            format!(
-                "{} 单批峰值 / {} 每批上限",
-                ai_summary.tool_calls_used_peak, max
-            )
-        })
-        .unwrap_or_else(|| "-".into());
     let preference = review_request
         .map(|value| sanitize_comment_detail(value, 300))
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "无".into());
+        .filter(|value| !value.is_empty());
     let mut body = format!(
-        "## GitLabWorkRunner Review\n\n**状态：** {}\n**Commit：** `{}`\n**结果：** {}\n\n### 检查范围\n\n- 文件：{} / {}\n- Diff：{} / {}\n- 批次：{}\n- 上下文工具：{}\n- 耗时：{} 秒\n\n### 用户偏好\n\n{}\n",
+        "## GitLabWorkRunner Review\n\n**状态：** {}\n**Commit：** `{}`\n**结果：** {}\n\n### 检查范围\n\n- 文件：{} / {}\n- Diff：{} / {}\n- 耗时：{} 秒\n",
         status,
         sanitize_comment_inline(&event.commit_sha),
         result,
@@ -883,11 +863,13 @@ fn build_manual_review_summary_body(
         changes.changes.len(),
         format_bytes(reviewed_diff_bytes),
         format_bytes(total_diff_bytes),
-        batch_line,
-        tool_line,
-        elapsed.as_secs().max(1),
-        preference
+        elapsed.as_secs().max(1)
     );
+    if let Some(preference) = preference {
+        body.push_str("\n### 用户偏好\n\n");
+        body.push_str(&preference);
+        body.push('\n');
+    }
     if !ai_summary.failed_review_items.is_empty() {
         let failed_reviews = ai_summary
             .failed_review_items
@@ -1220,31 +1202,11 @@ struct AiReviewRunSummary {
     skipped_reviews: usize,
     failed_review_items: Vec<AiReviewFailureSummary>,
     reviewed_diff_bytes: usize,
-    completed_batches: Option<usize>,
-    planned_batches: Option<usize>,
-    tool_calls_used_peak: usize,
-    max_tool_calls: Option<usize>,
 }
 
 impl AiReviewRunSummary {
     fn apply_coverage(&mut self, coverage: &ReviewCoverage) {
         self.reviewed_diff_bytes = self.reviewed_diff_bytes.max(coverage.reviewed_diff_bytes);
-        self.completed_batches = Some(
-            self.completed_batches
-                .unwrap_or_default()
-                .max(coverage.completed_batches),
-        );
-        self.planned_batches = Some(
-            self.planned_batches
-                .unwrap_or_default()
-                .max(coverage.planned_batches),
-        );
-        self.tool_calls_used_peak = self.tool_calls_used_peak.max(coverage.tool_calls_used);
-        self.max_tool_calls = Some(
-            self.max_tool_calls
-                .unwrap_or_default()
-                .max(coverage.max_tool_calls),
-        );
     }
 }
 
@@ -1394,7 +1356,54 @@ mod tests {
         assert!(body.contains("原因: `permission_denied`"));
         assert!(body.contains("详情: AI review API returned 401 invalid token"));
         assert!(body.contains("重点检查线程安全"));
+        assert!(body.contains("- Diff：3 B / 3 B"));
+        assert!(!body.contains("- 批次："));
+        assert!(!body.contains("- 上下文工具："));
         assert!(body.contains("<!-- gitlab-work-runner:summary run=rr-1 commit=abc123 -->"));
+    }
+
+    #[test]
+    fn manual_review_summary_hides_empty_preferences() {
+        let event = MergeRequestEvent {
+            project_id: 1,
+            project_name: None,
+            project_path_with_namespace: None,
+            mr_iid: 2,
+            commit_sha: "abc123".into(),
+            action: "manual-note-1".into(),
+            source_branch: String::new(),
+            target_branch: String::new(),
+        };
+        let changes = crate::gitlab::MergeRequestChanges {
+            changes: vec![GitLabChange {
+                old_path: "src/lib.rs".into(),
+                new_path: "src/lib.rs".into(),
+                new_file: false,
+                renamed_file: false,
+                deleted_file: false,
+                diff: "+x\n".into(),
+            }],
+            diff_refs: crate::gitlab::DiffRefs {
+                base_sha: Some("base".into()),
+                start_sha: Some("start".into()),
+                head_sha: Some("head".into()),
+            },
+        };
+
+        let body = build_manual_review_summary_body(
+            &event,
+            &changes,
+            "rr-1",
+            &AiReviewRunSummary::default(),
+            &ScriptTaskRunSummary::default(),
+            None,
+            std::time::Duration::from_secs(1),
+        );
+
+        assert!(!body.contains("### 用户偏好"));
+        assert!(!body.contains("\n无\n"));
+        assert!(!body.contains("- 批次："));
+        assert!(!body.contains("- 上下文工具："));
     }
 
     #[test]
