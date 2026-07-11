@@ -70,11 +70,32 @@ pub struct CreatedDiscussion {
     pub id: String,
     #[serde(default)]
     pub notes: Vec<CreatedNote>,
+    #[serde(default)]
+    pub publish_position: PublishPosition,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct CreatedNote {
     pub id: i64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PublishPosition {
+    #[default]
+    Inline,
+    MergeRequest,
+    MergeRequestFallback,
+}
+
+impl PublishPosition {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Inline => "inline",
+            Self::MergeRequest => "merge_request",
+            Self::MergeRequestFallback => "merge_request_fallback",
+        }
+    }
 }
 
 impl GitLabClient {
@@ -341,7 +362,8 @@ impl GitLabClient {
                 mr_iid,
                 "line-level discussion was rejected by gitlab; falling back to merge-request-level discussion"
             );
-            let created = created.expect("fallback discussion should be created");
+            let mut created = created.expect("fallback discussion should be created");
+            created.publish_position = PublishPosition::MergeRequestFallback;
             info!(
                 project_id,
                 mr_iid,
@@ -351,7 +373,12 @@ impl GitLabClient {
             );
             return Ok(created);
         }
-        let created = created.expect("discussion should be created");
+        let mut created = created.expect("discussion should be created");
+        created.publish_position = if has_position {
+            PublishPosition::Inline
+        } else {
+            PublishPosition::MergeRequest
+        };
         info!(
             project_id,
             mr_iid,

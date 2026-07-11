@@ -4,7 +4,7 @@ use crate::{
     },
     comments::{build_comment_drafts, CommentDraft},
     error::{AppError, AppResult, ReviewErrorCode, ReviewFailure},
-    gitlab::{CreateDiscussionRequest, DiscussionPosition, GitLabClient},
+    gitlab::{CreateDiscussionRequest, DiscussionPosition, GitLabChange, GitLabClient},
     rules::{AiReviewConfig, Finding, Ruleset, Severity},
     script_tasks::{
         extract_zip_archive, ArchiveLimits, ScriptTaskContext, ScriptTaskResult, ScriptTaskRunner,
@@ -20,6 +20,7 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
+    time::Instant,
 };
 use tracing::{info, warn};
 
@@ -198,6 +199,7 @@ impl ReviewService {
     ) -> AppResult<ReviewSummary> {
         let selected_ids = selected_manual_ids(&tasks, &ai_reviews);
         let review_request = manual_review_request_text(&event.note, &selected_ids);
+        let started = Instant::now();
         info!(
             project_id = event.project_id,
             mr_iid = event.mr_iid,
@@ -246,14 +248,21 @@ impl ReviewService {
         let ai_result = self
             .run_selected_ai_reviews(&mr_event, &changes, ai_reviews, review_request.as_deref())
             .await?;
-        let ai_completion_comments = self
-            .publish_manual_ai_review_clean_comments(&mr_event, &changes, &ai_result)
-            .await?;
         let script_result = self
             .run_selected_script_tasks(&mr_event, &changes, tasks)
             .await?;
         let findings = ai_result.findings + script_result.findings;
-        let comments = ai_result.comments + ai_completion_comments + script_result.comments;
+        let summary_comments = self
+            .publish_manual_review_summary(
+                &mr_event,
+                &changes,
+                &ai_result,
+                &script_result,
+                review_request.as_deref(),
+                started.elapsed(),
+            )
+            .await?;
+        let comments = ai_result.comments + script_result.comments + summary_comments;
         info!(
             project_id = event.project_id,
             mr_iid = event.mr_iid,
@@ -313,7 +322,9 @@ impl ReviewService {
                 commit_sha = %event.commit_sha,
                 "AI review skipped because gitlab diff refs are incomplete"
             );
-            return Ok(AiReviewRunSummary::default());
+            let mut summary = AiReviewRunSummary::default();
+            summary.skipped_reviews = reviews.len();
+            return Ok(summary);
         }
 
         let mut summary = AiReviewRunSummary::default();
@@ -343,14 +354,14 @@ impl ReviewService {
                 .await;
             let coverage = execution.coverage;
             let incomplete_files = execution.incomplete_files;
+            if let Some(coverage) = coverage.as_ref() {
+                summary.apply_coverage(coverage);
+            }
             match execution.result {
                 Ok(findings) => {
                     let review_findings = findings.len();
                     summary.successful_reviews += 1;
                     summary.findings += review_findings;
-                    if review_findings == 0 {
-                        summary.clean_review_ids.push(review.id.clone());
-                    }
                     self.record_findings("ai_review", &review.id, &findings)
                         .await?;
                     let comments = self
@@ -420,9 +431,6 @@ impl ReviewService {
                 }
             }
         }
-        summary.comments += self
-            .publish_ai_review_partial_failure_summary(event, changes, &summary)
-            .await?;
         Ok(summary)
     }
 
@@ -450,49 +458,31 @@ impl ReviewService {
         Ok(())
     }
 
-    async fn publish_ai_review_partial_failure_summary(
+    async fn publish_manual_review_summary(
         &self,
         event: &MergeRequestEvent,
         changes: &crate::gitlab::MergeRequestChanges,
-        summary: &AiReviewRunSummary,
+        ai_summary: &AiReviewRunSummary,
+        script_summary: &ScriptTaskRunSummary,
+        review_request: Option<&str>,
+        elapsed: std::time::Duration,
     ) -> AppResult<usize> {
-        if summary.failed_review_items.is_empty() {
-            return Ok(0);
-        }
+        let body = build_manual_review_summary_body(
+            event,
+            changes,
+            self.review_run_id(),
+            ai_summary,
+            script_summary,
+            review_request,
+            elapsed,
+        );
         let draft = CommentDraft {
             path: String::new(),
             new_line: None,
-            body: build_ai_review_partial_failure_body(
-                &event.commit_sha,
-                self.review_run_id.as_deref().unwrap_or("unknown"),
-                &summary.failed_review_items,
-            ),
+            body,
         };
-        self.publish_comment_drafts(event, changes, &[draft], "ai:partial-failed")
+        self.publish_comment_drafts(event, changes, &[draft], "summary")
             .await
-    }
-
-    async fn publish_manual_ai_review_clean_comments(
-        &self,
-        event: &MergeRequestEvent,
-        changes: &crate::gitlab::MergeRequestChanges,
-        summary: &AiReviewRunSummary,
-    ) -> AppResult<usize> {
-        if summary.failed_reviews > 0 || summary.findings > 0 || summary.comments > 0 {
-            return Ok(0);
-        }
-        let mut published = 0_usize;
-        for review_id in &summary.clean_review_ids {
-            let draft = CommentDraft {
-                path: String::new(),
-                new_line: None,
-                body: build_ai_review_clean_body(review_id),
-            };
-            published += self
-                .publish_comment_drafts(event, changes, &[draft], &format!("ai:{review_id}:clean"))
-                .await?;
-        }
-        Ok(published)
     }
 
     async fn publish_comment_drafts(
@@ -511,27 +501,9 @@ impl ReviewService {
                 new_line = ?draft.new_line,
                 "publishing review comment"
             );
-            let position = draft.new_line.map(|new_line| DiscussionPosition {
-                base_sha: changes
-                    .diff_refs
-                    .base_sha
-                    .clone()
-                    .expect("complete diff refs"),
-                start_sha: changes
-                    .diff_refs
-                    .start_sha
-                    .clone()
-                    .expect("complete diff refs"),
-                head_sha: changes
-                    .diff_refs
-                    .head_sha
-                    .clone()
-                    .expect("complete diff refs"),
-                position_type: "text".into(),
-                old_path: draft.path.clone(),
-                new_path: draft.path.clone(),
-                new_line: Some(new_line),
-            });
+            let position = draft
+                .new_line
+                .map(|new_line| discussion_position(changes, draft, new_line));
             let created = match self
                 .gitlab
                 .create_discussion(
@@ -566,6 +538,16 @@ impl ReviewService {
                 note_id = ?created.notes.first().map(|note| note.id),
                 "review comment published"
             );
+            let is_inline = matches!(
+                created.publish_position,
+                crate::gitlab::PublishPosition::Inline
+            );
+            let record_path = if is_inline { draft.path.as_str() } else { "" };
+            let record_new_line = if is_inline {
+                draft.new_line.map(i64::from)
+            } else {
+                None
+            };
             self.store
                 .record_comment(&StoredComment {
                     review_run_id: self.review_run_id(),
@@ -573,10 +555,11 @@ impl ReviewService {
                     mr_iid: event.mr_iid,
                     commit_sha: &event.commit_sha,
                     rule_id: record_rule_id,
-                    path: &draft.path,
-                    new_line: draft.new_line.map(i64::from),
+                    path: record_path,
+                    new_line: record_new_line,
                     discussion_id: Some(&created.id),
                     note_id: created.notes.first().map(|note| note.id),
+                    publish_position: created.publish_position.as_str(),
                 })
                 .await?;
             if created.notes.is_empty() {
@@ -786,38 +769,149 @@ impl ReviewService {
     }
 }
 
-fn build_ai_review_clean_body(review_id: &str) -> String {
-    format!(
-        "**AI Review 完成**\n\n未发现高置信度问题。\n\n<!-- gitlab-work-runner:rule=ai:{review_id}:clean -->"
-    )
+fn discussion_position(
+    changes: &crate::gitlab::MergeRequestChanges,
+    draft: &CommentDraft,
+    new_line: u32,
+) -> DiscussionPosition {
+    let change = change_for_new_path(&changes.changes, &draft.path);
+    if change.is_none() {
+        warn!(
+            path = %draft.path,
+            new_line,
+            "comment path was not found in merge request changes; using path for both old_path and new_path"
+        );
+    }
+    DiscussionPosition {
+        base_sha: changes
+            .diff_refs
+            .base_sha
+            .clone()
+            .expect("complete diff refs"),
+        start_sha: changes
+            .diff_refs
+            .start_sha
+            .clone()
+            .expect("complete diff refs"),
+        head_sha: changes
+            .diff_refs
+            .head_sha
+            .clone()
+            .expect("complete diff refs"),
+        position_type: "text".into(),
+        old_path: change
+            .map(|change| change.old_path.clone())
+            .unwrap_or_else(|| draft.path.clone()),
+        new_path: change
+            .map(|change| change.new_path.clone())
+            .unwrap_or_else(|| draft.path.clone()),
+        new_line: Some(new_line),
+    }
 }
 
-fn build_ai_review_partial_failure_body(
-    commit_sha: &str,
+fn change_for_new_path<'a>(changes: &'a [GitLabChange], path: &str) -> Option<&'a GitLabChange> {
+    changes.iter().find(|change| change.new_path == path)
+}
+
+fn build_manual_review_summary_body(
+    event: &MergeRequestEvent,
+    changes: &crate::gitlab::MergeRequestChanges,
     review_run_id: &str,
-    failures: &[AiReviewFailureSummary],
+    ai_summary: &AiReviewRunSummary,
+    script_summary: &ScriptTaskRunSummary,
+    review_request: Option<&str>,
+    elapsed: std::time::Duration,
 ) -> String {
-    let failed_reviews = failures
+    let findings = ai_summary.findings + script_summary.findings;
+    let status = if ai_summary.failed_reviews > 0 {
+        "部分失败"
+    } else if ai_summary.skipped_reviews > 0 {
+        "已跳过"
+    } else {
+        "完成"
+    };
+    let result = if ai_summary.skipped_reviews > 0
+        && ai_summary.successful_reviews == 0
+        && script_summary.findings == 0
+    {
+        "AI Review 未执行，GitLab diff refs 不完整".to_string()
+    } else if findings == 0 {
+        "未发现高置信度问题".to_string()
+    } else {
+        format!("发现 {findings} 个问题")
+    };
+    let total_diff_bytes = changes
+        .changes
         .iter()
-        .map(|failure| {
+        .map(|change| change.diff.len())
+        .sum::<usize>();
+    let reviewed_diff_bytes = if ai_summary.reviewed_diff_bytes > 0 {
+        ai_summary.reviewed_diff_bytes
+    } else {
+        total_diff_bytes
+    };
+    let batch_line = ai_summary
+        .planned_batches
+        .map(|planned| {
             format!(
-                "- `{}` {}\n  - 原因: `{}`\n  - 详情: {}",
-                sanitize_comment_inline(&failure.id),
-                sanitize_comment_inline(&failure.title),
-                sanitize_comment_inline(&failure.error_code),
-                sanitize_comment_detail(&failure.error, 500)
+                "{} / {}",
+                ai_summary.completed_batches.unwrap_or(0),
+                planned
             )
         })
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!(
-        "**部分 AI Review 失败**\n\n以下 AI review 执行失败，本次 review 已继续处理其它任务。失败原因如下，完整上下文请查看 runner 日志。\n\n{}\n\ncommit: `{}`\nreview_run_id: `{}`\n\n<!-- gitlab-work-runner:ai-review-partial-failed review_run_id={} commit={} -->",
-        failed_reviews,
-        sanitize_comment_inline(commit_sha),
+        .unwrap_or_else(|| "-".into());
+    let tool_line = ai_summary
+        .max_tool_calls
+        .map(|max| {
+            format!(
+                "{} 单批峰值 / {} 每批上限",
+                ai_summary.tool_calls_used_peak, max
+            )
+        })
+        .unwrap_or_else(|| "-".into());
+    let preference = review_request
+        .map(|value| sanitize_comment_detail(value, 300))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "无".into());
+    let mut body = format!(
+        "## GitLabWorkRunner Review\n\n**状态：** {}\n**Commit：** `{}`\n**结果：** {}\n\n### 检查范围\n\n- 文件：{} / {}\n- Diff：{} / {}\n- 批次：{}\n- 上下文工具：{}\n- 耗时：{} 秒\n\n### 用户偏好\n\n{}\n",
+        status,
+        sanitize_comment_inline(&event.commit_sha),
+        result,
+        changes.changes.len(),
+        changes.changes.len(),
+        format_bytes(reviewed_diff_bytes),
+        format_bytes(total_diff_bytes),
+        batch_line,
+        tool_line,
+        elapsed.as_secs().max(1),
+        preference
+    );
+    if !ai_summary.failed_review_items.is_empty() {
+        let failed_reviews = ai_summary
+            .failed_review_items
+            .iter()
+            .map(|failure| {
+                format!(
+                    "- `{}` {}\n  - 原因: `{}`\n  - 详情: {}",
+                    sanitize_comment_inline(&failure.id),
+                    sanitize_comment_inline(&failure.title),
+                    sanitize_comment_inline(&failure.error_code),
+                    sanitize_comment_detail(&failure.error, 500)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        body.push_str("\n### 失败项\n\n");
+        body.push_str(&failed_reviews);
+        body.push('\n');
+    }
+    body.push_str(&format!(
+        "\n<!-- gitlab-work-runner:summary run={} commit={} -->",
         sanitize_comment_inline(review_run_id),
-        sanitize_comment_inline(review_run_id),
-        sanitize_comment_inline(commit_sha)
-    )
+        sanitize_comment_inline(&event.commit_sha)
+    ));
+    body
 }
 
 fn sanitize_comment_inline(value: &str) -> String {
@@ -835,6 +929,14 @@ fn sanitize_comment_detail(value: &str, max_chars: usize) -> String {
     let mut truncated = sanitized.chars().take(max_chars).collect::<String>();
     truncated.push_str("...");
     truncated
+}
+
+fn format_bytes(bytes: usize) -> String {
+    const KIB: f64 = 1024.0;
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    format!("{:.1} KB", bytes as f64 / KIB)
 }
 
 fn severity_name(severity: &Severity) -> &'static str {
@@ -1114,8 +1216,35 @@ struct AiReviewRunSummary {
     comments: usize,
     successful_reviews: usize,
     failed_reviews: usize,
+    skipped_reviews: usize,
     failed_review_items: Vec<AiReviewFailureSummary>,
-    clean_review_ids: Vec<String>,
+    reviewed_diff_bytes: usize,
+    completed_batches: Option<usize>,
+    planned_batches: Option<usize>,
+    tool_calls_used_peak: usize,
+    max_tool_calls: Option<usize>,
+}
+
+impl AiReviewRunSummary {
+    fn apply_coverage(&mut self, coverage: &ReviewCoverage) {
+        self.reviewed_diff_bytes = self.reviewed_diff_bytes.max(coverage.reviewed_diff_bytes);
+        self.completed_batches = Some(
+            self.completed_batches
+                .unwrap_or_default()
+                .max(coverage.completed_batches),
+        );
+        self.planned_batches = Some(
+            self.planned_batches
+                .unwrap_or_default()
+                .max(coverage.planned_batches),
+        );
+        self.tool_calls_used_peak = self.tool_calls_used_peak.max(coverage.tool_calls_used);
+        self.max_tool_calls = Some(
+            self.max_tool_calls
+                .unwrap_or_default()
+                .max(coverage.max_tool_calls),
+        );
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1198,21 +1327,101 @@ mod tests {
     }
 
     #[test]
-    fn partial_ai_review_failure_comment_includes_failure_details() {
-        let body = build_ai_review_partial_failure_body(
-            "abc123",
-            "rr-1",
-            &[AiReviewFailureSummary {
+    fn manual_review_summary_includes_failure_details() {
+        let event = MergeRequestEvent {
+            project_id: 1,
+            project_name: None,
+            project_path_with_namespace: None,
+            mr_iid: 2,
+            commit_sha: "abc123".into(),
+            action: "manual-note-1".into(),
+            source_branch: String::new(),
+            target_branch: String::new(),
+        };
+        let changes = crate::gitlab::MergeRequestChanges {
+            changes: vec![GitLabChange {
+                old_path: "src/lib.rs".into(),
+                new_path: "src/lib.rs".into(),
+                new_file: false,
+                renamed_file: false,
+                deleted_file: false,
+                diff: "+x\n".into(),
+            }],
+            diff_refs: crate::gitlab::DiffRefs {
+                base_sha: Some("base".into()),
+                start_sha: Some("start".into()),
+                head_sha: Some("head".into()),
+            },
+        };
+        let mut ai_summary = AiReviewRunSummary {
+            failed_reviews: 1,
+            failed_review_items: vec![AiReviewFailureSummary {
                 id: "ai-review".into(),
                 title: "AI Review".into(),
                 error_code: "permission_denied".into(),
                 error: "AI review API returned 401\ninvalid token".into(),
             }],
+            ..AiReviewRunSummary::default()
+        };
+        ai_summary.apply_coverage(&ReviewCoverage {
+            total_files: 1,
+            fully_reviewed_files: 1,
+            partially_reviewed_files: 0,
+            unreviewed_files: 0,
+            total_diff_bytes: 3,
+            reviewed_diff_bytes: 3,
+            required_batches: 1,
+            planned_batches: 1,
+            completed_batches: 1,
+            max_batches: 10,
+            tool_calls_used: 2,
+            max_tool_calls: 30,
+            complete: true,
+        });
+        let body = build_manual_review_summary_body(
+            &event,
+            &changes,
+            "rr-1",
+            &ai_summary,
+            &ScriptTaskRunSummary::default(),
+            Some("重点检查线程安全"),
+            std::time::Duration::from_secs(42),
         );
 
+        assert!(body.contains("**状态：** 部分失败"));
         assert!(body.contains("- `ai-review` AI Review"));
         assert!(body.contains("原因: `permission_denied`"));
         assert!(body.contains("详情: AI review API returned 401 invalid token"));
-        assert!(body.contains("review_run_id: `rr-1`"));
+        assert!(body.contains("重点检查线程安全"));
+        assert!(body.contains("<!-- gitlab-work-runner:summary run=rr-1 commit=abc123 -->"));
+    }
+
+    #[test]
+    fn discussion_position_uses_rename_old_and_new_paths() {
+        let changes = crate::gitlab::MergeRequestChanges {
+            changes: vec![GitLabChange {
+                old_path: "src/old.rs".into(),
+                new_path: "src/new.rs".into(),
+                new_file: false,
+                renamed_file: true,
+                deleted_file: false,
+                diff: "@@ -1 +1 @@\n+let value = 1;\n".into(),
+            }],
+            diff_refs: crate::gitlab::DiffRefs {
+                base_sha: Some("base".into()),
+                start_sha: Some("start".into()),
+                head_sha: Some("head".into()),
+            },
+        };
+        let draft = CommentDraft {
+            path: "src/new.rs".into(),
+            new_line: Some(1),
+            body: "body".into(),
+        };
+
+        let position = discussion_position(&changes, &draft, 1);
+
+        assert_eq!(position.old_path, "src/old.rs");
+        assert_eq!(position.new_path, "src/new.rs");
     }
 }

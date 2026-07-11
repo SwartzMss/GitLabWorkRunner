@@ -99,6 +99,7 @@ pub struct StoredComment<'a> {
     pub new_line: Option<i64>,
     pub discussion_id: Option<&'a str>,
     pub note_id: Option<i64>,
+    pub publish_position: &'a str,
 }
 
 impl StateStore {
@@ -239,11 +240,18 @@ create table if not exists review_comment_records (
     new_line integer,
     discussion_id text,
     note_id integer,
+    publish_position text not null default 'inline',
     created_at text not null
 );
 "#,
         )
         .execute(&self.pool)
+        .await?;
+        self.ensure_column(
+            "review_comment_records",
+            "publish_position",
+            "text not null default 'inline'",
+        )
         .await?;
         sqlx::query(
             r#"
@@ -524,8 +532,8 @@ values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         sqlx::query(
             r#"
 insert into review_comment_records
-(review_run_id, project_id, mr_iid, commit_sha, rule_id, path, new_line, discussion_id, note_id, created_at)
-values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+(review_run_id, project_id, mr_iid, commit_sha, rule_id, path, new_line, discussion_id, note_id, publish_position, created_at)
+values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 "#,
         )
         .bind(comment.review_run_id)
@@ -537,6 +545,7 @@ values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         .bind(comment.new_line)
         .bind(comment.discussion_id)
         .bind(comment.note_id)
+        .bind(comment.publish_position)
         .bind(now)
         .execute(&self.pool)
         .await?;
@@ -550,6 +559,7 @@ values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             new_line = ?comment.new_line,
             discussion_id = ?comment.discussion_id,
             note_id = ?comment.note_id,
+            publish_position = %comment.publish_position,
             "review comment state recorded"
         );
         Ok(())

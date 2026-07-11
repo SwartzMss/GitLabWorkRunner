@@ -217,6 +217,7 @@ mod tests {
                 new_line: Some(7),
                 discussion_id: Some("discussion-1"),
                 note_id: Some(99),
+                publish_position: "inline",
             })
             .await
             .unwrap();
@@ -423,6 +424,7 @@ mod tests {
                 new_line: Some(7),
                 discussion_id: Some("discussion-1"),
                 note_id: Some(99),
+                publish_position: "inline",
             })
             .await
             .unwrap();
