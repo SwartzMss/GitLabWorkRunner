@@ -7,7 +7,7 @@
 extra_instructions = ""
 # Built-in read-only context tools are enabled by default. The runner controls call count
 # and result size.
-max_tool_calls = 30
+max_tool_calls = 0
 max_tool_result_bytes = 60000
 
 [[ai_reviews]]
@@ -16,7 +16,7 @@ title = "AI Review"
 base_url = "https://api.openai.com/v1"
 api_key = "<your-ai-api-key>"
 model = "gpt-4.1-mini"
-timeout_seconds = 1200
+timeout_seconds = 2400
 request_timeout_seconds = 420
 second_pass_on_clean = false
 # AI Review requests Chat Completions tool_calls by default and falls back to JSON content parsing when needed.
