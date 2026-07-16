@@ -796,6 +796,42 @@ impl ReviewService {
         .await
     }
 
+    async fn timeout_fallback_for_execution(
+        &self,
+        review: &AiReviewConfig,
+        changes: &[GitLabChange],
+        review_request: Option<&str>,
+        execution: &AiReviewExecution,
+        context: &mut Option<AiReviewContextWorkDir>,
+        context_started: Instant,
+    ) -> Option<AiReviewExecutionWithMetadata> {
+        let error = execution.result.as_ref().err()?;
+        let reason = timeout_fallback_reason(error)?;
+        drop(context.take());
+        let context_elapsed_ms = elapsed_ms(context_started);
+        let fallback_started = Instant::now();
+        let mut fallback_review = review.clone();
+        fallback_review.second_pass_on_clean = false;
+        let fallback = self
+            .execute_ai_review(
+                &fallback_review,
+                changes,
+                None,
+                review_request,
+                Some(TIMEOUT_DIFF_ONLY_INSTRUCTION),
+            )
+            .await;
+        Some(AiReviewExecutionWithMetadata {
+            execution: fallback,
+            metadata: AiReviewExecutionMetadata {
+                execution_mode: AiReviewExecutionMode::DiffOnlyFallback,
+                fallback_reason: Some(reason),
+                context_elapsed_ms: Some(context_elapsed_ms),
+                fallback_elapsed_ms: Some(elapsed_ms(fallback_started)),
+            },
+        })
+    }
+
     async fn run_ai_review_with_optional_clean_second_pass(
         &self,
         review: &AiReviewConfig,
@@ -809,7 +845,7 @@ impl ReviewService {
             .head_sha
             .as_deref()
             .unwrap_or(&event.commit_sha);
-        let context = match self
+        let mut context = match self
             .prepare_ai_review_context_inner(review, event, archive_sha)
             .await
         {
@@ -872,36 +908,23 @@ impl ReviewService {
                 };
             }
         };
-        let source_dir = context.as_ref().map(|context| context.source_dir.as_path());
-        let execution = self
-            .execute_ai_review(review, &changes.changes, source_dir, review_request, None)
-            .await;
-        if let Err(error) = &execution.result {
-            if let Some(reason) = timeout_fallback_reason(error) {
-                drop(context);
-                let context_elapsed_ms = elapsed_ms(context_started);
-                let fallback_started = Instant::now();
-                let mut fallback_review = review.clone();
-                fallback_review.second_pass_on_clean = false;
-                let fallback = self
-                    .execute_ai_review(
-                        &fallback_review,
-                        &changes.changes,
-                        None,
-                        review_request,
-                        Some(TIMEOUT_DIFF_ONLY_INSTRUCTION),
-                    )
-                    .await;
-                return AiReviewExecutionWithMetadata {
-                    execution: fallback,
-                    metadata: AiReviewExecutionMetadata {
-                        execution_mode: AiReviewExecutionMode::DiffOnlyFallback,
-                        fallback_reason: Some(reason),
-                        context_elapsed_ms: Some(context_elapsed_ms),
-                        fallback_elapsed_ms: Some(elapsed_ms(fallback_started)),
-                    },
-                };
-            }
+        let execution = {
+            let source_dir = context.as_ref().map(|context| context.source_dir.as_path());
+            self.execute_ai_review(review, &changes.changes, source_dir, review_request, None)
+                .await
+        };
+        if let Some(fallback) = self
+            .timeout_fallback_for_execution(
+                review,
+                &changes.changes,
+                review_request,
+                &execution,
+                &mut context,
+                context_started,
+            )
+            .await
+        {
+            return fallback;
         }
         let is_clean = matches!(&execution.result, Ok(findings) if findings.is_empty());
         if !review.second_pass_on_clean || !is_clean {
@@ -920,9 +943,24 @@ impl ReviewService {
             ai_review_id = %review.id,
             "AI review first pass was clean; running second confirmation pass"
         );
-        let execution = self
-            .execute_ai_review(review, &changes.changes, source_dir, review_request, None)
-            .await;
+        let execution = {
+            let source_dir = context.as_ref().map(|context| context.source_dir.as_path());
+            self.execute_ai_review(review, &changes.changes, source_dir, review_request, None)
+                .await
+        };
+        if let Some(fallback) = self
+            .timeout_fallback_for_execution(
+                review,
+                &changes.changes,
+                review_request,
+                &execution,
+                &mut context,
+                context_started,
+            )
+            .await
+        {
+            return fallback;
+        }
         AiReviewExecutionWithMetadata {
             execution,
             metadata: AiReviewExecutionMetadata {
@@ -1418,6 +1456,73 @@ mod tests {
             matches!(result.execution.result, Err(ref error) if timeout_fallback_reason(error) == Some(AiReviewFallbackReason::AiToolLoopTimeout))
         );
         assert_eq!(seam.calls.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn timeout_in_clean_context_confirmation_gets_one_independent_fallback() {
+        for (suffix, fallback_result) in [
+            ("success", scripted_execution(Ok(Vec::new()), 3)),
+            (
+                "timeout",
+                scripted_execution(
+                    Err(AppError::ai_review(
+                        ReviewErrorCode::AiRequestTimeout,
+                        "fallback timeout",
+                    )),
+                    4,
+                ),
+            ),
+        ] {
+            let clean_first = scripted_execution(Ok(Vec::new()), 1);
+            let timed_out_confirmation = scripted_execution(
+                Err(AppError::ai_review(
+                    ReviewErrorCode::AiToolLoopTimeout,
+                    "confirmation timeout",
+                )),
+                2,
+            );
+            let (service, seam, review, event, changes) = scripted_timeout_service(
+                vec![clean_first, timed_out_confirmation, fallback_result],
+                &format!("confirmation-{suffix}"),
+            )
+            .await;
+
+            let result = service
+                .run_ai_review_with_optional_clean_second_pass(&review, &changes, &event, None)
+                .await;
+
+            assert_eq!(
+                result.metadata.fallback_reason,
+                Some(AiReviewFallbackReason::AiToolLoopTimeout)
+            );
+            assert_eq!(
+                result.execution.coverage.as_ref().unwrap().total_files,
+                if suffix == "success" { 3 } else { 4 }
+            );
+            if suffix == "success" {
+                assert!(result.execution.result.is_ok());
+            } else {
+                assert!(matches!(
+                    result.execution.result,
+                    Err(ref error) if timeout_fallback_reason(error)
+                        == Some(AiReviewFallbackReason::AiRequestTimeout)
+                ));
+            }
+            let calls = seam.calls.lock().unwrap();
+            assert_eq!(
+                calls.len(),
+                3,
+                "fallback timeout must not trigger a fourth run"
+            );
+            assert!(calls[0].source_available);
+            assert!(calls[1].source_available);
+            assert!(!calls[2].source_available);
+            assert!(!calls[2].second_pass_on_clean);
+            assert_eq!(
+                calls[2].trusted_runtime_instruction.as_deref(),
+                Some(TIMEOUT_DIFF_ONLY_INSTRUCTION)
+            );
+        }
     }
 
     #[tokio::test]
