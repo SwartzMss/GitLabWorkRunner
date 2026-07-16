@@ -70,8 +70,8 @@ impl AiReviewFallbackReason {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AiReviewExecutionMetadata {
-    pub mode: AiReviewExecutionMode,
-    pub reason: Option<AiReviewFallbackReason>,
+    pub execution_mode: AiReviewExecutionMode,
+    pub fallback_reason: Option<AiReviewFallbackReason>,
     pub context_elapsed_ms: Option<u64>,
     pub fallback_elapsed_ms: Option<u64>,
 }

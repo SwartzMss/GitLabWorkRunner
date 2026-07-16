@@ -491,8 +491,12 @@ where review_run_id = ? and task_type = ? and task_id = ?
         .bind(coverage.tool_calls_used as i64)
         .bind(coverage.max_tool_calls as i64)
         .bind(coverage.complete)
-        .bind(metadata.map(|metadata| metadata.mode.as_str()))
-        .bind(metadata.and_then(|metadata| metadata.reason.map(|reason| reason.as_str())))
+        .bind(metadata.map(|metadata| metadata.execution_mode.as_str()))
+        .bind(metadata.and_then(|metadata| {
+            metadata
+                .fallback_reason
+                .map(|fallback_reason| fallback_reason.as_str())
+        }))
         .bind(metadata.and_then(|metadata| metadata.context_elapsed_ms.map(saturating_u64_to_i64)))
         .bind(metadata.and_then(|metadata| metadata.fallback_elapsed_ms.map(saturating_u64_to_i64)))
         .bind(task.review_run_id)
@@ -801,8 +805,8 @@ mod tests {
             error: None,
         };
         let metadata = AiReviewExecutionMetadata {
-            mode: AiReviewExecutionMode::DiffOnlyFallback,
-            reason: Some(AiReviewFallbackReason::AiToolLoopTimeout),
+            execution_mode: AiReviewExecutionMode::DiffOnlyFallback,
+            fallback_reason: Some(AiReviewFallbackReason::AiToolLoopTimeout),
             context_elapsed_ms: Some(2_400_000),
             fallback_elapsed_ms: Some(386_000),
         };
