@@ -231,7 +231,12 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
 
     function renderTaskCoverage(task) {
       if (task.coverage_total_files == null) {
-        return `<div class="detail-list"><div class="detail-row"><span>覆盖情况</span><span></span></div></div>`;
+        const failure = renderFailure(task.error ? { code: task.error_code, message: task.error } : null);
+        return `<div class="detail-list">
+          <div class="detail-row"><span>任务</span><span>${esc(task.title)}</span></div>
+          <div class="detail-row"><span>状态</span><span>${badge(task.status)}</span></div>
+          <div class="detail-row"><span>问题</span><span>${esc(task.findings ?? 0)}</span></div>
+        </div>${failure}`;
       }
       const batchStats = `${task.coverage_completed_batches ?? 0} 已用 / ${fmtLimit(task.coverage_max_batches)} 上限`;
       const toolCallStats = `${task.tool_calls_used ?? 0} 单批峰值 / ${fmtLimit(task.max_tool_calls)} 每批上限`;
@@ -489,6 +494,29 @@ mod tests {
         assert!(DASHBOARD_HTML.contains("达到批次上限"));
         assert!(DASHBOARD_HTML.contains("单文件 Diff 超过批次限制"));
         assert!(DASHBOARD_HTML.contains("批次执行失败"));
+    }
+
+    #[test]
+    fn run_detail_renders_generic_summary_for_legacy_task_without_coverage() {
+        let legacy_task = serde_json::json!({
+            "title": "Historical Task",
+            "status": "failed",
+            "findings": 3,
+            "error_code": null,
+            "error": "legacy failure",
+            "coverage_total_files": null
+        });
+
+        assert_eq!(legacy_task["coverage_total_files"], serde_json::Value::Null);
+        assert!(DASHBOARD_HTML.contains("${esc(task.title)}"));
+        assert!(DASHBOARD_HTML.contains("${badge(task.status)}"));
+        assert!(DASHBOARD_HTML.contains("${esc(task.findings ?? 0)}"));
+        assert!(DASHBOARD_HTML.contains(
+            "renderFailure(task.error ? { code: task.error_code, message: task.error } : null)"
+        ));
+        assert!(!DASHBOARD_HTML.contains(
+            r#"return `<div class="detail-list"><div class="detail-row"><span>覆盖情况</span><span></span></div></div>`;"#
+        ));
     }
 
     #[test]
