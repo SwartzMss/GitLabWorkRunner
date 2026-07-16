@@ -116,15 +116,15 @@ AI reviews are configured with `[[ai_reviews]]` in `rules.toml`.
 
 The runner sends MR diff content to an OpenAI-compatible `POST /chat/completions` endpoint. It requests structured `tool_calls` output through `submit_review_findings` and falls back to parsing JSON from assistant content when needed.
 
-Optional read-only context tools can be enabled under `[ai_review.context_tools]`:
+The runner provides these built-in read-only context tools by default whenever archive context preparation succeeds:
 
 - `read_file(path)`
 - `search_code(query, glob?)`
 - `list_files(glob?)`
 
-When these tools are enabled, the service downloads the MR head archive and exposes only repository-local text content. It does not execute shell commands and rejects or skips unsafe paths such as `.env`, `.git`, absolute paths, and `..` traversal.
+The service downloads the MR head archive and exposes only repository-local text content through these tools. It does not execute shell commands and rejects or skips unsafe paths such as `.env`, `.git`, absolute paths, and `..` traversal.
 
-If any configured `[archive]` download or extraction limit is exceeded, the service logs a warning and runs the AI Review with diff only. Context tools are unavailable in that fallback, and no archive-limit failure notification is posted. A normal archive still enables all configured context tools. A clean optional second pass reuses the same prepared context or diff-only fallback. Archive timeout, permission, HTTP, corrupt-ZIP, and filesystem errors remain fatal.
+If any configured `[archive]` download or extraction limit is exceeded, the service logs a warning and runs the AI Review with diff only. The built-in context tools are unavailable in that fallback, and no archive-limit failure notification is posted. A normal archive still enables all three context tools. A clean optional second pass reuses the same prepared context or diff-only fallback. Archive timeout, permission, HTTP, corrupt-ZIP, and filesystem errors remain fatal.
 
 ## Comment Builder
 

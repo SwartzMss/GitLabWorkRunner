@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- 移除脚本任务；配置中的 `[[script_tasks]]` 现在会被拒绝。
+- 移除脚本任务；配置中的 `[[script_tasks]]` 现在会被严格解析拒绝，升级时必须删除这些配置块。
 - AI archive 下载或解压触发任一安全限制时记录 WARN，并以仅 MR diff 的模式继续 Review；此时不提供上下文工具，也不发送 `archive_limit_exceeded` 失败通知。
 - archive 超时、权限、HTTP、损坏 ZIP、文件系统等非限制错误仍会使 Review 失败。
 

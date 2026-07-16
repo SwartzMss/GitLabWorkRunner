@@ -221,7 +221,7 @@ dashboard 进程不会执行 migration。如果数据库或统计表不存在，
 
 ## AI Review 配置
 
-当前只支持在 MR 评论里手动触发 review，不再支持 MR 更新后自动筛选执行。`rules.toml` 里需要保留 `[ai_review]` 和 `[[ai_reviews]]`；已经移除的旧配置块会被拒绝。
+当前只支持在 MR 评论里手动触发 review，不再支持 MR 更新后自动筛选执行。`rules.toml` 里需要保留 `[ai_review]` 和 `[[ai_reviews]]`。升级时请删除所有 `[[script_tasks]]` 配置块；配置解析是严格模式，保留这些块会导致配置被拒绝。
 
 推荐 `rules.toml` 示例：
 

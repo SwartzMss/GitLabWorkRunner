@@ -221,7 +221,7 @@ The dashboard process does not run migrations. If the database or statistics tab
 
 ## AI Review Config
 
-Only manual MR comment-triggered reviews are currently supported. MR update events are accepted and ignored instead of entering the review queue. Keep `[ai_review]` and `[[ai_reviews]]` in `rules.toml`; removed legacy configuration blocks are rejected.
+Only manual MR comment-triggered reviews are currently supported. MR update events are accepted and ignored instead of entering the review queue. Keep `[ai_review]` and `[[ai_reviews]]` in `rules.toml`. When upgrading, remove every `[[script_tasks]]` block: configuration parsing is strict, so leaving these blocks in place causes the configuration to be rejected.
 
 Recommended `rules.toml` example:
 
