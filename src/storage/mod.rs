@@ -300,7 +300,7 @@ insert into review_requests
 (review_run_id, trigger_type, project_id, project_name, project_path_with_namespace,
  mr_iid, commit_sha, note_id, requested_ids_json,
  selected_ai_reviews, selected_script_tasks, status, findings, comments, timezone, started_at)
-values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', 0, 0, ?, ?)
+values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'running', 0, 0, ?, ?)
 on conflict(review_run_id) do update set
     status = 'running',
     project_name = excluded.project_name,
@@ -320,7 +320,6 @@ on conflict(review_run_id) do update set
         .bind(request.note_id)
         .bind(request.requested_ids_json)
         .bind(request.selected_ai_reviews as i64)
-        .bind(0_i64)
         .bind(REVIEW_TIMEZONE)
         .bind(&now)
         .execute(&self.pool)
