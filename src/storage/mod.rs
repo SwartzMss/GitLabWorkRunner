@@ -1,4 +1,5 @@
 use crate::error::{AppResult, ReviewFailure};
+use crate::review::ai::AiReviewExecutionMetadata;
 use chrono::Utc;
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
@@ -159,6 +160,10 @@ create table if not exists review_task_runs (
     findings integer not null default 0,
     comments integer not null default 0,
     error text,
+    execution_mode text,
+    fallback_reason text,
+    context_elapsed_ms integer,
+    fallback_elapsed_ms integer,
     started_at text not null,
     finished_at text,
     unique(review_run_id, task_type, task_id)
@@ -168,6 +173,14 @@ create table if not exists review_task_runs (
         .execute(&self.pool)
         .await?;
         self.ensure_column("review_task_runs", "error_code", "text")
+            .await?;
+        self.ensure_column("review_task_runs", "execution_mode", "text")
+            .await?;
+        self.ensure_column("review_task_runs", "fallback_reason", "text")
+            .await?;
+        self.ensure_column("review_task_runs", "context_elapsed_ms", "integer")
+            .await?;
+        self.ensure_column("review_task_runs", "fallback_elapsed_ms", "integer")
             .await?;
         for column in [
             "coverage_total_files",
@@ -432,6 +445,17 @@ where review_run_id = ? and task_type = ? and task_id = ?
         coverage: &StoredReviewCoverage,
         files: &[StoredReviewCoverageFile<'_>],
     ) -> AppResult<()> {
+        self.finish_task_run_with_coverage_and_metadata(task, coverage, files, None)
+            .await
+    }
+
+    pub async fn finish_task_run_with_coverage_and_metadata(
+        &self,
+        task: &TaskRunFinish<'_>,
+        coverage: &StoredReviewCoverage,
+        files: &[StoredReviewCoverageFile<'_>],
+        metadata: Option<&AiReviewExecutionMetadata>,
+    ) -> AppResult<()> {
         let now = now_rfc3339();
         let mut tx = self.pool.begin().await?;
         sqlx::query(
@@ -443,7 +467,8 @@ update review_task_runs set
     coverage_total_diff_bytes = ?, coverage_reviewed_diff_bytes = ?,
     coverage_required_batches = ?, coverage_planned_batches = ?,
     coverage_completed_batches = ?, coverage_max_batches = ?,
-    tool_calls_used = ?, max_tool_calls = ?, coverage_complete = ?
+    tool_calls_used = ?, max_tool_calls = ?, coverage_complete = ?,
+    execution_mode = ?, fallback_reason = ?, context_elapsed_ms = ?, fallback_elapsed_ms = ?
 where review_run_id = ? and task_type = ? and task_id = ?
 "#,
         )
@@ -466,6 +491,10 @@ where review_run_id = ? and task_type = ? and task_id = ?
         .bind(coverage.tool_calls_used as i64)
         .bind(coverage.max_tool_calls as i64)
         .bind(coverage.complete)
+        .bind(metadata.map(|metadata| metadata.mode.as_str()))
+        .bind(metadata.and_then(|metadata| metadata.reason.map(|reason| reason.as_str())))
+        .bind(metadata.and_then(|metadata| metadata.context_elapsed_ms.map(saturating_u64_to_i64)))
+        .bind(metadata.and_then(|metadata| metadata.fallback_elapsed_ms.map(saturating_u64_to_i64)))
         .bind(task.review_run_id)
         .bind(task.task_type)
         .bind(task.task_id)
@@ -568,9 +597,16 @@ fn now_rfc3339() -> String {
     Utc::now().to_rfc3339()
 }
 
+fn saturating_u64_to_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::review::ai::{
+        AiReviewExecutionMetadata, AiReviewExecutionMode, AiReviewFallbackReason,
+    };
 
     #[tokio::test]
     async fn records_review_requests() {
@@ -724,5 +760,113 @@ mod tests {
         assert_eq!(task_row.get::<i64, _>("coverage_max_batches"), 4);
         assert_eq!(task_row.get::<i64, _>("tool_calls_used"), 5);
         assert_eq!(task_row.get::<i64, _>("max_tool_calls"), 8);
+    }
+
+    #[tokio::test]
+    async fn records_ai_execution_metadata_with_task_coverage() {
+        let store = StateStore::connect("sqlite::memory:").await.unwrap();
+        store.migrate().await.unwrap();
+        store
+            .start_task_run(&TaskRunStart {
+                review_run_id: "rr-metadata",
+                task_type: "ai_review",
+                task_id: "ai-review",
+                title: "AI Review",
+            })
+            .await
+            .unwrap();
+        let coverage = StoredReviewCoverage {
+            total_files: 1,
+            fully_reviewed_files: 1,
+            partially_reviewed_files: 0,
+            unreviewed_files: 0,
+            total_diff_bytes: 10,
+            reviewed_diff_bytes: 10,
+            required_batches: 1,
+            planned_batches: 1,
+            completed_batches: 1,
+            max_batches: 1,
+            tool_calls_used: 2,
+            max_tool_calls: 4,
+            complete: true,
+        };
+        let finish = TaskRunFinish {
+            review_run_id: "rr-metadata",
+            task_type: "ai_review",
+            task_id: "ai-review",
+            status: "completed",
+            findings: 0,
+            comments: 0,
+            error_code: None,
+            error: None,
+        };
+        let metadata = AiReviewExecutionMetadata {
+            mode: AiReviewExecutionMode::DiffOnlyFallback,
+            reason: Some(AiReviewFallbackReason::AiToolLoopTimeout),
+            context_elapsed_ms: Some(2_400_000),
+            fallback_elapsed_ms: Some(386_000),
+        };
+
+        store
+            .finish_task_run_with_coverage_and_metadata(&finish, &coverage, &[], Some(&metadata))
+            .await
+            .unwrap();
+
+        let row = sqlx::query(
+            "select execution_mode, fallback_reason, context_elapsed_ms, fallback_elapsed_ms from review_task_runs where review_run_id = ?",
+        )
+        .bind("rr-metadata")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<String, _>("execution_mode"), "diff_only_fallback");
+        assert_eq!(
+            row.get::<String, _>("fallback_reason"),
+            "ai_tool_loop_timeout"
+        );
+        assert_eq!(row.get::<i64, _>("context_elapsed_ms"), 2_400_000);
+        assert_eq!(row.get::<i64, _>("fallback_elapsed_ms"), 386_000);
+    }
+
+    #[tokio::test]
+    async fn migration_keeps_existing_rows_metadata_null_and_is_idempotent() {
+        let store = StateStore::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            r#"create table review_task_runs (
+                id integer primary key autoincrement,
+                review_run_id text not null,
+                task_type text not null,
+                task_id text not null,
+                title text not null,
+                status text not null,
+                findings integer not null default 0,
+                comments integer not null default 0,
+                error text,
+                started_at text not null,
+                finished_at text,
+                unique(review_run_id, task_type, task_id)
+            )"#,
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        sqlx::query("insert into review_task_runs (review_run_id, task_type, task_id, title, status, started_at) values ('legacy', 'ai_review', 'ai-review', 'AI Review', 'completed', 'now')")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        store.migrate().await.unwrap();
+        store.migrate().await.unwrap();
+
+        let row = sqlx::query(
+            "select execution_mode, fallback_reason, context_elapsed_ms, fallback_elapsed_ms from review_task_runs where review_run_id = 'legacy'",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert!(row.get::<Option<String>, _>("execution_mode").is_none());
+        assert!(row.get::<Option<String>, _>("fallback_reason").is_none());
+        assert!(row.get::<Option<i64>, _>("context_elapsed_ms").is_none());
+        assert!(row.get::<Option<i64>, _>("fallback_elapsed_ms").is_none());
     }
 }

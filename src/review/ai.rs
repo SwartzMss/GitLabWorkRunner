@@ -34,6 +34,48 @@ const AI_RESPONSE_PREVIEW_CHARS: usize = 1000;
 const AI_HTTP_ATTEMPTS: usize = 2;
 const TOOL_ARGUMENT_SUMMARY_CHARS: usize = 160;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AiReviewExecutionMode {
+    Context,
+    DiffOnlyFallback,
+}
+
+impl AiReviewExecutionMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Context => "context",
+            Self::DiffOnlyFallback => "diff_only_fallback",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AiReviewFallbackReason {
+    ArchiveLimitExceeded,
+    ReviewRunTimeout,
+    AiRequestTimeout,
+    AiToolLoopTimeout,
+}
+
+impl AiReviewFallbackReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ArchiveLimitExceeded => "archive_limit_exceeded",
+            Self::ReviewRunTimeout => "review_run_timeout",
+            Self::AiRequestTimeout => "ai_request_timeout",
+            Self::AiToolLoopTimeout => "ai_tool_loop_timeout",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AiReviewExecutionMetadata {
+    pub mode: AiReviewExecutionMode,
+    pub reason: Option<AiReviewFallbackReason>,
+    pub context_elapsed_ms: Option<u64>,
+    pub fallback_elapsed_ms: Option<u64>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReviewCoverage {
     pub total_files: usize,
