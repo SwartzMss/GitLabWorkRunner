@@ -185,7 +185,12 @@ async fn run_ai_review_single(
         );
         for attempt in 1..=AI_HTTP_ATTEMPTS {
             let mut messages = initial_chat_messages(config, &prompt);
-            let request_body = serialize_review_request_body(config, &messages, use_tool_calls)?;
+            let request_body = serialize_review_request_body(
+                config,
+                &messages,
+                use_tool_calls,
+                tool_context.source_available(),
+            )?;
             let attempt_started = Instant::now();
             let request_body_bytes = request_body.len();
             info!(
@@ -535,9 +540,14 @@ fn serialize_review_request_body(
     config: &AiReviewConfig,
     messages: &[ChatMessage],
     use_tool_calls: bool,
+    context_tools_enabled: bool,
 ) -> AppResult<Vec<u8>> {
     let (response_format, tools, tool_choice) = if use_tool_calls {
-        let mut tools = enabled_context_tools(config);
+        let mut tools = if context_tools_enabled {
+            enabled_context_tools(config)
+        } else {
+            Vec::new()
+        };
         tools.push(review_findings_tool());
         (None, Some(tools), None)
     } else {
@@ -777,7 +787,8 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
             });
         }
 
-        let request_body = serialize_review_request_body(config, messages, true)?;
+        let request_body =
+            serialize_review_request_body(config, messages, true, tool_context.source_available())?;
         let mut last_error = None;
         let mut response = None;
         for followup_attempt in 1..=AI_HTTP_ATTEMPTS {
@@ -1656,7 +1667,7 @@ mod tests {
 
         let (prompt, _, _) = build_review_prompt(&config, &changes, None);
         let messages = initial_chat_messages(&config, &prompt);
-        let body = serialize_review_request_body(&config, &messages, true).unwrap();
+        let body = serialize_review_request_body(&config, &messages, true, true).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
 
         assert!(!prompt.contains("Focus on C++ lifetime bugs."));
@@ -1732,7 +1743,7 @@ mod tests {
 
         let (prompt, _, _) = build_review_prompt(&config, &changes, None);
         let messages = initial_chat_messages(&config, &prompt);
-        let body = serialize_review_request_body(&config, &messages, true).unwrap();
+        let body = serialize_review_request_body(&config, &messages, true, true).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(json["model"], "test-model");
@@ -1748,7 +1759,7 @@ mod tests {
     fn serializes_enabled_context_tools() {
         let config = test_ai_review_config();
         let messages = initial_chat_messages(&config, "prompt");
-        let body = serialize_review_request_body(&config, &messages, true).unwrap();
+        let body = serialize_review_request_body(&config, &messages, true, true).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         let names: Vec<_> = json["tools"]
             .as_array()
@@ -1766,6 +1777,22 @@ mod tests {
                 "submit_review_findings"
             ]
         );
+    }
+
+    #[test]
+    fn omits_context_tools_when_source_is_unavailable() {
+        let config = test_ai_review_config();
+        let messages = initial_chat_messages(&config, "prompt");
+        let body = serialize_review_request_body(&config, &messages, true, false).unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let names: Vec<_> = json["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect();
+
+        assert_eq!(names, vec!["submit_review_findings"]);
     }
 
     #[test]
@@ -1835,7 +1862,7 @@ mod tests {
     fn serializes_json_content_fallback_review_request_body() {
         let config = test_ai_review_config();
         let messages = initial_chat_messages(&config, "prompt");
-        let body = serialize_review_request_body(&config, &messages, false).unwrap();
+        let body = serialize_review_request_body(&config, &messages, false, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(json["response_format"]["type"], "json_object");

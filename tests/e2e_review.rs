@@ -11,7 +11,7 @@ use gitlab_work_runner::{
     dashboard::queries::DashboardStore,
     gitlab::GitLabChange,
     gitlab::GitLabClient,
-    review::ReviewService,
+    review::{ArchiveLimits, ReviewService},
     rules::{AiReviewConfig, Ruleset},
     storage::StateStore,
     webhook::MergeRequestNoteEvent,
@@ -1591,6 +1591,184 @@ model = "test-model"
     assert_eq!(discussion_count.load(Ordering::SeqCst), 1);
     assert_eq!(summary.findings, 1);
     assert_eq!(summary.comments, 1);
+}
+
+#[tokio::test]
+async fn archive_limit_falls_back_to_diff_only_ai_review_without_retrying_second_pass() {
+    let archive_request_count = Arc::new(AtomicUsize::new(0));
+    let archive_request_count_for_handler = Arc::clone(&archive_request_count);
+    let ai_request_count = Arc::new(AtomicUsize::new(0));
+    let ai_request_count_for_handler = Arc::clone(&ai_request_count);
+    let (listener, addr) = bind_test_listener().await;
+    let app = Router::new()
+        .route(
+            "/api/v4/projects/123/merge_requests/45/changes",
+            get(|| async {
+                Json(json!({
+                    "changes": [{
+                        "old_path": "src/lib.rs",
+                        "new_path": "src/lib.rs",
+                        "new_file": false,
+                        "renamed_file": false,
+                        "deleted_file": false,
+                        "diff": "@@ -1 +1 @@\n+pub fn value() {}\n"
+                    }],
+                    "diff_refs": {
+                        "base_sha": "base",
+                        "start_sha": "start",
+                        "head_sha": "oversized-head"
+                    }
+                }))
+            }),
+        )
+        .route(
+            "/api/v4/projects/123/repository/archive.zip",
+            get(move || {
+                let archive_request_count = Arc::clone(&archive_request_count_for_handler);
+                async move {
+                    archive_request_count.fetch_add(1, Ordering::SeqCst);
+                    test_archive()
+                }
+            }),
+        )
+        .route(
+            "/chat/completions",
+            post(move |body: Bytes| {
+                let ai_request_count = Arc::clone(&ai_request_count_for_handler);
+                async move {
+                    ai_request_count.fetch_add(1, Ordering::SeqCst);
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    let tool_names: Vec<_> = body["tools"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|tool| tool["function"]["name"].as_str().unwrap())
+                        .collect();
+                    assert_eq!(tool_names, vec!["submit_review_findings"]);
+                    assert!(body["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|message| message["role"] != "tool"));
+                    Json(json!({
+                        "choices": [{
+                            "message": {
+                                "content": "",
+                                "tool_calls": [{
+                                    "id": "call-submit",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "submit_review_findings",
+                                        "arguments": "{\"findings\":[]}"
+                                    }
+                                }]
+                            }
+                        }]
+                    }))
+                }
+            }),
+        );
+    spawn_server_on(listener, app);
+    let base_url = format!("http://{}", addr);
+    let ruleset = Ruleset::from_toml(&format!(
+        r#"
+[[ai_reviews]]
+id = "ai-review"
+title = "AI Review"
+base_url = "{}"
+api_key = "test-api-key"
+model = "test-model"
+second_pass_on_clean = true
+"#,
+        base_url
+    ))
+    .unwrap();
+    let store = StateStore::connect("sqlite::memory:").await.unwrap();
+    store.migrate().await.unwrap();
+    let mut archive_limits = ArchiveLimits::default();
+    archive_limits.max_archive_bytes = 1;
+    let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset)
+        .with_archive_limits(archive_limits);
+
+    let summary = service
+        .review_merge_request_note(&manual_note_event("@ai-review"))
+        .await
+        .unwrap();
+
+    assert_eq!(archive_request_count.load(Ordering::SeqCst), 1);
+    assert_eq!(ai_request_count.load(Ordering::SeqCst), 2);
+    assert_eq!(summary.findings, 0);
+    assert_eq!(summary.comments, 0);
+}
+
+#[tokio::test]
+async fn non_limit_archive_failure_still_fails_before_ai_review() {
+    let ai_request_count = Arc::new(AtomicUsize::new(0));
+    let ai_request_count_for_handler = Arc::clone(&ai_request_count);
+    let (listener, addr) = bind_test_listener().await;
+    let app = Router::new()
+        .route(
+            "/api/v4/projects/123/merge_requests/45/changes",
+            get(|| async {
+                Json(json!({
+                    "changes": [{
+                        "old_path": "src/lib.rs",
+                        "new_path": "src/lib.rs",
+                        "new_file": false,
+                        "renamed_file": false,
+                        "deleted_file": false,
+                        "diff": "@@ -1 +1 @@\n+pub fn value() {}\n"
+                    }],
+                    "diff_refs": {
+                        "base_sha": "base",
+                        "start_sha": "start",
+                        "head_sha": "failed-head"
+                    }
+                }))
+            }),
+        )
+        .route(
+            "/api/v4/projects/123/repository/archive.zip",
+            get(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "archive unavailable") }),
+        )
+        .route(
+            "/chat/completions",
+            post(move || {
+                let ai_request_count = Arc::clone(&ai_request_count_for_handler);
+                async move {
+                    ai_request_count.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({}))
+                }
+            }),
+        );
+    spawn_server_on(listener, app);
+    let base_url = format!("http://{}", addr);
+    let ruleset = Ruleset::from_toml(&format!(
+        r#"
+[[ai_reviews]]
+id = "ai-review"
+title = "AI Review"
+base_url = "{}"
+api_key = "test-api-key"
+model = "test-model"
+"#,
+        base_url
+    ))
+    .unwrap();
+    let store = StateStore::connect("sqlite::memory:").await.unwrap();
+    store.migrate().await.unwrap();
+    let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset);
+
+    let error = service
+        .review_merge_request_note(&manual_note_event("@ai-review"))
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.review_failure().map(|failure| failure.code),
+        Some(gitlab_work_runner::error::ReviewErrorCode::ArchiveDownloadFailed)
+    );
+    assert_eq!(ai_request_count.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

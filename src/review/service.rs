@@ -5,7 +5,7 @@ use crate::{
     comments::{build_comment_drafts, CommentDraft},
     error::{AppError, AppResult, ReviewErrorCode, ReviewFailure},
     gitlab::{CreateDiscussionRequest, DiscussionPosition, GitLabChange, GitLabClient},
-    review::archive::{extract_zip_archive, ArchiveLimits},
+    review::archive::extract_zip_archive,
     rules::{AiReviewConfig, Finding, Ruleset, Severity},
     script_tasks::{ScriptTaskContext, ScriptTaskResult, ScriptTaskRunner, ScriptTaskStatus},
     storage::{
@@ -21,6 +21,8 @@ use std::{
     time::Instant,
 };
 use tracing::{info, warn};
+
+pub use crate::review::archive::ArchiveLimits;
 
 pub struct ReviewService {
     gitlab: GitLabClient,
@@ -978,6 +980,38 @@ impl ReviewService {
             .head_sha
             .as_deref()
             .unwrap_or(&event.commit_sha);
+        match self
+            .prepare_ai_review_context_inner(review, event, archive_sha)
+            .await
+        {
+            Ok(context) => Ok(Some(context)),
+            Err(err) if is_archive_limit_error(&err) => {
+                let error_code = err
+                    .review_failure()
+                    .expect("archive limit errors have a structured review failure")
+                    .code
+                    .as_str();
+                warn!(
+                    project_id = event.project_id,
+                    mr_iid = event.mr_iid,
+                    commit_sha = archive_sha,
+                    ai_review_id = %review.id,
+                    error_code,
+                    error = %err,
+                    "AI review context archive exceeded limits; continuing with diff-only review"
+                );
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn prepare_ai_review_context_inner(
+        &self,
+        review: &AiReviewConfig,
+        event: &MergeRequestEvent,
+        archive_sha: &str,
+    ) -> AppResult<AiReviewContextWorkDir> {
         let archive = self
             .gitlab
             .repository_archive(
@@ -1009,10 +1043,10 @@ impl ReviewService {
             source_dir = %source_dir.display(),
             "AI review context archive extracted"
         );
-        Ok(Some(AiReviewContextWorkDir {
+        Ok(AiReviewContextWorkDir {
             work_dir,
             source_dir,
-        }))
+        })
     }
 }
 
@@ -1229,9 +1263,43 @@ fn failure_for_error(error: &AppError, fallback: ReviewErrorCode) -> ReviewFailu
         .unwrap_or_else(|| ReviewFailure::new(fallback, error.to_string()))
 }
 
+fn is_archive_limit_error(error: &AppError) -> bool {
+    matches!(
+        error.review_failure(),
+        Some(failure) if failure.code == ReviewErrorCode::ArchiveLimitExceeded
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archive_limit_error_is_eligible_for_diff_only_fallback() {
+        let error = AppError::archive(
+            ReviewErrorCode::ArchiveLimitExceeded,
+            "rendered text is intentionally irrelevant",
+        );
+
+        assert!(is_archive_limit_error(&error));
+    }
+
+    #[test]
+    fn archive_timeout_is_not_eligible_for_diff_only_fallback() {
+        let error = AppError::archive(
+            ReviewErrorCode::ArchiveDownloadTimeout,
+            "archive_limit_exceeded appears only in rendered text",
+        );
+
+        assert!(!is_archive_limit_error(&error));
+    }
+
+    #[test]
+    fn non_review_error_is_not_eligible_for_diff_only_fallback() {
+        let error = AppError::Storage("archive_limit_exceeded".into());
+
+        assert!(!is_archive_limit_error(&error));
+    }
 
     #[test]
     fn parses_manual_script_task_ids() {
