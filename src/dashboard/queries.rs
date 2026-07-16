@@ -121,6 +121,9 @@ pub struct DashboardTaskRun {
     pub fallback_reason: Option<String>,
     pub context_elapsed_ms: Option<i64>,
     pub fallback_elapsed_ms: Option<i64>,
+    pub context_elapsed_display: Option<String>,
+    pub fallback_elapsed_display: Option<String>,
+    pub ai_total_elapsed_display: Option<String>,
     pub coverage_total_files: Option<i64>,
     pub coverage_fully_reviewed_files: Option<i64>,
     pub coverage_partially_reviewed_files: Option<i64>,
@@ -657,6 +660,10 @@ from review_coverage_files where review_run_id = ? and task_type = ? and task_id
                     reviewed_diff_bytes: file.get("reviewed_diff_bytes"),
                 })
                 .collect();
+            let context_elapsed_ms = row.get("context_elapsed_ms");
+            let fallback_elapsed_ms = row.get("fallback_elapsed_ms");
+            let (context_elapsed_display, fallback_elapsed_display, ai_total_elapsed_display) =
+                ai_duration_displays(context_elapsed_ms, fallback_elapsed_ms);
             tasks.push(DashboardTaskRun {
                 task_type,
                 task_id,
@@ -670,8 +677,11 @@ from review_coverage_files where review_run_id = ? and task_type = ? and task_id
                 finished_at: row.get("finished_at"),
                 execution_mode: row.get("execution_mode"),
                 fallback_reason: row.get("fallback_reason"),
-                context_elapsed_ms: row.get("context_elapsed_ms"),
-                fallback_elapsed_ms: row.get("fallback_elapsed_ms"),
+                context_elapsed_ms,
+                fallback_elapsed_ms,
+                context_elapsed_display,
+                fallback_elapsed_display,
+                ai_total_elapsed_display,
                 coverage_total_files: row.get("coverage_total_files"),
                 coverage_fully_reviewed_files: row.get("coverage_fully_reviewed_files"),
                 coverage_partially_reviewed_files: row.get("coverage_partially_reviewed_files"),
@@ -738,6 +748,41 @@ limit 500
 }
 
 const ERROR_PREVIEW_MAX_BYTES: usize = 4 * 1024;
+
+fn ai_duration_displays(
+    context_elapsed_ms: Option<i64>,
+    fallback_elapsed_ms: Option<i64>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let context = context_elapsed_ms.map(format_ai_duration_ms);
+    let fallback = fallback_elapsed_ms.map(format_ai_duration_ms);
+    let total = match (context_elapsed_ms, fallback_elapsed_ms) {
+        (None, None) => None,
+        (context, fallback) => Some(format_ai_duration_ms(
+            context
+                .unwrap_or(0)
+                .max(0)
+                .saturating_add(fallback.unwrap_or(0).max(0)),
+        )),
+    };
+    (context, fallback, total)
+}
+
+fn format_ai_duration_ms(milliseconds: i64) -> String {
+    let seconds = milliseconds.max(0) / 1_000;
+    let minutes = seconds / 60;
+    if seconds < 60 {
+        return format!("{seconds:02} 秒");
+    }
+    if minutes < 60 {
+        return format!("{minutes} 分 {:02} 秒", seconds % 60);
+    }
+    format!(
+        "{} 小时 {:02} 分 {:02} 秒",
+        minutes / 60,
+        minutes % 60,
+        seconds % 60
+    )
+}
 
 fn dashboard_failure(code: Option<String>, message: Option<String>) -> Option<DashboardFailure> {
     if code.is_none() && message.is_none() {
@@ -957,6 +1002,9 @@ values ('legacy-run', 'script_task', 'legacy-script', 'Legacy Script', 'complete
         assert_eq!(detail.tasks[0].fallback_reason, None);
         assert_eq!(detail.tasks[0].context_elapsed_ms, None);
         assert_eq!(detail.tasks[0].fallback_elapsed_ms, None);
+        assert_eq!(detail.tasks[0].context_elapsed_display, None);
+        assert_eq!(detail.tasks[0].fallback_elapsed_display, None);
+        assert_eq!(detail.tasks[0].ai_total_elapsed_display, None);
     }
 
     #[tokio::test]
@@ -994,6 +1042,18 @@ values ('legacy-run', 'script_task', 'legacy-script', 'Legacy Script', 'complete
         assert_eq!(detail.tasks[0].context_elapsed_ms, Some(2_400_000));
         assert_eq!(detail.tasks[0].fallback_elapsed_ms, Some(386_000));
         assert_eq!(
+            detail.tasks[0].context_elapsed_display.as_deref(),
+            Some("40 分 00 秒")
+        );
+        assert_eq!(
+            detail.tasks[0].fallback_elapsed_display.as_deref(),
+            Some("6 分 26 秒")
+        );
+        assert_eq!(
+            detail.tasks[0].ai_total_elapsed_display.as_deref(),
+            Some("46 分 26 秒")
+        );
+        assert_eq!(
             detail.tasks[1].execution_mode.as_deref(),
             Some("<future-mode>")
         );
@@ -1017,6 +1077,46 @@ values ('legacy-run', 'script_task', 'legacy-script', 'Legacy Script', 'complete
 
         assert_eq!(failure.code, None);
         assert_eq!(failure.message, "legacy failure");
+    }
+
+    #[test]
+    fn ai_duration_display_uses_integer_arithmetic_and_saturating_total() {
+        assert_eq!(format_ai_duration_ms(-1), "00 秒");
+        assert_eq!(format_ai_duration_ms(2_400_000), "40 分 00 秒");
+        assert_eq!(format_ai_duration_ms(386_000), "6 分 26 秒");
+        assert_eq!(format_ai_duration_ms(3_723_000), "1 小时 02 分 03 秒");
+        assert_eq!(
+            format_ai_duration_ms(i64::MAX),
+            "2562047788015 小时 12 分 55 秒"
+        );
+
+        let (context, fallback, total) = ai_duration_displays(Some(2_400_000), Some(386_000));
+        assert_eq!(context.as_deref(), Some("40 分 00 秒"));
+        assert_eq!(fallback.as_deref(), Some("6 分 26 秒"));
+        assert_eq!(total.as_deref(), Some("46 分 26 秒"));
+        assert_eq!(ai_duration_displays(None, None), (None, None, None));
+        assert_eq!(
+            ai_duration_displays(Some(-1), Some(386_000)),
+            (
+                Some("00 秒".into()),
+                Some("6 分 26 秒".into()),
+                Some("6 分 26 秒".into())
+            )
+        );
+        assert_eq!(
+            ai_duration_displays(Some(3_723_000), None),
+            (
+                Some("1 小时 02 分 03 秒".into()),
+                None,
+                Some("1 小时 02 分 03 秒".into())
+            )
+        );
+        assert_eq!(
+            ai_duration_displays(Some(i64::MAX), Some(i64::MAX))
+                .2
+                .as_deref(),
+            Some("2562047788015 小时 12 分 55 秒")
+        );
     }
 
     #[tokio::test]

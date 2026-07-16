@@ -379,6 +379,18 @@ mod tests {
         );
         assert_eq!(detail_json["tasks"][0]["context_elapsed_ms"], 2_400_000);
         assert_eq!(detail_json["tasks"][0]["fallback_elapsed_ms"], 386_000);
+        assert_eq!(
+            detail_json["tasks"][0]["context_elapsed_display"],
+            "40 分 00 秒"
+        );
+        assert_eq!(
+            detail_json["tasks"][0]["fallback_elapsed_display"],
+            "6 分 26 秒"
+        );
+        assert_eq!(
+            detail_json["tasks"][0]["ai_total_elapsed_display"],
+            "46 分 26 秒"
+        );
         assert_eq!(detail.tasks[0].incomplete_files[0].path, "src/c.rs");
         assert_eq!(
             detail.tasks[0].incomplete_files[0].reason,

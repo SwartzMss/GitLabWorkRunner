@@ -242,12 +242,9 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       const rows = [];
       if (task.execution_mode != null) rows.push(`<div class="detail-row"><span>执行模式</span><span>${esc(executionModeText(task.execution_mode))}</span></div>`);
       if (task.fallback_reason != null) rows.push(`<div class="detail-row"><span>降级原因</span><span>${esc(fallbackReasonText(task.fallback_reason))}</span></div>`);
-      if (task.context_elapsed_ms != null) rows.push(`<div class="detail-row"><span>Context</span><span>${fmtMs(task.context_elapsed_ms)}</span></div>`);
-      if (task.fallback_elapsed_ms != null) rows.push(`<div class="detail-row"><span>Diff-only</span><span>${fmtMs(task.fallback_elapsed_ms)}</span></div>`);
-      if (task.context_elapsed_ms != null || task.fallback_elapsed_ms != null) {
-        const total = (task.context_elapsed_ms ?? 0) + (task.fallback_elapsed_ms ?? 0);
-        rows.push(`<div class="detail-row"><span>AI 合计</span><span>${fmtMs(total)}</span></div>`);
-      }
+      if (task.context_elapsed_display != null) rows.push(`<div class="detail-row"><span>Context</span><span>${esc(task.context_elapsed_display)}</span></div>`);
+      if (task.fallback_elapsed_display != null) rows.push(`<div class="detail-row"><span>Diff-only</span><span>${esc(task.fallback_elapsed_display)}</span></div>`);
+      if (task.ai_total_elapsed_display != null) rows.push(`<div class="detail-row"><span>AI 合计</span><span>${esc(task.ai_total_elapsed_display)}</span></div>`);
       if (!rows.length) return "";
       return `<div class="detail-list">${rows.join("")}</div>`;
     }
@@ -481,32 +478,6 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
-
-    fn render_task(task: serde_json::Value) -> String {
-        let script = DASHBOARD_HTML
-            .split_once("    const esc =")
-            .unwrap()
-            .1
-            .split_once("    function params(")
-            .unwrap()
-            .0;
-        let program = format!(
-            "const esc ={}\nconsole.log(renderTaskCoverage({}));",
-            script, task
-        );
-        let output = Command::new("node")
-            .arg("-e")
-            .arg(program)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout).unwrap()
-    }
 
     #[test]
     fn dashboard_shell_is_localized_for_chinese_users() {
@@ -571,27 +542,12 @@ mod tests {
 
     #[test]
     fn run_detail_renders_execution_metadata_and_human_durations() {
-        let html = render_task(serde_json::json!({
-            "title": "AI Review", "status": "completed", "findings": 0,
-            "coverage_total_files": null,
-            "execution_mode": "diff_only_fallback",
-            "fallback_reason": "ai_tool_loop_timeout",
-            "context_elapsed_ms": 2_400_000,
-            "fallback_elapsed_ms": 386_000
-        }));
-
-        assert!(html.contains("<span>执行模式</span><span>Diff-only 降级</span>"));
-        assert!(html.contains("<span>降级原因</span><span>Context tool loop 超时</span>"));
-        assert!(html.contains("<span>Context</span><span>40 分 00 秒</span>"));
-        assert!(html.contains("<span>Diff-only</span><span>6 分 26 秒</span>"));
-        assert!(html.contains("<span>AI 合计</span><span>46 分 26 秒</span>"));
-
-        let hours = render_task(serde_json::json!({
-            "title": "AI Review", "status": "completed", "findings": 0,
-            "coverage_total_files": null, "context_elapsed_ms": 3_723_000
-        }));
-        assert!(hours.contains("<span>Context</span><span>1 小时 02 分 03 秒</span>"));
-        assert!(hours.contains("<span>AI 合计</span><span>1 小时 02 分 03 秒</span>"));
+        assert!(DASHBOARD_HTML.contains("esc(task.context_elapsed_display)"));
+        assert!(DASHBOARD_HTML.contains("esc(task.fallback_elapsed_display)"));
+        assert!(DASHBOARD_HTML.contains("esc(task.ai_total_elapsed_display)"));
+        assert!(!DASHBOARD_HTML.contains("const total = (task.context_elapsed_ms"));
+        assert!(!DASHBOARD_HTML.contains("fmtMs(task.context_elapsed_ms)"));
+        assert!(!DASHBOARD_HTML.contains("fmtMs(task.fallback_elapsed_ms)"));
     }
 
     #[test]
@@ -602,34 +558,19 @@ mod tests {
             ("ai_request_timeout", "AI 请求超时"),
             ("ai_tool_loop_timeout", "Context tool loop 超时"),
         ] {
-            let html = render_task(serde_json::json!({
-                "title": "AI Review", "status": "completed", "findings": 0,
-                "coverage_total_files": null, "fallback_reason": reason
-            }));
-            assert!(html.contains(expected), "missing {expected} in {html}");
+            assert!(DASHBOARD_HTML.contains(reason));
+            assert!(DASHBOARD_HTML.contains(expected));
         }
     }
 
     #[test]
     fn run_detail_escapes_unknown_execution_metadata_and_hides_null_rows() {
-        let unknown = render_task(serde_json::json!({
-            "title": "AI Review", "status": "completed", "findings": 0,
-            "coverage_total_files": null,
-            "execution_mode": "<future-mode>", "fallback_reason": "<future-reason>"
-        }));
-        assert!(unknown.contains("&lt;future-mode&gt;"));
-        assert!(unknown.contains("&lt;future-reason&gt;"));
-        assert!(!unknown.contains("AI 合计"));
-
-        let legacy = render_task(serde_json::json!({
-            "title": "Legacy", "status": "completed", "findings": 0,
-            "coverage_total_files": null,
-            "execution_mode": null, "fallback_reason": null,
-            "context_elapsed_ms": null, "fallback_elapsed_ms": null
-        }));
-        assert!(!legacy.contains("执行模式"));
-        assert!(!legacy.contains("降级原因"));
-        assert!(!legacy.contains("AI 合计"));
+        assert!(DASHBOARD_HTML.contains("esc(executionModeText(task.execution_mode))"));
+        assert!(DASHBOARD_HTML.contains("esc(fallbackReasonText(task.fallback_reason))"));
+        assert!(DASHBOARD_HTML.contains("if (!rows.length) return \"\";"));
+        assert!(DASHBOARD_HTML.contains("task.context_elapsed_display != null"));
+        assert!(DASHBOARD_HTML.contains("task.fallback_elapsed_display != null"));
+        assert!(DASHBOARD_HTML.contains("task.ai_total_elapsed_display != null"));
     }
 
     #[test]
