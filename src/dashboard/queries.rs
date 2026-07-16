@@ -117,6 +117,13 @@ pub struct DashboardTaskRun {
     pub error: Option<String>,
     pub started_at: String,
     pub finished_at: Option<String>,
+    pub execution_mode: Option<String>,
+    pub fallback_reason: Option<String>,
+    pub context_elapsed_ms: Option<i64>,
+    pub fallback_elapsed_ms: Option<i64>,
+    pub context_elapsed_display: Option<String>,
+    pub fallback_elapsed_display: Option<String>,
+    pub ai_total_elapsed_display: Option<String>,
     pub coverage_total_files: Option<i64>,
     pub coverage_fully_reviewed_files: Option<i64>,
     pub coverage_partially_reviewed_files: Option<i64>,
@@ -258,6 +265,10 @@ impl DashboardStore {
             "tool_calls_used",
             "max_tool_calls",
             "coverage_complete",
+            "execution_mode",
+            "fallback_reason",
+            "context_elapsed_ms",
+            "fallback_elapsed_ms",
         ] {
             if !self.column_exists("review_task_runs", column).await? {
                 return Err(AppError::Storage(format!(
@@ -613,6 +624,7 @@ where 1 = 1
         let rows = sqlx::query(
             r#"
 select task_type, task_id, title, status, findings, comments, error_code, error, started_at, finished_at,
+    execution_mode, fallback_reason, context_elapsed_ms, fallback_elapsed_ms,
     coverage_total_files, coverage_fully_reviewed_files, coverage_partially_reviewed_files,
     coverage_unreviewed_files, coverage_total_diff_bytes, coverage_reviewed_diff_bytes,
     coverage_required_batches, coverage_planned_batches, coverage_completed_batches,
@@ -648,6 +660,10 @@ from review_coverage_files where review_run_id = ? and task_type = ? and task_id
                     reviewed_diff_bytes: file.get("reviewed_diff_bytes"),
                 })
                 .collect();
+            let context_elapsed_ms = row.get("context_elapsed_ms");
+            let fallback_elapsed_ms = row.get("fallback_elapsed_ms");
+            let (context_elapsed_display, fallback_elapsed_display, ai_total_elapsed_display) =
+                ai_duration_displays(context_elapsed_ms, fallback_elapsed_ms);
             tasks.push(DashboardTaskRun {
                 task_type,
                 task_id,
@@ -659,6 +675,13 @@ from review_coverage_files where review_run_id = ? and task_type = ? and task_id
                 error: error_preview(row.get("error")),
                 started_at: row.get("started_at"),
                 finished_at: row.get("finished_at"),
+                execution_mode: row.get("execution_mode"),
+                fallback_reason: row.get("fallback_reason"),
+                context_elapsed_ms,
+                fallback_elapsed_ms,
+                context_elapsed_display,
+                fallback_elapsed_display,
+                ai_total_elapsed_display,
                 coverage_total_files: row.get("coverage_total_files"),
                 coverage_fully_reviewed_files: row.get("coverage_fully_reviewed_files"),
                 coverage_partially_reviewed_files: row.get("coverage_partially_reviewed_files"),
@@ -725,6 +748,41 @@ limit 500
 }
 
 const ERROR_PREVIEW_MAX_BYTES: usize = 4 * 1024;
+
+fn ai_duration_displays(
+    context_elapsed_ms: Option<i64>,
+    fallback_elapsed_ms: Option<i64>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let context = context_elapsed_ms.map(format_ai_duration_ms);
+    let fallback = fallback_elapsed_ms.map(format_ai_duration_ms);
+    let total = match (context_elapsed_ms, fallback_elapsed_ms) {
+        (None, None) => None,
+        (context, fallback) => Some(format_ai_duration_ms(
+            context
+                .unwrap_or(0)
+                .max(0)
+                .saturating_add(fallback.unwrap_or(0).max(0)),
+        )),
+    };
+    (context, fallback, total)
+}
+
+fn format_ai_duration_ms(milliseconds: i64) -> String {
+    let seconds = milliseconds.max(0) / 1_000;
+    let minutes = seconds / 60;
+    if seconds < 60 {
+        return format!("{seconds:02} 秒");
+    }
+    if minutes < 60 {
+        return format!("{minutes} 分 {:02} 秒", seconds % 60);
+    }
+    format!(
+        "{} 小时 {:02} 分 {:02} 秒",
+        minutes / 60,
+        minutes % 60,
+        seconds % 60
+    )
+}
 
 fn dashboard_failure(code: Option<String>, message: Option<String>) -> Option<DashboardFailure> {
     if code.is_none() && message.is_none() {
@@ -940,6 +998,69 @@ values ('legacy-run', 'script_task', 'legacy-script', 'Legacy Script', 'complete
         assert_eq!(detail.run.review_run_id, "legacy-run");
         assert_eq!(detail.tasks.len(), 1);
         assert_eq!(detail.tasks[0].task_type, "script_task");
+        assert_eq!(detail.tasks[0].execution_mode, None);
+        assert_eq!(detail.tasks[0].fallback_reason, None);
+        assert_eq!(detail.tasks[0].context_elapsed_ms, None);
+        assert_eq!(detail.tasks[0].fallback_elapsed_ms, None);
+        assert_eq!(detail.tasks[0].context_elapsed_display, None);
+        assert_eq!(detail.tasks[0].fallback_elapsed_display, None);
+        assert_eq!(detail.tasks[0].ai_total_elapsed_display, None);
+    }
+
+    #[tokio::test]
+    async fn run_detail_preserves_known_and_unknown_execution_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let database_url = format!("sqlite://{}", dir.path().join("metadata.db").display());
+        let state_store = crate::storage::StateStore::connect(&database_url)
+            .await
+            .unwrap();
+        state_store.migrate().await.unwrap();
+        drop(state_store);
+        let pool = SqlitePool::connect(&database_url).await.unwrap();
+        sqlx::query("insert into review_requests (review_run_id, trigger_type, project_id, mr_iid, commit_sha, requested_ids_json, selected_ai_reviews, selected_script_tasks, status, findings, comments, timezone, started_at) values ('metadata-run', 'manual_note', 1, 2, 'abc', '[]', 2, 0, 'completed', 0, 0, 'UTC', '2025-01-01T00:00:00Z')")
+            .execute(&pool).await.unwrap();
+        sqlx::query("insert into review_task_runs (review_run_id, task_type, task_id, title, status, findings, comments, execution_mode, fallback_reason, context_elapsed_ms, fallback_elapsed_ms, started_at) values ('metadata-run', 'ai_review', 'known', 'Known', 'completed', 0, 0, 'diff_only_fallback', 'archive_limit_exceeded', 2400000, 386000, '2025-01-01T00:00:00Z'), ('metadata-run', 'ai_review', 'unknown', 'Unknown', 'completed', 0, 0, '<future-mode>', '<future-reason>', 1, 2, '2025-01-01T00:00:01Z')")
+            .execute(&pool).await.unwrap();
+        pool.close().await;
+
+        let detail = DashboardStore::connect(&database_url)
+            .await
+            .unwrap()
+            .run_detail("metadata-run")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            detail.tasks[0].execution_mode.as_deref(),
+            Some("diff_only_fallback")
+        );
+        assert_eq!(
+            detail.tasks[0].fallback_reason.as_deref(),
+            Some("archive_limit_exceeded")
+        );
+        assert_eq!(detail.tasks[0].context_elapsed_ms, Some(2_400_000));
+        assert_eq!(detail.tasks[0].fallback_elapsed_ms, Some(386_000));
+        assert_eq!(
+            detail.tasks[0].context_elapsed_display.as_deref(),
+            Some("40 分 00 秒")
+        );
+        assert_eq!(
+            detail.tasks[0].fallback_elapsed_display.as_deref(),
+            Some("6 分 26 秒")
+        );
+        assert_eq!(
+            detail.tasks[0].ai_total_elapsed_display.as_deref(),
+            Some("46 分 26 秒")
+        );
+        assert_eq!(
+            detail.tasks[1].execution_mode.as_deref(),
+            Some("<future-mode>")
+        );
+        assert_eq!(
+            detail.tasks[1].fallback_reason.as_deref(),
+            Some("<future-reason>")
+        );
     }
 
     #[test]
@@ -956,6 +1077,46 @@ values ('legacy-run', 'script_task', 'legacy-script', 'Legacy Script', 'complete
 
         assert_eq!(failure.code, None);
         assert_eq!(failure.message, "legacy failure");
+    }
+
+    #[test]
+    fn ai_duration_display_uses_integer_arithmetic_and_saturating_total() {
+        assert_eq!(format_ai_duration_ms(-1), "00 秒");
+        assert_eq!(format_ai_duration_ms(2_400_000), "40 分 00 秒");
+        assert_eq!(format_ai_duration_ms(386_000), "6 分 26 秒");
+        assert_eq!(format_ai_duration_ms(3_723_000), "1 小时 02 分 03 秒");
+        assert_eq!(
+            format_ai_duration_ms(i64::MAX),
+            "2562047788015 小时 12 分 55 秒"
+        );
+
+        let (context, fallback, total) = ai_duration_displays(Some(2_400_000), Some(386_000));
+        assert_eq!(context.as_deref(), Some("40 分 00 秒"));
+        assert_eq!(fallback.as_deref(), Some("6 分 26 秒"));
+        assert_eq!(total.as_deref(), Some("46 分 26 秒"));
+        assert_eq!(ai_duration_displays(None, None), (None, None, None));
+        assert_eq!(
+            ai_duration_displays(Some(-1), Some(386_000)),
+            (
+                Some("00 秒".into()),
+                Some("6 分 26 秒".into()),
+                Some("6 分 26 秒".into())
+            )
+        );
+        assert_eq!(
+            ai_duration_displays(Some(3_723_000), None),
+            (
+                Some("1 小时 02 分 03 秒".into()),
+                None,
+                Some("1 小时 02 分 03 秒".into())
+            )
+        );
+        assert_eq!(
+            ai_duration_displays(Some(i64::MAX), Some(i64::MAX))
+                .2
+                .as_deref(),
+            Some("2562047788015 小时 12 分 55 秒")
+        );
     }
 
     #[tokio::test]
@@ -1020,6 +1181,10 @@ create table review_task_runs (
     tool_calls_used integer,
     max_tool_calls integer,
     coverage_complete integer,
+    execution_mode text,
+    fallback_reason text,
+    context_elapsed_ms integer,
+    fallback_elapsed_ms integer,
     started_at text not null,
     finished_at text
 );
@@ -1076,5 +1241,32 @@ create table review_coverage_files (
         assert!(err
             .to_string()
             .contains("review_comment_records.publish_position"));
+    }
+
+    #[tokio::test]
+    async fn schema_check_reports_missing_execution_metadata_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let database_url = format!("sqlite://{}", dir.path().join("old.db").display());
+        let state_store = crate::storage::StateStore::connect(&database_url)
+            .await
+            .unwrap();
+        state_store.migrate().await.unwrap();
+        drop(state_store);
+        let pool = SqlitePool::connect(&database_url).await.unwrap();
+        sqlx::query("alter table review_task_runs drop column fallback_elapsed_ms")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+
+        let err = match DashboardStore::connect(&database_url).await {
+            Ok(_) => panic!("dashboard schema check unexpectedly passed"),
+            Err(err) => err,
+        };
+
+        assert!(err
+            .to_string()
+            .contains("review_task_runs.fallback_elapsed_ms"));
+        assert!(err.to_string().contains("run migrations"));
     }
 }

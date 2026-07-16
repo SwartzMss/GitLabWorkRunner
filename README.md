@@ -253,11 +253,14 @@ max_batches = 10
 `max_tool_calls` 默认是 `30`，`0` 表示不限制工具调用次数；`max_tool_result_bytes` 默认是 `60000`。
 日志会记录每次工具调用的工具名、参数摘要、返回 bytes、结果是否截断、是否触发调用上限、batch index/count 和累计 tool call 次数，便于确认模型是否真的调用了 `read_file`、`search_code` 或 `list_files`。
 `request_timeout_seconds` 是单次 AI API 请求的超时；不配置时默认使用 `timeout_seconds / 2`，用于保留一次失败重试机会。
+`timeout_seconds` 是每次 AI Review 执行的完整预算。带上下文的执行只有在返回 `review_run_timeout`、`ai_request_timeout` 或 `ai_tool_loop_timeout` 时，才会启动一次新的、独立计时的 diff-only fallback；fallback 继续使用相同的 `timeout_seconds`、`request_timeout_seconds`、分批策略和 `max_batches`，但不提供上下文工具，也绝不会运行自己的 clean confirmation 或递归启动第三次执行。`second_pass_on_clean = false` 时，最坏耗时可能接近 `2 × timeout_seconds`；设为 `true` 时，首次 context pass 可能正常完成且结果为空，随后 confirmation 消耗一个完整预算并超时，再由独立 fallback 消耗第三个完整预算，因此最坏耗时可能接近 `3 × timeout_seconds`。两者还需加少量 archive 准备、清理和发布开销；该行为不新增配置项。其他 AI 错误以及 archive 超时、权限、HTTP、损坏 ZIP、文件系统等错误不符合此 timeout fallback 条件。
 `second_pass_on_clean` 默认是 `false`；设置为 `true` 时，第一次 AI Review 没有发现问题会再执行一次确认。确认轮次复用第一次已准备好的同一份 archive 上下文；如果 archive 因安全限制退化为 diff-only，确认轮次也复用同一 diff-only fallback。
 AI Review 默认请求 Chat Completions `tool_calls` 结构化输出，并从 `submit_review_findings` 的 arguments 解析 findings；如果响应没有 tool call，会回退解析 `content` 中的 JSON。内置 context tools 不需要 MCP，也不会调用外部服务。
 AI Review 默认按完整文件 diff 分批调用。`max_batch_diff_bytes` 控制单批 diff 字节上限，`max_batches` 控制最多请求批次数；`0` 表示不限制批次数。
 
 runner 会完整扫描 MR changes，并把文件数、原始 diff 字节数以及 required/planned/completed batches 保存到 SQLite。达到 `max_batches` 而未送审的文件和因单文件 diff 过大而被截断的文件会记录在 Review 运行明细中，可从 Dashboard 查看；这些 coverage 信息不会写入 GitLab comments。
+
+Dashboard 的任务明细会显示执行模式、降级原因、context 耗时、fallback 耗时及两者相加的总耗时。成功降级会在 GitLab Review 汇总中注明原因和两段耗时；如果 fallback 自身失败，则仍按现有 AI Review 失败路径报告。旧数据库行的这些新增 metadata 字段可以保持为空，Dashboard 会继续兼容显示。
 
 内置 context tools 说明：
 

@@ -34,6 +34,57 @@ const AI_RESPONSE_PREVIEW_CHARS: usize = 1000;
 const AI_HTTP_ATTEMPTS: usize = 2;
 const TOOL_ARGUMENT_SUMMARY_CHARS: usize = 160;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AiReviewExecutionMode {
+    Context,
+    DiffOnlyFallback,
+}
+
+impl AiReviewExecutionMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Context => "context",
+            Self::DiffOnlyFallback => "diff_only_fallback",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AiReviewFallbackReason {
+    ArchiveLimitExceeded,
+    ReviewRunTimeout,
+    AiRequestTimeout,
+    AiToolLoopTimeout,
+}
+
+impl AiReviewFallbackReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ArchiveLimitExceeded => "archive_limit_exceeded",
+            Self::ReviewRunTimeout => "review_run_timeout",
+            Self::AiRequestTimeout => "ai_request_timeout",
+            Self::AiToolLoopTimeout => "ai_tool_loop_timeout",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AiReviewExecutionMetadata {
+    pub execution_mode: AiReviewExecutionMode,
+    pub fallback_reason: Option<AiReviewFallbackReason>,
+    pub context_elapsed_ms: Option<u64>,
+    pub fallback_elapsed_ms: Option<u64>,
+}
+
+pub(crate) fn timeout_fallback_reason(error: &AppError) -> Option<AiReviewFallbackReason> {
+    match error.review_failure().map(|failure| failure.code) {
+        Some(ReviewErrorCode::ReviewRunTimeout) => Some(AiReviewFallbackReason::ReviewRunTimeout),
+        Some(ReviewErrorCode::AiRequestTimeout) => Some(AiReviewFallbackReason::AiRequestTimeout),
+        Some(ReviewErrorCode::AiToolLoopTimeout) => Some(AiReviewFallbackReason::AiToolLoopTimeout),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReviewCoverage {
     pub total_files: usize,
@@ -104,7 +155,52 @@ pub async fn run_ai_review_execution_with_context(
     source_dir: Option<&Path>,
     review_request: Option<&str>,
 ) -> AiReviewExecution {
-    run_batched_ai_review(config, changes, source_dir, review_request).await
+    run_ai_review_execution_with_runtime_instruction(
+        config,
+        changes,
+        source_dir,
+        review_request,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn run_ai_review_execution_with_runtime_instruction(
+    config: &AiReviewConfig,
+    changes: &[GitLabChange],
+    source_dir: Option<&Path>,
+    review_request: Option<&str>,
+    trusted_runtime_instruction: Option<&str>,
+) -> AiReviewExecution {
+    run_batched_ai_review(
+        config,
+        changes,
+        source_dir,
+        review_request,
+        trusted_runtime_instruction,
+    )
+    .await
+}
+
+fn review_chat_messages(
+    config: &AiReviewConfig,
+    prompt: &str,
+    trusted_runtime_instruction: Option<&str>,
+) -> Vec<ChatMessage> {
+    let mut messages = initial_chat_messages(config, prompt);
+    if let Some(instruction) = trusted_runtime_instruction.filter(|value| !value.trim().is_empty())
+    {
+        messages.insert(
+            1,
+            ChatMessage {
+                role: "system".into(),
+                content: Some(instruction.to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        );
+    }
+    messages
 }
 
 fn ai_review_deadline_error(config: &AiReviewConfig) -> AppError {
@@ -125,6 +221,7 @@ async fn run_ai_review_single(
     batch: Option<(usize, usize)>,
     source_dir: Option<&Path>,
     review_request: Option<&str>,
+    trusted_runtime_instruction: Option<&str>,
 ) -> AppResult<AiReviewSingleResult> {
     let api_key = config.api_key.trim();
     if api_key.is_empty() {
@@ -184,7 +281,7 @@ async fn run_ai_review_single(
             "calling AI review API"
         );
         for attempt in 1..=AI_HTTP_ATTEMPTS {
-            let mut messages = initial_chat_messages(config, &prompt);
+            let mut messages = review_chat_messages(config, &prompt, trusted_runtime_instruction);
             let request_body = serialize_review_request_body(
                 config,
                 &messages,
@@ -385,6 +482,7 @@ async fn run_batched_ai_review(
     changes: &[GitLabChange],
     source_dir: Option<&Path>,
     review_request: Option<&str>,
+    trusted_runtime_instruction: Option<&str>,
 ) -> AiReviewExecution {
     let deadline = Instant::now() + Duration::from_secs(config.timeout_seconds.max(1));
     let mut plan = plan_ai_review_batches(
@@ -432,6 +530,7 @@ async fn run_batched_ai_review(
                 Some((batch_index, batch_count)),
                 source_dir,
                 review_request,
+                trusted_runtime_instruction,
             ),
         )
         .await
@@ -1375,6 +1474,56 @@ mod tests {
             max_tool_calls: 8,
             max_tool_result_bytes: 60_000,
         }
+    }
+
+    #[test]
+    fn timeout_fallback_classifies_only_structured_timeout_codes() {
+        for (code, expected) in [
+            (
+                ReviewErrorCode::ReviewRunTimeout,
+                Some(AiReviewFallbackReason::ReviewRunTimeout),
+            ),
+            (
+                ReviewErrorCode::AiRequestTimeout,
+                Some(AiReviewFallbackReason::AiRequestTimeout),
+            ),
+            (
+                ReviewErrorCode::AiToolLoopTimeout,
+                Some(AiReviewFallbackReason::AiToolLoopTimeout),
+            ),
+            (ReviewErrorCode::PermissionDenied, None),
+            (ReviewErrorCode::AiRequestFailed, None),
+            (ReviewErrorCode::AiResponseParseFailed, None),
+        ] {
+            let error = AppError::ai_review(code, "irrelevant rendered text");
+            assert_eq!(timeout_fallback_reason(&error), expected);
+        }
+        assert_eq!(
+            timeout_fallback_reason(&AppError::Storage("ai_request_timeout".into())),
+            None
+        );
+    }
+
+    #[test]
+    fn trusted_runtime_instruction_is_a_system_message_before_untrusted_prompt() {
+        let config = test_ai_review_config();
+        let messages = review_chat_messages(
+            &config,
+            "UNTRUSTED REVIEW REQUEST AND DIFF",
+            Some("TRUSTED FALLBACK INSTRUCTION"),
+        );
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "system");
+        assert_eq!(
+            messages[1].content.as_deref(),
+            Some("TRUSTED FALLBACK INSTRUCTION")
+        );
+        assert_eq!(messages[2].role, "user");
+        assert_eq!(
+            messages[2].content.as_deref(),
+            Some("UNTRUSTED REVIEW REQUEST AND DIFF")
+        );
     }
 
     async fn read_http_json_request(stream: &mut TcpStream) -> Value {

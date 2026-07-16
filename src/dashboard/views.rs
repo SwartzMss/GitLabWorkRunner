@@ -200,8 +200,10 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     const fmtMs = (value) => {
       if (value == null) return "-";
       const seconds = Math.max(0, Math.round(value / 1000));
-      if (seconds < 60) return `${seconds} 秒`;
-      return `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
+      if (seconds < 60) return `${pad(seconds)} 秒`;
+      const minutes = Math.floor(seconds / 60);
+      if (minutes < 60) return `${minutes} 分 ${pad(seconds % 60)} 秒`;
+      return `${Math.floor(minutes / 60)} 小时 ${pad(minutes % 60)} 分 ${pad(seconds % 60)} 秒`;
     };
     const statusText = (status) => ({ running: "运行中", completed: "已完成", failed: "失败", error: "错误" }[status] || status || "-");
     const severityText = (severity) => ({ error: "严重", warning: "主要", info: "提示" }[severity] || severity || "-");
@@ -227,16 +229,35 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       review_run_timeout: "Review 整体超时", gitlab_comment_failed: "GitLab 发布失败", permission_denied: "权限不足",
       invalid_configuration: "配置无效", internal: "内部错误"
     }[code] || code || "未分类错误");
+    const executionModeText = (mode) => ({ context: "Context", diff_only_fallback: "Diff-only 降级" }[mode] || mode || "");
+    const fallbackReasonText = (reason) => ({
+      archive_limit_exceeded: "Archive 超出安全限制",
+      review_run_timeout: "Context Review 整体超时",
+      ai_request_timeout: "AI 请求超时",
+      ai_tool_loop_timeout: "Context tool loop 超时"
+    }[reason] || reason || "");
     const renderFailure = (failure) => failure ? `<div class="failure"><div><span class="badge failed">${esc(errorCodeText(failure.code))}</span>${failure.code ? ` <code>${esc(failure.code)}</code>` : ""}</div><pre class="failure-message">${esc(failure.message || "-")}</pre></div>` : "";
 
+    function renderExecutionMetadata(task) {
+      const rows = [];
+      if (task.execution_mode != null) rows.push(`<div class="detail-row"><span>执行模式</span><span>${esc(executionModeText(task.execution_mode))}</span></div>`);
+      if (task.fallback_reason != null) rows.push(`<div class="detail-row"><span>降级原因</span><span>${esc(fallbackReasonText(task.fallback_reason))}</span></div>`);
+      if (task.context_elapsed_display != null) rows.push(`<div class="detail-row"><span>Context</span><span>${esc(task.context_elapsed_display)}</span></div>`);
+      if (task.fallback_elapsed_display != null) rows.push(`<div class="detail-row"><span>Diff-only</span><span>${esc(task.fallback_elapsed_display)}</span></div>`);
+      if (task.ai_total_elapsed_display != null) rows.push(`<div class="detail-row"><span>AI 合计</span><span>${esc(task.ai_total_elapsed_display)}</span></div>`);
+      if (!rows.length) return "";
+      return `<div class="detail-list">${rows.join("")}</div>`;
+    }
+
     function renderTaskCoverage(task) {
+      const metadata = renderExecutionMetadata(task);
       if (task.coverage_total_files == null) {
         const failure = renderFailure(task.error ? { code: task.error_code, message: task.error } : null);
         return `<div class="detail-list">
           <div class="detail-row"><span>任务</span><span>${esc(task.title)}</span></div>
           <div class="detail-row"><span>状态</span><span>${badge(task.status)}</span></div>
           <div class="detail-row"><span>问题</span><span>${esc(task.findings ?? 0)}</span></div>
-        </div>${failure}`;
+        </div>${metadata}${failure}`;
       }
       const batchStats = `${task.coverage_completed_batches ?? 0} 已用 / ${fmtLimit(task.coverage_max_batches)} 上限`;
       const toolCallStats = `${task.tool_calls_used ?? 0} 单批峰值 / ${fmtLimit(task.max_tool_calls)} 每批上限`;
@@ -245,7 +266,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
           <div class="detail-row"><span>覆盖情况</span><span></span></div>
           <div class="detail-row"><span>批次</span><span>${batchStats}</span></div>
           <div class="detail-row"><span>工具调用</span><span>${toolCallStats}</span></div>
-        </div>`;
+        </div>${metadata}`;
       }
       const state = task.coverage_complete ? "完整" : "部分";
       const files = task.incomplete_files || [];
@@ -256,7 +277,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         <div class="detail-row"><span>Diff</span><span>${fmtBytes(task.coverage_reviewed_diff_bytes)} / ${fmtBytes(task.coverage_total_diff_bytes)} (${pct(task.coverage_reviewed_diff_bytes, task.coverage_total_diff_bytes)}%)</span></div>
         <div class="detail-row"><span>批次</span><span>${batchStats}</span></div>
         <div class="detail-row"><span>工具调用</span><span>${toolCallStats}</span></div>
-      </div>${incomplete}`;
+      </div>${metadata}${incomplete}`;
     }
 
     function params(includeStatus = true) {
@@ -517,6 +538,39 @@ mod tests {
         assert!(!DASHBOARD_HTML.contains(
             r#"return `<div class="detail-list"><div class="detail-row"><span>覆盖情况</span><span></span></div></div>`;"#
         ));
+    }
+
+    #[test]
+    fn run_detail_renders_execution_metadata_and_human_durations() {
+        assert!(DASHBOARD_HTML.contains("esc(task.context_elapsed_display)"));
+        assert!(DASHBOARD_HTML.contains("esc(task.fallback_elapsed_display)"));
+        assert!(DASHBOARD_HTML.contains("esc(task.ai_total_elapsed_display)"));
+        assert!(!DASHBOARD_HTML.contains("const total = (task.context_elapsed_ms"));
+        assert!(!DASHBOARD_HTML.contains("fmtMs(task.context_elapsed_ms)"));
+        assert!(!DASHBOARD_HTML.contains("fmtMs(task.fallback_elapsed_ms)"));
+    }
+
+    #[test]
+    fn run_detail_renders_approved_fallback_reason_copy() {
+        for (reason, expected) in [
+            ("archive_limit_exceeded", "Archive 超出安全限制"),
+            ("review_run_timeout", "Context Review 整体超时"),
+            ("ai_request_timeout", "AI 请求超时"),
+            ("ai_tool_loop_timeout", "Context tool loop 超时"),
+        ] {
+            assert!(DASHBOARD_HTML.contains(reason));
+            assert!(DASHBOARD_HTML.contains(expected));
+        }
+    }
+
+    #[test]
+    fn run_detail_escapes_unknown_execution_metadata_and_hides_null_rows() {
+        assert!(DASHBOARD_HTML.contains("esc(executionModeText(task.execution_mode))"));
+        assert!(DASHBOARD_HTML.contains("esc(fallbackReasonText(task.fallback_reason))"));
+        assert!(DASHBOARD_HTML.contains("if (!rows.length) return \"\";"));
+        assert!(DASHBOARD_HTML.contains("task.context_elapsed_display != null"));
+        assert!(DASHBOARD_HTML.contains("task.fallback_elapsed_display != null"));
+        assert!(DASHBOARD_HTML.contains("task.ai_total_elapsed_display != null"));
     }
 
     #[test]

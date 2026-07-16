@@ -126,6 +126,8 @@ The service downloads the MR head archive and exposes only repository-local text
 
 If any configured `[archive]` download or extraction limit is exceeded, the service logs a warning and runs the AI Review with diff only. The built-in context tools are unavailable in that fallback, and no archive-limit failure notification is posted. A normal archive still enables all three context tools. A clean optional second pass reuses the same prepared context or diff-only fallback. Archive timeout, permission, HTTP, corrupt-ZIP, and filesystem errors remain fatal.
 
+A context-assisted execution that ends with exactly one of `review_run_timeout`, `ai_request_timeout`, or `ai_tool_loop_timeout` is discarded and restarted once as an independent diff-only execution. The restart gets a fresh full `timeout_seconds` budget and preserves `request_timeout_seconds`, file batching, and `max_batches`; it has only `submit_review_findings`, no context tools. Its `second_pass_on_clean` is disabled, so it never runs its own clean confirmation, and a timeout or any other failure in the fallback does not recurse. With `second_pass_on_clean = false`, the worst case is close to twice `timeout_seconds`. When it is `true`, an initial clean context pass can be followed by a confirmation that consumes another full budget and times out, after which the independent fallback gets a third full budget; that worst case is close to three times `timeout_seconds`. Both cases add archive preparation, cleanup, and publishing overhead and require no new configuration field. Non-timeout AI failures and non-limit archive failures are not eligible. Archive-limit fallback remains the existing path, including reuse of diff-only execution for an optional clean confirmation.
+
 ## Comment Builder
 
 Findings are normalized into a common shape:
@@ -153,6 +155,8 @@ The store records:
 - published comments
 
 Timestamps are stored as RFC3339 UTC strings. The dashboard reads these tables to display summaries, run lists, findings, and audit data.
+
+AI task rows also store nullable `execution_mode`, `fallback_reason`, `context_elapsed_ms`, and `fallback_elapsed_ms`. Null values preserve compatibility with legacy rows. Dashboard run details expose those fields and server-formatted context, fallback, and summed total durations. A successful fallback also degrades visibly in the GitLab Review summary; fallback failure uses the normal AI failure reporting path.
 
 ## Work Directory Cleanup
 

@@ -5,6 +5,8 @@
 - 移除脚本任务；配置中的 `[[script_tasks]]` 现在会被严格解析拒绝，升级时必须删除这些配置块。
 - AI archive 下载或解压触发任一安全限制时记录 WARN，并以仅 MR diff 的模式继续 Review；此时不提供上下文工具，也不发送 `archive_limit_exceeded` 失败通知。
 - archive 超时、权限、HTTP、损坏 ZIP、文件系统等非限制错误仍会使 Review 失败。
+- 带上下文的 AI Review 仅在 `review_run_timeout`、`ai_request_timeout` 或 `ai_tool_loop_timeout` 时独立重启一次 diff-only fallback；新执行获得完整 `timeout_seconds` 预算，保留 request timeout、分批与 `max_batches`，但不提供上下文工具、绝不运行自己的 clean confirmation、也不递归重试。`second_pass_on_clean = false` 时最坏耗时可接近两倍预算；设为 `true` 时，首次 clean context pass、超时 confirmation 和独立 fallback 最坏可接近三倍预算；两者均另加少量开销，且无需新增配置。
+- Dashboard 和 GitLab Review 汇总现在展示 timeout/archive 降级原因及 context/fallback 耗时；Dashboard 还展示相加后的总耗时，新增 nullable metadata 与旧数据库记录兼容。非适用错误与 fallback 自身失败仍走原有失败路径。
 
 ## v2.0.8
 

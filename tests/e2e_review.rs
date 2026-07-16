@@ -17,12 +17,13 @@ use gitlab_work_runner::{
     webhook::MergeRequestNoteEvent,
 };
 use serde_json::{json, Value};
+use sqlx::Row;
 use std::{
     collections::HashMap,
     net::SocketAddr,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -1503,11 +1504,149 @@ model = "test-model"
 }
 
 #[tokio::test]
-async fn archive_limit_falls_back_to_diff_only_ai_review_without_retrying_second_pass() {
+async fn timeout_fallback_persists_final_diff_only_coverage_metadata_and_summary() {
+    let request_bodies = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let request_bodies_for_handler = Arc::clone(&request_bodies);
+    let summary_body = Arc::new(Mutex::new(String::new()));
+    let summary_body_for_handler = Arc::clone(&summary_body);
+    let (listener, addr) = bind_test_listener().await;
+    let app = Router::new()
+        .route(
+            "/api/v4/projects/123/merge_requests/45/changes",
+            get(|| async {
+                Json(json!({
+                    "changes": [
+                        {"old_path":"src/a.rs","new_path":"src/a.rs","new_file":false,"renamed_file":false,"deleted_file":false,"diff":"@@ -1 +1 @@\n+let a = risky();\n"},
+                        {"old_path":"src/b.rs","new_path":"src/b.rs","new_file":false,"renamed_file":false,"deleted_file":false,"diff":"@@ -1 +1 @@\n+let b = risky();\n"}
+                    ],
+                    "diff_refs":{"base_sha":"base","start_sha":"start","head_sha":"timeout-head"}
+                }))
+            }),
+        )
+        .route("/api/v4/projects/123/repository/archive.zip", get(|| async { test_archive() }))
+        .route(
+            "/chat/completions",
+            post(move |body: Bytes| {
+                let request_bodies = Arc::clone(&request_bodies_for_handler);
+                async move {
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    let is_fallback = body["messages"].as_array().unwrap().iter().any(|message| {
+                        message["content"].as_str().is_some_and(|content| content.contains("context-assisted review timed out"))
+                    });
+                    request_bodies.lock().unwrap().push(body);
+                    if !is_fallback {
+                        sleep(Duration::from_secs(2)).await;
+                        return Json(json!({"choices":[{"message":{"content":"{\"findings\":[]}"}}]}));
+                    }
+                    Json(json!({"choices":[{"message":{"content":"","tool_calls":[{"id":"fallback-submit","type":"function","function":{"name":"submit_review_findings","arguments":"{\"findings\":[{\"path\":\"src/a.rs\",\"line\":1,\"severity\":\"error\",\"title\":\"Fallback only\",\"message\":\"Found by diff-only fallback.\"}]}"}}]}}]}))
+                }
+            }),
+        )
+        .route(
+            "/api/v4/projects/123/merge_requests/45/discussions",
+            post(move |body: Bytes| {
+                let summary_body = Arc::clone(&summary_body_for_handler);
+                async move {
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    let text = body["body"].as_str().unwrap();
+                    if body["position"].is_null() {
+                        *summary_body.lock().unwrap() = text.to_string();
+                    }
+                    (StatusCode::CREATED, Json(json!({"id":"discussion","notes":[{"id":102}]})))
+                }
+            }),
+        );
+    spawn_server_on(listener, app);
+    let base_url = format!("http://{addr}");
+    let ruleset = Ruleset::from_toml(&format!(
+        r#"
+[[ai_reviews]]
+id = "ai-review"
+title = "AI Review"
+base_url = "{base_url}"
+api_key = "test"
+model = "test"
+timeout_seconds = 1
+request_timeout_seconds = 5
+max_batch_diff_bytes = 55
+max_batches = 1
+second_pass_on_clean = true
+"#
+    ))
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        dir.path().join("timeout-fallback.db").display()
+    );
+    let store = StateStore::connect(&database_url).await.unwrap();
+    store.migrate().await.unwrap();
+    let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset)
+        .with_review_run_id("rr-timeout-fallback".into());
+
+    let summary = service
+        .review_merge_request_note(&manual_note_event("@ai-review"))
+        .await
+        .unwrap();
+
+    assert_eq!(summary.findings, 1);
+    assert_eq!(summary.comments, 2);
+    let fallback = {
+        let bodies = request_bodies.lock().unwrap();
+        assert_eq!(
+            bodies.len(),
+            2,
+            "one context attempt and one independent fallback"
+        );
+        bodies[1].clone()
+    };
+    assert_eq!(fallback["tools"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        fallback["tools"][0]["function"]["name"],
+        "submit_review_findings"
+    );
+    assert!(fallback["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|message| message["role"] != "tool"));
+    let body = summary_body.lock().unwrap().clone();
+    assert!(body.contains("### 降级执行"));
+    assert!(body.contains("Context 审查超时"));
+    assert!(body.contains("已使用 Diff-only 模式完成"));
+    let pool = sqlx::SqlitePool::connect(&database_url).await.unwrap();
+    let row = sqlx::query("select findings, coverage_required_batches, coverage_planned_batches, coverage_completed_batches, coverage_max_batches, coverage_complete, execution_mode, fallback_reason, context_elapsed_ms, fallback_elapsed_ms from review_task_runs where review_run_id = ?")
+        .bind("rr-timeout-fallback").fetch_one(&pool).await.unwrap();
+    assert_eq!(row.get::<i64, _>("findings"), 1);
+    assert_eq!(row.get::<i64, _>("coverage_required_batches"), 2);
+    assert_eq!(row.get::<i64, _>("coverage_planned_batches"), 1);
+    assert_eq!(row.get::<i64, _>("coverage_completed_batches"), 1);
+    assert_eq!(row.get::<i64, _>("coverage_max_batches"), 1);
+    assert!(!row.get::<bool, _>("coverage_complete"));
+    assert_eq!(row.get::<String, _>("execution_mode"), "diff_only_fallback");
+    assert_eq!(
+        row.get::<String, _>("fallback_reason"),
+        "review_run_timeout"
+    );
+    assert!(row.get::<i64, _>("context_elapsed_ms") >= 1_000);
+    assert!(row.get::<i64, _>("fallback_elapsed_ms") >= 0);
+    let file = sqlx::query("select path, reason from review_coverage_files where review_run_id = ? and reason = 'max_batches_reached'")
+        .bind("rr-timeout-fallback").fetch_one(&pool).await.unwrap();
+    assert!(matches!(
+        file.get::<String, _>("path").as_str(),
+        "src/a.rs" | "src/b.rs"
+    ));
+    assert_eq!(file.get::<String, _>("reason"), "max_batches_reached");
+}
+
+#[tokio::test]
+async fn archive_limit_reuses_diff_only_execution_for_clean_confirmation() {
     let archive_request_count = Arc::new(AtomicUsize::new(0));
     let archive_request_count_for_handler = Arc::clone(&archive_request_count);
     let ai_request_count = Arc::new(AtomicUsize::new(0));
     let ai_request_count_for_handler = Arc::clone(&ai_request_count);
+    let summary_body = Arc::new(Mutex::new(String::new()));
+    let summary_body_for_handler = Arc::clone(&summary_body);
     let (listener, addr) = bind_test_listener().await;
     let app = Router::new()
         .route(
@@ -1603,6 +1742,20 @@ async fn archive_limit_falls_back_to_diff_only_ai_review_without_retrying_second
                     }))
                 }
             }),
+        )
+        .route(
+            "/api/v4/projects/123/merge_requests/45/discussions",
+            post(move |body: Bytes| {
+                let summary_body = Arc::clone(&summary_body_for_handler);
+                async move {
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    *summary_body.lock().unwrap() = body["body"].as_str().unwrap().to_string();
+                    (
+                        StatusCode::CREATED,
+                        Json(json!({"id":"archive-summary","notes":[{"id":101}]})),
+                    )
+                }
+            }),
         );
     spawn_server_on(listener, app);
     let base_url = format!("http://{}", addr);
@@ -1619,14 +1772,17 @@ second_pass_on_clean = true
         base_url
     ))
     .unwrap();
-    let store = StateStore::connect("sqlite::memory:").await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let database_url = format!("sqlite://{}", dir.path().join("archive.db").display());
+    let store = StateStore::connect(&database_url).await.unwrap();
     store.migrate().await.unwrap();
     let archive_limits = ArchiveLimits {
         max_archive_bytes: 1,
         ..ArchiveLimits::default()
     };
     let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset)
-        .with_archive_limits(archive_limits);
+        .with_archive_limits(archive_limits)
+        .with_review_run_id("rr-archive-degraded".into());
 
     let summary = service
         .review_merge_request_note(&manual_note_event("@ai-review"))
@@ -1636,7 +1792,24 @@ second_pass_on_clean = true
     assert_eq!(archive_request_count.load(Ordering::SeqCst), 1);
     assert_eq!(ai_request_count.load(Ordering::SeqCst), 4);
     assert_eq!(summary.findings, 0);
-    assert_eq!(summary.comments, 0);
+    assert_eq!(summary.comments, 1);
+    let body = summary_body.lock().unwrap().clone();
+    assert!(body.contains("### 降级执行"));
+    assert!(body.contains("仓库上下文归档超过限制"));
+    assert!(body.contains("已使用 Diff-only 模式完成"));
+    let pool = sqlx::SqlitePool::connect(&database_url).await.unwrap();
+    let row = sqlx::query("select execution_mode, fallback_reason, context_elapsed_ms, fallback_elapsed_ms from review_task_runs where review_run_id = ?")
+        .bind("rr-archive-degraded")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.get::<String, _>("execution_mode"), "diff_only_fallback");
+    assert_eq!(
+        row.get::<String, _>("fallback_reason"),
+        "archive_limit_exceeded"
+    );
+    assert!(row.get::<i64, _>("context_elapsed_ms") >= 0);
+    assert!(row.get::<i64, _>("fallback_elapsed_ms") >= 0);
 }
 
 #[tokio::test]
@@ -1693,9 +1866,15 @@ model = "test-model"
         base_url
     ))
     .unwrap();
-    let store = StateStore::connect("sqlite::memory:").await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        dir.path().join("archive-failure.db").display()
+    );
+    let store = StateStore::connect(&database_url).await.unwrap();
     store.migrate().await.unwrap();
-    let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset);
+    let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset)
+        .with_review_run_id("rr-archive-failure".into());
 
     let error = service
         .review_merge_request_note(&manual_note_event("@ai-review"))
@@ -1707,6 +1886,21 @@ model = "test-model"
         Some(gitlab_work_runner::error::ReviewErrorCode::ArchiveDownloadFailed)
     );
     assert_eq!(ai_request_count.load(Ordering::SeqCst), 0);
+    let pool = sqlx::SqlitePool::connect(&database_url).await.unwrap();
+    let row = sqlx::query("select status, execution_mode, context_elapsed_ms, coverage_total_files, coverage_complete from review_task_runs where review_run_id = ?")
+        .bind("rr-archive-failure").fetch_one(&pool).await.unwrap();
+    assert_eq!(row.get::<String, _>("status"), "failed");
+    assert_eq!(row.get::<String, _>("execution_mode"), "context");
+    assert!(row.get::<i64, _>("context_elapsed_ms") >= 0);
+    assert!(row.get::<Option<i64>, _>("coverage_total_files").is_none());
+    assert!(row.get::<Option<bool>, _>("coverage_complete").is_none());
+    let files =
+        sqlx::query("select count(*) as count from review_coverage_files where review_run_id = ?")
+            .bind("rr-archive-failure")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(files.get::<i64, _>("count"), 0);
 }
 
 #[tokio::test]
@@ -1776,6 +1970,8 @@ async fn ai_review_timeout_does_not_block_merge_request_review() {
                     assert!(message.contains("GitLabWorkRunner Review"));
                     assert!(message.contains("**状态：** 部分失败"));
                     assert!(message.contains("- `ai-review` AI Review"));
+                    assert!(!message.contains("### 降级执行"));
+                    assert!(!message.contains("已使用 Diff-only 模式完成"));
                     assert!(message.contains("**Commit：** `abc123`"));
                     assert!(message.contains("gitlab-work-runner:summary run=rr-timeout"));
                     discussion_count.fetch_add(1, Ordering::SeqCst);
@@ -1816,7 +2012,7 @@ timeout_seconds = 1
     assert_eq!(summary.findings, 0);
     assert_eq!(summary.comments, 1);
     assert!(!summary.skipped);
-    assert!((1..=2).contains(&ai_request_count.load(Ordering::SeqCst)));
+    assert_eq!(ai_request_count.load(Ordering::SeqCst), 2);
     assert_eq!(discussion_count.load(Ordering::SeqCst), 1);
 }
 
