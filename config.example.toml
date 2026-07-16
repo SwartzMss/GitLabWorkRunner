@@ -25,7 +25,7 @@ max_files = 5
 
 [archive]
 max_archive_bytes = 209715200      # 200 MiB (压缩包上限)
-max_extracted_files = 10000        # 10,000 files
+max_extracted_files = 10000        # 10,000 entries (directories and regular files)
 max_extracted_bytes = 419430400    # 400 MiB (解压后上限，留2倍余量)
 max_single_file_bytes = 41943040   # 40 MiB
 max_entry_path_bytes = 512         # 512 bytes

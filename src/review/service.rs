@@ -828,7 +828,7 @@ impl ReviewService {
             source_dir,
         };
         fs::create_dir_all(&context.source_dir)?;
-        let extracted_files =
+        let extracted_entries =
             extract_zip_archive(&archive, &context.source_dir, &self.archive_limits)?;
         info!(
             project_id = event.project_id,
@@ -836,7 +836,7 @@ impl ReviewService {
             commit_sha = archive_sha,
             ai_review_id = %review.id,
             archive_bytes = archive.len(),
-            extracted_files,
+            extracted_entries,
             source_dir = %context.source_dir.display(),
             "AI review context archive extracted"
         );
@@ -885,6 +885,12 @@ fn ai_review_context_work_dir(
 }
 
 fn sanitize_work_path_segment(value: &str) -> String {
+    if value == "." {
+        return "%2E".into();
+    }
+    if value == ".." {
+        return "%2E%2E".into();
+    }
     let sanitized: String = value
         .chars()
         .map(|ch| {
@@ -1187,6 +1193,42 @@ mod tests {
         let normalized = path.to_string_lossy().replace('\\', "/");
 
         assert!(normalized.contains("/abc123/ai-review/run_1"));
+    }
+
+    #[test]
+    fn ai_review_context_work_dir_encodes_dot_review_id() {
+        let path = ai_review_context_work_dir(1, 2, "abc123", ".", Some("run-1")).unwrap();
+        let intended_parent = std::env::current_dir()
+            .unwrap()
+            .join("work/ai_review_context/1/2/abc123");
+
+        assert!(path.starts_with(&intended_parent));
+        assert_eq!(
+            path.strip_prefix(&intended_parent).unwrap(),
+            Path::new("%2E/run-1")
+        );
+        assert!(path.components().all(|component| !matches!(
+            component,
+            std::path::Component::CurDir | std::path::Component::ParentDir
+        )));
+    }
+
+    #[test]
+    fn ai_review_context_work_dir_encodes_dotdot_review_run_id() {
+        let path = ai_review_context_work_dir(1, 2, "abc123", "ai-review", Some("..")).unwrap();
+        let intended_parent = std::env::current_dir()
+            .unwrap()
+            .join("work/ai_review_context/1/2/abc123/ai-review");
+
+        assert!(path.starts_with(&intended_parent));
+        assert_eq!(
+            path.strip_prefix(&intended_parent).unwrap(),
+            Path::new("%2E%2E")
+        );
+        assert!(path.components().all(|component| !matches!(
+            component,
+            std::path::Component::CurDir | std::path::Component::ParentDir
+        )));
     }
 
     #[test]

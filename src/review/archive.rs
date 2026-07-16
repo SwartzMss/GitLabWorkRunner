@@ -77,7 +77,7 @@ pub(crate) fn extract_zip_archive(
     let reader = Cursor::new(bytes);
     let mut archive = ZipArchive::new(reader)
         .map_err(|err| AppError::archive(ReviewErrorCode::ArchiveExtractFailed, err.to_string()))?;
-    let mut extracted_files = 0_usize;
+    let mut extracted_entries = 0_usize;
     let mut extracted_bytes = 0_usize;
     for index in 0..archive.len() {
         let mut file = archive.by_index(index).map_err(|err| {
@@ -102,19 +102,20 @@ pub(crate) fn extract_zip_archive(
                 ),
             ));
         }
-        let output_path = destination.join(relative);
-        if file.is_dir() {
-            fs::create_dir_all(&output_path)?;
-            continue;
-        }
-        if extracted_files >= limits.max_extracted_files {
+        if extracted_entries >= limits.max_extracted_files {
             return Err(AppError::archive(
                 ReviewErrorCode::ArchiveLimitExceeded,
                 format!(
-                    "archive extracted file count exceeded max_extracted_files {}",
+                    "archive extracted entry count exceeded max_extracted_files {}",
                     limits.max_extracted_files
                 ),
             ));
+        }
+        let output_path = destination.join(relative);
+        if file.is_dir() {
+            fs::create_dir_all(&output_path)?;
+            extracted_entries += 1;
+            continue;
         }
         if let Some(parent) = output_path.parent() {
             fs::create_dir_all(parent)?;
@@ -131,9 +132,9 @@ pub(crate) fn extract_zip_archive(
         })?;
         extracted_bytes = extracted_bytes.saturating_add(copied);
         set_unix_mode(&output_path, file.unix_mode())?;
-        extracted_files += 1;
+        extracted_entries += 1;
     }
-    Ok(extracted_files)
+    Ok(extracted_entries)
 }
 
 fn copy_zip_file_with_limits<R: Read, W: Write>(
@@ -224,6 +225,24 @@ mod tests {
         bytes.into_inner()
     }
 
+    fn archive_with_directories_and_files(directories: &[&str], files: &[&str]) -> Vec<u8> {
+        let mut bytes = Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut bytes);
+            for name in directories {
+                zip.add_directory(*name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+            }
+            for name in files {
+                zip.start_file(name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                zip.write_all(b"test\n").unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        bytes.into_inner()
+    }
+
     fn permissive_archive_limits() -> ArchiveLimits {
         ArchiveLimits {
             max_archive_bytes: usize::MAX,
@@ -259,6 +278,43 @@ mod tests {
         let err = extract_zip_archive(&test_archive(), temp.path(), &limits).unwrap_err();
 
         assert!(err.to_string().contains("max_extracted_files"));
+    }
+
+    #[test]
+    fn extract_zip_archive_rejects_too_many_directory_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive =
+            archive_with_directories_and_files(&["repo-head/one/", "repo-head/two/"], &[]);
+        let limits = ArchiveLimits {
+            max_extracted_files: 1,
+            ..permissive_archive_limits()
+        };
+
+        let err = extract_zip_archive(&archive, temp.path(), &limits).unwrap_err();
+
+        assert_eq!(
+            err.review_failure().map(|failure| failure.code),
+            Some(ReviewErrorCode::ArchiveLimitExceeded)
+        );
+        assert!(err.to_string().contains("max_extracted_files"));
+        assert!(temp.path().join("one").is_dir());
+        assert!(!temp.path().join("two").exists());
+    }
+
+    #[test]
+    fn extract_zip_archive_allows_exact_mixed_entry_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive =
+            archive_with_directories_and_files(&["repo-head/src/"], &["repo-head/src/lib.rs"]);
+        let limits = ArchiveLimits {
+            max_extracted_files: 2,
+            ..permissive_archive_limits()
+        };
+
+        let extracted_entries = extract_zip_archive(&archive, temp.path(), &limits).unwrap();
+
+        assert_eq!(extracted_entries, 2);
+        assert!(temp.path().join("src/lib.rs").is_file());
     }
 
     #[test]

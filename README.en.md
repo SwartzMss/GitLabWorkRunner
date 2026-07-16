@@ -162,7 +162,7 @@ file = "rules.toml"
 
 [archive]
 max_archive_bytes = 104857600      # 100 MiB
-max_extracted_files = 10000        # 10,000 files
+max_extracted_files = 10000        # 10,000 entries (directories and regular files)
 max_extracted_bytes = 209715200    # 200 MiB
 max_single_file_bytes = 10485760   # 10 MiB
 max_entry_path_bytes = 512         # 512 bytes
