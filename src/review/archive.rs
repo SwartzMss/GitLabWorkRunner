@@ -194,24 +194,6 @@ fn set_unix_mode(_path: &Path, _mode: Option<u32>) -> io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn sanitize_path_segment(value: &str) -> String {
-    let sanitized: String = value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if sanitized.is_empty() {
-        "_".into()
-    } else {
-        sanitized
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,11 +307,5 @@ mod tests {
         let err = extract_zip_archive(&archive, temp.path(), &limits).unwrap_err();
 
         assert!(err.to_string().contains("max_entry_path_bytes"));
-    }
-
-    #[test]
-    fn sanitizes_path_segments() {
-        assert_eq!(sanitize_path_segment("check/a:b"), "check_a_b");
-        assert_eq!(sanitize_path_segment(""), "_");
     }
 }

@@ -1,9 +1,5 @@
 pub use crate::review::archive::ArchiveLimits;
-use crate::{
-    error::AppResult,
-    review::archive::{extract_zip_archive, sanitize_path_segment},
-    rules::ScriptTaskConfig,
-};
+use crate::{error::AppResult, review::archive::extract_zip_archive, rules::ScriptTaskConfig};
 use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
@@ -421,6 +417,24 @@ fn append_timeout_note(path: &Path, timeout: Duration) -> io::Result<()> {
     )
 }
 
+fn sanitize_path_segment(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "_".into()
+    } else {
+        sanitized
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,6 +485,12 @@ mod tests {
             script_task_status(None),
             ScriptTaskStatus::ExecutionFailed(None)
         );
+    }
+
+    #[test]
+    fn sanitizes_path_segments() {
+        assert_eq!(sanitize_path_segment("check/a:b"), "check_a_b");
+        assert_eq!(sanitize_path_segment(""), "_");
     }
 
     #[tokio::test]
