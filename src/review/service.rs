@@ -1051,8 +1051,10 @@ mod tests {
         });
         let store = StateStore::connect("sqlite::memory:").await.unwrap();
         store.migrate().await.unwrap();
-        let mut limits = ArchiveLimits::default();
-        limits.max_extracted_files = 1;
+        let limits = ArchiveLimits {
+            max_extracted_files: 1,
+            ..ArchiveLimits::default()
+        };
         let run_id = format!("cleanup-regression-{}", std::process::id());
         let service = ReviewService::new(
             GitLabClient::new(format!("http://{addr}"), "token".into()),

@@ -75,11 +75,7 @@ async fn merge_request_webhook_is_ignored_without_review_work() {
 #[tokio::test]
 async fn non_create_merge_request_note_is_ignored_even_with_manual_command() {
     let rules_file = NamedTempFile::new().unwrap();
-    let command = if cfg!(windows) {
-        "echo ok"
-    } else {
-        "printf ok"
-    };
+    let ai_base_url = "http://127.0.0.1:1";
     std::fs::write(
         rules_file.path(),
         format!(
@@ -92,7 +88,7 @@ api_key = "test"
 model = "test"
 timeout_seconds = 10
 "#,
-            command.replace('\\', "\\\\").replace('"', "\\\"")
+            ai_base_url
         ),
     )
     .unwrap();
@@ -183,11 +179,7 @@ model = "test"
 #[tokio::test]
 async fn duplicate_running_commit_note_gets_acknowledgement_comment() {
     let rules_file = NamedTempFile::new().unwrap();
-    let command = if cfg!(windows) {
-        "echo ok"
-    } else {
-        "printf ok"
-    };
+    let ai_base_url = "http://127.0.0.1:1";
     std::fs::write(
         rules_file.path(),
         format!(
@@ -200,7 +192,7 @@ api_key = "test"
 model = "test"
 timeout_seconds = 10
 "#,
-            command.replace('\\', "\\\\").replace('"', "\\\"")
+            ai_base_url
         ),
     )
     .unwrap();
@@ -359,11 +351,7 @@ timeout_seconds = 10
 #[tokio::test]
 async fn busy_review_queue_note_gets_acknowledgement_comment() {
     let rules_file = NamedTempFile::new().unwrap();
-    let command = if cfg!(windows) {
-        "echo ok"
-    } else {
-        "printf ok"
-    };
+    let ai_base_url = "http://127.0.0.1:1";
     std::fs::write(
         rules_file.path(),
         format!(
@@ -376,7 +364,7 @@ api_key = "test"
 model = "test"
 timeout_seconds = 10
 "#,
-            command.replace('\\', "\\\\").replace('"', "\\\"")
+            ai_base_url
         ),
     )
     .unwrap();
@@ -539,11 +527,7 @@ timeout_seconds = 10
 #[tokio::test]
 async fn merge_request_webhook_is_ignored_when_review_queue_is_busy() {
     let rules_file = NamedTempFile::new().unwrap();
-    let command = if cfg!(windows) {
-        "echo ok"
-    } else {
-        "printf ok"
-    };
+    let ai_base_url = "http://127.0.0.1:1";
     std::fs::write(
         rules_file.path(),
         format!(
@@ -556,7 +540,7 @@ api_key = "test"
 model = "test"
 timeout_seconds = 10
 "#,
-            command.replace('\\', "\\\\").replace('"', "\\\"")
+            ai_base_url
         ),
     )
     .unwrap();
@@ -667,11 +651,7 @@ timeout_seconds = 10
 #[tokio::test]
 async fn failed_webhook_review_posts_failure_comment() {
     let rules_file = NamedTempFile::new().unwrap();
-    let command = if cfg!(windows) {
-        "echo ok"
-    } else {
-        "printf ok"
-    };
+    let ai_base_url = "http://127.0.0.1:1";
     std::fs::write(
         rules_file.path(),
         format!(
@@ -684,7 +664,7 @@ api_key = "test"
 model = "test"
 timeout_seconds = 10
 "#,
-            command.replace('\\', "\\\\").replace('"', "\\\"")
+            ai_base_url
         ),
     )
     .unwrap();

@@ -1610,8 +1610,10 @@ second_pass_on_clean = true
     .unwrap();
     let store = StateStore::connect("sqlite::memory:").await.unwrap();
     store.migrate().await.unwrap();
-    let mut archive_limits = ArchiveLimits::default();
-    archive_limits.max_archive_bytes = 1;
+    let archive_limits = ArchiveLimits {
+        max_archive_bytes: 1,
+        ..ArchiveLimits::default()
+    };
     let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset)
         .with_archive_limits(archive_limits);
 
