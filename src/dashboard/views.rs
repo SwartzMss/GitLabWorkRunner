@@ -201,7 +201,9 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       if (value == null) return "-";
       const seconds = Math.max(0, Math.round(value / 1000));
       if (seconds < 60) return `${seconds} 秒`;
-      return `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
+      const minutes = Math.floor(seconds / 60);
+      if (minutes < 60) return `${minutes} 分 ${seconds % 60} 秒`;
+      return `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分 ${seconds % 60} 秒`;
     };
     const statusText = (status) => ({ running: "运行中", completed: "已完成", failed: "失败", error: "错误" }[status] || status || "-");
     const severityText = (severity) => ({ error: "严重", warning: "主要", info: "提示" }[severity] || severity || "-");
@@ -227,16 +229,38 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       review_run_timeout: "Review 整体超时", gitlab_comment_failed: "GitLab 发布失败", permission_denied: "权限不足",
       invalid_configuration: "配置无效", internal: "内部错误"
     }[code] || code || "未分类错误");
+    const executionModeText = (mode) => ({ context: "Context", diff_only_fallback: "Diff-only 降級" }[mode] || mode || "");
+    const fallbackReasonText = (reason) => ({
+      archive_limit_exceeded: "Archive 超出限制",
+      review_run_timeout: "Context 整体超时",
+      ai_request_timeout: "AI 请求超时",
+      ai_tool_loop_timeout: "AI 工具循环超时"
+    }[reason] || reason || "");
     const renderFailure = (failure) => failure ? `<div class="failure"><div><span class="badge failed">${esc(errorCodeText(failure.code))}</span>${failure.code ? ` <code>${esc(failure.code)}</code>` : ""}</div><pre class="failure-message">${esc(failure.message || "-")}</pre></div>` : "";
 
+    function renderExecutionMetadata(task) {
+      const rows = [];
+      if (task.execution_mode != null) rows.push(`<div class="detail-row"><span>执行模式</span><span>${esc(executionModeText(task.execution_mode))}</span></div>`);
+      if (task.fallback_reason != null) rows.push(`<div class="detail-row"><span>降級原因</span><span>${esc(fallbackReasonText(task.fallback_reason))}</span></div>`);
+      if (task.context_elapsed_ms != null) rows.push(`<div class="detail-row"><span>Context 阶段</span><span>${fmtMs(task.context_elapsed_ms)}</span></div>`);
+      if (task.fallback_elapsed_ms != null) rows.push(`<div class="detail-row"><span>Diff-only 阶段</span><span>${fmtMs(task.fallback_elapsed_ms)}</span></div>`);
+      if (task.context_elapsed_ms != null || task.fallback_elapsed_ms != null) {
+        const total = (task.context_elapsed_ms ?? 0) + (task.fallback_elapsed_ms ?? 0);
+        rows.push(`<div class="detail-row"><span>AI 总耗时</span><span>${fmtMs(total)}</span></div>`);
+      }
+      if (!rows.length) return "";
+      return `<div class="detail-list">${rows.join("")}</div>`;
+    }
+
     function renderTaskCoverage(task) {
+      const metadata = renderExecutionMetadata(task);
       if (task.coverage_total_files == null) {
         const failure = renderFailure(task.error ? { code: task.error_code, message: task.error } : null);
         return `<div class="detail-list">
           <div class="detail-row"><span>任务</span><span>${esc(task.title)}</span></div>
           <div class="detail-row"><span>状态</span><span>${badge(task.status)}</span></div>
           <div class="detail-row"><span>问题</span><span>${esc(task.findings ?? 0)}</span></div>
-        </div>${failure}`;
+        </div>${metadata}${failure}`;
       }
       const batchStats = `${task.coverage_completed_batches ?? 0} 已用 / ${fmtLimit(task.coverage_max_batches)} 上限`;
       const toolCallStats = `${task.tool_calls_used ?? 0} 单批峰值 / ${fmtLimit(task.max_tool_calls)} 每批上限`;
@@ -245,7 +269,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
           <div class="detail-row"><span>覆盖情况</span><span></span></div>
           <div class="detail-row"><span>批次</span><span>${batchStats}</span></div>
           <div class="detail-row"><span>工具调用</span><span>${toolCallStats}</span></div>
-        </div>`;
+        </div>${metadata}`;
       }
       const state = task.coverage_complete ? "完整" : "部分";
       const files = task.incomplete_files || [];
@@ -256,7 +280,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         <div class="detail-row"><span>Diff</span><span>${fmtBytes(task.coverage_reviewed_diff_bytes)} / ${fmtBytes(task.coverage_total_diff_bytes)} (${pct(task.coverage_reviewed_diff_bytes, task.coverage_total_diff_bytes)}%)</span></div>
         <div class="detail-row"><span>批次</span><span>${batchStats}</span></div>
         <div class="detail-row"><span>工具调用</span><span>${toolCallStats}</span></div>
-      </div>${incomplete}`;
+      </div>${metadata}${incomplete}`;
     }
 
     function params(includeStatus = true) {
@@ -517,6 +541,40 @@ mod tests {
         assert!(!DASHBOARD_HTML.contains(
             r#"return `<div class="detail-list"><div class="detail-row"><span>覆盖情况</span><span></span></div></div>`;"#
         ));
+    }
+
+    #[test]
+    fn run_detail_renders_execution_metadata_and_human_durations() {
+        assert!(
+            DASHBOARD_HTML.contains(r#"context: "Context", diff_only_fallback: "Diff-only 降級""#)
+        );
+        assert!(DASHBOARD_HTML.contains(r#"archive_limit_exceeded: "Archive 超出限制""#));
+        assert!(DASHBOARD_HTML.contains(r#"review_run_timeout: "Context 整体超时""#));
+        assert!(DASHBOARD_HTML.contains(r#"ai_request_timeout: "AI 请求超时""#));
+        assert!(DASHBOARD_HTML.contains(r#"ai_tool_loop_timeout: "AI 工具循环超时""#));
+        assert!(DASHBOARD_HTML.contains("<span>Context 阶段</span>"));
+        assert!(DASHBOARD_HTML.contains("<span>Diff-only 阶段</span>"));
+        assert!(DASHBOARD_HTML.contains("<span>AI 总耗时</span>"));
+        let total_seconds = (2_400_000 + 386_000) / 1_000;
+        assert_eq!(total_seconds / 60, 46);
+        assert_eq!(total_seconds % 60, 26);
+        assert!(DASHBOARD_HTML.contains(
+            "const total = (task.context_elapsed_ms ?? 0) + (task.fallback_elapsed_ms ?? 0)"
+        ));
+        assert!(DASHBOARD_HTML.contains("`${minutes} 分 ${seconds % 60} 秒`"));
+        assert!(DASHBOARD_HTML
+            .contains("`${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分 ${seconds % 60} 秒`"));
+        assert!(DASHBOARD_HTML
+            .contains("task.context_elapsed_ms != null || task.fallback_elapsed_ms != null"));
+    }
+
+    #[test]
+    fn run_detail_escapes_unknown_execution_metadata_and_hides_null_rows() {
+        assert!(DASHBOARD_HTML.contains("esc(executionModeText(task.execution_mode))"));
+        assert!(DASHBOARD_HTML.contains("esc(fallbackReasonText(task.fallback_reason))"));
+        assert!(DASHBOARD_HTML.contains("if (!rows.length) return \"\";"));
+        assert!(DASHBOARD_HTML.contains("task.context_elapsed_ms != null"));
+        assert!(DASHBOARD_HTML.contains("task.fallback_elapsed_ms != null"));
     }
 
     #[test]

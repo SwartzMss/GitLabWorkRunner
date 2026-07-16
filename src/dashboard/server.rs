@@ -354,6 +354,11 @@ mod tests {
             .unwrap();
         drop(writer);
 
+        let pool = sqlx::SqlitePool::connect(&database_url).await.unwrap();
+        sqlx::query("update review_task_runs set execution_mode = 'diff_only_fallback', fallback_reason = 'ai_request_timeout', context_elapsed_ms = 2400000, fallback_elapsed_ms = 386000 where review_run_id = 'rr-coverage'")
+            .execute(&pool).await.unwrap();
+        pool.close().await;
+
         let store = DashboardStore::connect(&database_url).await.unwrap();
         let detail = store.run_detail("rr-coverage").await.unwrap().unwrap();
 
@@ -363,6 +368,17 @@ mod tests {
         assert_eq!(detail.tasks[0].tool_calls_used, Some(5));
         assert_eq!(detail.tasks[0].max_tool_calls, Some(8));
         assert_eq!(detail.tasks[0].coverage_complete, Some(false));
+        assert_eq!(
+            detail.tasks[0].execution_mode.as_deref(),
+            Some("diff_only_fallback")
+        );
+        let detail_json = serde_json::to_value(&detail).unwrap();
+        assert_eq!(
+            detail_json["tasks"][0]["fallback_reason"],
+            "ai_request_timeout"
+        );
+        assert_eq!(detail_json["tasks"][0]["context_elapsed_ms"], 2_400_000);
+        assert_eq!(detail_json["tasks"][0]["fallback_elapsed_ms"], 386_000);
         assert_eq!(detail.tasks[0].incomplete_files[0].path, "src/c.rs");
         assert_eq!(
             detail.tasks[0].incomplete_files[0].reason,
