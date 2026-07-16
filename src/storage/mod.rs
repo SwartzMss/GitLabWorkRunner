@@ -462,18 +462,28 @@ where review_run_id = ? and task_type = ? and task_id = ?
         files: &[StoredReviewCoverageFile<'_>],
         metadata: Option<&AiReviewExecutionMetadata>,
     ) -> AppResult<()> {
+        self.finish_task_run_with_optional_coverage_and_metadata(
+            task,
+            Some(coverage),
+            files,
+            metadata,
+        )
+        .await
+    }
+
+    pub async fn finish_task_run_with_optional_coverage_and_metadata(
+        &self,
+        task: &TaskRunFinish<'_>,
+        coverage: Option<&StoredReviewCoverage>,
+        files: &[StoredReviewCoverageFile<'_>],
+        metadata: Option<&AiReviewExecutionMetadata>,
+    ) -> AppResult<()> {
         let now = now_rfc3339();
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             r#"
 update review_task_runs set
     status = ?, findings = ?, comments = ?, error_code = ?, error = ?, finished_at = ?,
-    coverage_total_files = ?, coverage_fully_reviewed_files = ?,
-    coverage_partially_reviewed_files = ?, coverage_unreviewed_files = ?,
-    coverage_total_diff_bytes = ?, coverage_reviewed_diff_bytes = ?,
-    coverage_required_batches = ?, coverage_planned_batches = ?,
-    coverage_completed_batches = ?, coverage_max_batches = ?,
-    tool_calls_used = ?, max_tool_calls = ?, coverage_complete = ?,
     execution_mode = case when ? then ? else execution_mode end,
     fallback_reason = case when ? then ? else fallback_reason end,
     context_elapsed_ms = case when ? then ? else context_elapsed_ms end,
@@ -487,6 +497,37 @@ where review_run_id = ? and task_type = ? and task_id = ?
         .bind(task.error_code)
         .bind(task.error)
         .bind(&now)
+        .bind(metadata.is_some())
+        .bind(metadata.map(|metadata| metadata.execution_mode.as_str()))
+        .bind(metadata.is_some())
+        .bind(metadata.and_then(|metadata| {
+            metadata
+                .fallback_reason
+                .map(|fallback_reason| fallback_reason.as_str())
+        }))
+        .bind(metadata.is_some())
+        .bind(metadata.and_then(|metadata| metadata.context_elapsed_ms.map(saturating_u64_to_i64)))
+        .bind(metadata.is_some())
+        .bind(metadata.and_then(|metadata| metadata.fallback_elapsed_ms.map(saturating_u64_to_i64)))
+        .bind(task.review_run_id)
+        .bind(task.task_type)
+        .bind(task.task_id)
+        .execute(&mut *tx)
+        .await?;
+        let Some(coverage) = coverage else {
+            tx.commit().await?;
+            return Ok(());
+        };
+        sqlx::query(
+            r#"update review_task_runs set
+coverage_total_files = ?, coverage_fully_reviewed_files = ?,
+coverage_partially_reviewed_files = ?, coverage_unreviewed_files = ?,
+coverage_total_diff_bytes = ?, coverage_reviewed_diff_bytes = ?,
+coverage_required_batches = ?, coverage_planned_batches = ?,
+coverage_completed_batches = ?, coverage_max_batches = ?,
+tool_calls_used = ?, max_tool_calls = ?, coverage_complete = ?
+where review_run_id = ? and task_type = ? and task_id = ?"#,
+        )
         .bind(coverage.total_files as i64)
         .bind(coverage.fully_reviewed_files as i64)
         .bind(coverage.partially_reviewed_files as i64)
@@ -500,18 +541,6 @@ where review_run_id = ? and task_type = ? and task_id = ?
         .bind(coverage.tool_calls_used as i64)
         .bind(coverage.max_tool_calls as i64)
         .bind(coverage.complete)
-        .bind(metadata.is_some())
-        .bind(metadata.map(|metadata| metadata.execution_mode.as_str()))
-        .bind(metadata.is_some())
-        .bind(metadata.and_then(|metadata| {
-            metadata
-                .fallback_reason
-                .map(|fallback_reason| fallback_reason.as_str())
-        }))
-        .bind(metadata.is_some())
-        .bind(metadata.and_then(|metadata| metadata.context_elapsed_ms.map(saturating_u64_to_i64)))
-        .bind(metadata.is_some())
-        .bind(metadata.and_then(|metadata| metadata.fallback_elapsed_ms.map(saturating_u64_to_i64)))
         .bind(task.review_run_id)
         .bind(task.task_type)
         .bind(task.task_id)
@@ -908,6 +937,122 @@ mod tests {
         .unwrap();
         assert_eq!(row.get::<i64, _>("context_elapsed_ms"), i64::MAX);
         assert_eq!(row.get::<i64, _>("fallback_elapsed_ms"), i64::MAX);
+    }
+
+    #[tokio::test]
+    async fn records_metadata_without_fabricating_coverage() {
+        let store = StateStore::connect("sqlite::memory:").await.unwrap();
+        store.migrate().await.unwrap();
+        store
+            .start_task_run(&TaskRunStart {
+                review_run_id: "rr-no-coverage",
+                task_type: "ai_review",
+                task_id: "ai-review",
+                title: "AI Review",
+            })
+            .await
+            .unwrap();
+        let finish = TaskRunFinish {
+            review_run_id: "rr-no-coverage",
+            task_type: "ai_review",
+            task_id: "ai-review",
+            status: "failed",
+            findings: 0,
+            comments: 0,
+            error_code: Some("archive_download_failed"),
+            error: Some("archive failed before coverage planning"),
+        };
+        let metadata = AiReviewExecutionMetadata {
+            execution_mode: AiReviewExecutionMode::Context,
+            fallback_reason: None,
+            context_elapsed_ms: Some(42),
+            fallback_elapsed_ms: None,
+        };
+
+        store
+            .finish_task_run_with_optional_coverage_and_metadata(
+                &finish,
+                None,
+                &[],
+                Some(&metadata),
+            )
+            .await
+            .unwrap();
+
+        let row = sqlx::query("select status, error_code, execution_mode, context_elapsed_ms, coverage_total_files, coverage_complete from review_task_runs where review_run_id = ?")
+            .bind("rr-no-coverage")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<String, _>("status"), "failed");
+        assert_eq!(
+            row.get::<String, _>("error_code"),
+            "archive_download_failed"
+        );
+        assert_eq!(row.get::<String, _>("execution_mode"), "context");
+        assert_eq!(row.get::<i64, _>("context_elapsed_ms"), 42);
+        assert!(row.get::<Option<i64>, _>("coverage_total_files").is_none());
+        assert!(row.get::<Option<bool>, _>("coverage_complete").is_none());
+        let files = sqlx::query(
+            "select count(*) as count from review_coverage_files where review_run_id = ?",
+        )
+        .bind("rr-no-coverage")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(files.get::<i64, _>("count"), 0);
+
+        let coverage = StoredReviewCoverage {
+            total_files: 1,
+            fully_reviewed_files: 0,
+            partially_reviewed_files: 1,
+            unreviewed_files: 0,
+            total_diff_bytes: 10,
+            reviewed_diff_bytes: 5,
+            required_batches: 1,
+            planned_batches: 1,
+            completed_batches: 1,
+            max_batches: 1,
+            tool_calls_used: 1,
+            max_tool_calls: 2,
+            complete: false,
+        };
+        let file = StoredReviewCoverageFile {
+            path: "src/lib.rs",
+            status: "partial",
+            reason: "batch_execution_failed",
+            total_diff_bytes: 10,
+            reviewed_diff_bytes: 5,
+        };
+        store
+            .finish_task_run_with_coverage(&finish, &coverage, &[file])
+            .await
+            .unwrap();
+        store
+            .finish_task_run_with_optional_coverage_and_metadata(
+                &finish,
+                None,
+                &[],
+                Some(&metadata),
+            )
+            .await
+            .unwrap();
+        let preserved = sqlx::query(
+            "select coverage_total_files from review_task_runs where review_run_id = ?",
+        )
+        .bind("rr-no-coverage")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(preserved.get::<i64, _>("coverage_total_files"), 1);
+        let files = sqlx::query(
+            "select count(*) as count from review_coverage_files where review_run_id = ?",
+        )
+        .bind("rr-no-coverage")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(files.get::<i64, _>("count"), 1);
     }
 
     #[tokio::test]

@@ -66,11 +66,9 @@ impl ReviewService {
         task: &TaskRunFinish<'_>,
         coverage: Option<&ReviewCoverage>,
         files: &[ReviewCoverageFile],
+        metadata: &AiReviewExecutionMetadata,
     ) -> AppResult<()> {
-        let Some(coverage) = coverage else {
-            return self.store.finish_task_run(task).await;
-        };
-        let stored = StoredReviewCoverage {
+        let stored = coverage.map(|coverage| StoredReviewCoverage {
             total_files: coverage.total_files,
             fully_reviewed_files: coverage.fully_reviewed_files,
             partially_reviewed_files: coverage.partially_reviewed_files,
@@ -84,7 +82,7 @@ impl ReviewService {
             tool_calls_used: coverage.tool_calls_used,
             max_tool_calls: coverage.max_tool_calls,
             complete: coverage.complete,
-        };
+        });
         let stored_files = files
             .iter()
             .map(|file| StoredReviewCoverageFile {
@@ -96,7 +94,12 @@ impl ReviewService {
             })
             .collect::<Vec<_>>();
         self.store
-            .finish_task_run_with_coverage(task, &stored, &stored_files)
+            .finish_task_run_with_optional_coverage_and_metadata(
+                task,
+                stored.as_ref(),
+                &stored_files,
+                Some(metadata),
+            )
             .await
     }
 
@@ -382,7 +385,7 @@ impl ReviewService {
                 )
                 .await;
             let execution = execution_with_metadata.execution;
-            let _metadata = execution_with_metadata.metadata;
+            let metadata = execution_with_metadata.metadata;
             let coverage = execution.coverage;
             let incomplete_files = execution.incomplete_files;
             if let Some(coverage) = coverage.as_ref() {
@@ -412,8 +415,22 @@ impl ReviewService {
                         },
                         coverage.as_ref(),
                         &incomplete_files,
+                        &metadata,
                     )
                     .await?;
+                    if let Some(reason) = metadata.fallback_reason {
+                        summary
+                            .degraded_review_items
+                            .push(AiReviewDegradationSummary {
+                                id: review.id.clone(),
+                                title: review.title.clone(),
+                                reason,
+                                context_elapsed_ms: metadata.context_elapsed_ms.unwrap_or_default(),
+                                fallback_elapsed_ms: metadata
+                                    .fallback_elapsed_ms
+                                    .unwrap_or_default(),
+                            });
+                    }
                     info!(
                         project_id = event.project_id,
                         mr_iid = event.mr_iid,
@@ -439,6 +456,7 @@ impl ReviewService {
                         },
                         coverage.as_ref(),
                         &incomplete_files,
+                        &metadata,
                     )
                     .await?;
                     if matches!(err, AppError::Archive(_)) {
@@ -720,6 +738,19 @@ fn build_manual_review_summary_body(
         body.push_str(&failed_reviews);
         body.push('\n');
     }
+    if !ai_summary.degraded_review_items.is_empty() {
+        body.push_str("\n### 降级执行\n\n");
+        for item in &ai_summary.degraded_review_items {
+            body.push_str(&format!(
+                "- `{}` {}：{}，已使用 Diff-only 模式完成。Context {}，Diff-only {}。\n",
+                sanitize_comment_summary_label(&item.id, 100),
+                sanitize_comment_summary_label(&item.title, 200),
+                fallback_reason_summary(item.reason),
+                format_duration_ms(item.context_elapsed_ms),
+                format_duration_ms(item.fallback_elapsed_ms),
+            ));
+        }
+    }
     body.push_str(&format!(
         "\n<!-- gitlab-work-runner:summary run={} commit={} -->",
         sanitize_comment_inline(review_run_id),
@@ -741,6 +772,23 @@ fn sanitize_comment_detail(value: &str, max_chars: usize) -> String {
         return sanitized;
     }
     let mut truncated = sanitized.chars().take(max_chars).collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
+fn sanitize_comment_summary_label(value: &str, max_chars: usize) -> String {
+    let single_line = sanitize_comment_inline(value).replace(['\r', '\n'], " ");
+    let mut escaped = String::new();
+    for ch in single_line.trim().chars() {
+        if matches!(ch, '\\' | '*' | '_' | '[' | ']' | '(' | ')' | '#' | '>') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    if escaped.chars().count() <= max_chars {
+        return escaped;
+    }
+    let mut truncated = escaped.chars().take(max_chars).collect::<String>();
     truncated.push_str("...");
     truncated
 }
@@ -1197,6 +1245,7 @@ struct AiReviewRunSummary {
     failed_reviews: usize,
     skipped_reviews: usize,
     failed_review_items: Vec<AiReviewFailureSummary>,
+    degraded_review_items: Vec<AiReviewDegradationSummary>,
     reviewed_diff_bytes: usize,
 }
 
@@ -1212,6 +1261,37 @@ struct AiReviewFailureSummary {
     title: String,
     error_code: String,
     error: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AiReviewDegradationSummary {
+    id: String,
+    title: String,
+    reason: AiReviewFallbackReason,
+    context_elapsed_ms: u64,
+    fallback_elapsed_ms: u64,
+}
+
+fn fallback_reason_summary(reason: AiReviewFallbackReason) -> &'static str {
+    match reason {
+        AiReviewFallbackReason::ArchiveLimitExceeded => "仓库上下文归档超过限制",
+        AiReviewFallbackReason::ReviewRunTimeout => "Context 审查超时",
+        AiReviewFallbackReason::AiRequestTimeout => "AI 请求超时",
+        AiReviewFallbackReason::AiToolLoopTimeout => "AI 工具循环超时",
+    }
+}
+
+fn format_duration_ms(elapsed_ms: u64) -> String {
+    let seconds = elapsed_ms / 1_000;
+    let minutes = seconds / 60;
+    let hours = minutes / 60;
+    if hours > 0 {
+        format!("{hours} 小时 {:02} 分 {:02} 秒", minutes % 60, seconds % 60)
+    } else if minutes > 0 {
+        format!("{minutes} 分 {:02} 秒", seconds % 60)
+    } else {
+        format!("{seconds} 秒")
+    }
 }
 
 fn failure_for_error(error: &AppError, fallback: ReviewErrorCode) -> ReviewFailure {
@@ -2039,6 +2119,60 @@ mod tests {
         assert!(!body.contains("\n无\n"));
         assert!(!body.contains("- 批次："));
         assert!(!body.contains("- 上下文工具："));
+    }
+
+    #[test]
+    fn formats_degradation_durations_deterministically() {
+        assert_eq!(format_duration_ms(0), "0 秒");
+        assert_eq!(format_duration_ms(40_000), "40 秒");
+        assert_eq!(format_duration_ms(2_400_000), "40 分 00 秒");
+        assert_eq!(format_duration_ms(3_986_000), "1 小时 06 分 26 秒");
+    }
+
+    #[test]
+    fn manual_review_summary_reports_successful_diff_only_degradation() {
+        let event = MergeRequestEvent {
+            project_id: 1,
+            project_name: None,
+            project_path_with_namespace: None,
+            mr_iid: 2,
+            commit_sha: "abc123".into(),
+            action: "manual-note-1".into(),
+            source_branch: String::new(),
+            target_branch: String::new(),
+        };
+        let changes = crate::gitlab::MergeRequestChanges {
+            changes: Vec::new(),
+            diff_refs: crate::gitlab::DiffRefs {
+                base_sha: None,
+                start_sha: None,
+                head_sha: None,
+            },
+        };
+        let mut ai_summary = AiReviewRunSummary::default();
+        ai_summary
+            .degraded_review_items
+            .push(AiReviewDegradationSummary {
+                id: "ai-`review\nnext".into(),
+                title: format!("AI `Review\n### injected {}", "x".repeat(240)),
+                reason: AiReviewFallbackReason::ReviewRunTimeout,
+                context_elapsed_ms: 2_400_000,
+                fallback_elapsed_ms: 386_000,
+            });
+
+        let body = build_manual_review_summary_body(
+            &event,
+            &changes,
+            "rr-1",
+            &ai_summary,
+            None,
+            std::time::Duration::from_secs(1),
+        );
+
+        assert!(body.contains("### 降级执行"));
+        assert!(body.contains("- `ai-'review next` AI 'Review \\#\\#\\# injected "));
+        assert!(!body.contains("\n### injected"));
+        assert!(body.contains("xxx...：Context 审查超时，已使用 Diff-only 模式完成。Context 40 分 00 秒，Diff-only 6 分 26 秒。"));
     }
 
     #[test]
