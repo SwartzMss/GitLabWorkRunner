@@ -146,11 +146,12 @@ pub(crate) struct AiReviewToolContext {
 impl AiReviewToolContext {
     pub(crate) fn new(config: &AiReviewConfig, source_dir: Option<&Path>) -> Self {
         let source_dir = source_dir.map(Path::to_path_buf);
+        let source_available = source_dir.is_some();
         info!(
             ai_review_id = %config.id,
-            read_file = true,
-            search_code = true,
-            list_files = true,
+            read_file = source_available,
+            search_code = source_available,
+            list_files = source_available,
             max_tool_calls = config.max_tool_calls,
             max_tool_result_bytes = config.max_tool_result_bytes,
             source_dir = %source_dir.as_ref().map(|path| path.display().to_string()).unwrap_or_default(),
@@ -158,9 +159,9 @@ impl AiReviewToolContext {
         );
         Self {
             source_dir,
-            read_file: true,
-            search_code: true,
-            list_files: true,
+            read_file: source_available,
+            search_code: source_available,
+            list_files: source_available,
             max_result_bytes: config.max_tool_result_bytes.max(1),
         }
     }
@@ -520,7 +521,6 @@ mod tests {
             model: "test-model".into(),
             timeout_seconds: 60,
             request_timeout_seconds: None,
-            second_pass_on_clean: false,
             max_batch_diff_bytes: 30_000,
             max_batches: 6,
             extra_instructions: String::new(),

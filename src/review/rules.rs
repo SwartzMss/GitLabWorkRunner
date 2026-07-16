@@ -13,6 +13,7 @@ pub struct RulesFile {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AiReviewConfig {
     pub id: String,
     pub title: String,
@@ -23,8 +24,6 @@ pub struct AiReviewConfig {
     pub timeout_seconds: u64,
     #[serde(default)]
     pub request_timeout_seconds: Option<u64>,
-    #[serde(default)]
-    pub second_pass_on_clean: bool,
     #[serde(default = "default_ai_max_batch_diff_bytes")]
     pub max_batch_diff_bytes: usize,
     #[serde(default = "default_ai_max_batches")]
@@ -191,6 +190,28 @@ command = "python check.py"
     }
 
     #[test]
+    fn second_pass_on_clean_is_rejected_as_unknown_field() {
+        let error = match Ruleset::from_toml(
+            r#"
+[[ai_reviews]]
+id = "ai-review"
+title = "AI Review"
+base_url = "https://api.openai.com/v1"
+api_key = "test-api-key"
+model = "gpt-4.1-mini"
+second_pass_on_clean = true
+"#,
+        ) {
+            Ok(_) => panic!("removed second_pass_on_clean unexpectedly parsed"),
+            Err(error) => error,
+        };
+
+        assert!(error
+            .to_string()
+            .contains("unknown field `second_pass_on_clean`"));
+    }
+
+    #[test]
     fn parses_ai_review_defaults_and_selects_by_manual_ids() {
         let rules = Ruleset::from_toml(
             r#"
@@ -211,7 +232,6 @@ model = "gpt-4.1-mini"
         assert_eq!(reviews[0].api_key, "test-api-key");
         assert_eq!(reviews[0].timeout_seconds, 60);
         assert_eq!(reviews[0].request_timeout_seconds, None);
-        assert!(!reviews[0].second_pass_on_clean);
         assert_eq!(reviews[0].max_batch_diff_bytes, 30_000);
         assert_eq!(reviews[0].max_batches, 6);
         assert!(reviews[0].extra_instructions.is_empty());

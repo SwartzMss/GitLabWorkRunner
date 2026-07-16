@@ -124,6 +124,12 @@ pub struct DashboardTaskRun {
     pub context_elapsed_display: Option<String>,
     pub fallback_elapsed_display: Option<String>,
     pub ai_total_elapsed_display: Option<String>,
+    pub progress_phase: Option<String>,
+    pub progress_message: Option<String>,
+    pub progress_current: Option<i64>,
+    pub progress_total: Option<i64>,
+    pub progress_unit: Option<String>,
+    pub progress_updated_at: Option<String>,
     pub coverage_total_files: Option<i64>,
     pub coverage_fully_reviewed_files: Option<i64>,
     pub coverage_partially_reviewed_files: Option<i64>,
@@ -269,6 +275,12 @@ impl DashboardStore {
             "fallback_reason",
             "context_elapsed_ms",
             "fallback_elapsed_ms",
+            "progress_phase",
+            "progress_message",
+            "progress_current",
+            "progress_total",
+            "progress_unit",
+            "progress_updated_at",
         ] {
             if !self.column_exists("review_task_runs", column).await? {
                 return Err(AppError::Storage(format!(
@@ -625,6 +637,7 @@ where 1 = 1
             r#"
 select task_type, task_id, title, status, findings, comments, error_code, error, started_at, finished_at,
     execution_mode, fallback_reason, context_elapsed_ms, fallback_elapsed_ms,
+    progress_phase, progress_message, progress_current, progress_total, progress_unit, progress_updated_at,
     coverage_total_files, coverage_fully_reviewed_files, coverage_partially_reviewed_files,
     coverage_unreviewed_files, coverage_total_diff_bytes, coverage_reviewed_diff_bytes,
     coverage_required_batches, coverage_planned_batches, coverage_completed_batches,
@@ -682,6 +695,12 @@ from review_coverage_files where review_run_id = ? and task_type = ? and task_id
                 context_elapsed_display,
                 fallback_elapsed_display,
                 ai_total_elapsed_display,
+                progress_phase: row.get("progress_phase"),
+                progress_message: row.get("progress_message"),
+                progress_current: row.get("progress_current"),
+                progress_total: row.get("progress_total"),
+                progress_unit: row.get("progress_unit"),
+                progress_updated_at: row.get("progress_updated_at"),
                 coverage_total_files: row.get("coverage_total_files"),
                 coverage_fully_reviewed_files: row.get("coverage_fully_reviewed_files"),
                 coverage_partially_reviewed_files: row.get("coverage_partially_reviewed_files"),
@@ -1019,7 +1038,7 @@ values ('legacy-run', 'script_task', 'legacy-script', 'Legacy Script', 'complete
         let pool = SqlitePool::connect(&database_url).await.unwrap();
         sqlx::query("insert into review_requests (review_run_id, trigger_type, project_id, mr_iid, commit_sha, requested_ids_json, selected_ai_reviews, selected_script_tasks, status, findings, comments, timezone, started_at) values ('metadata-run', 'manual_note', 1, 2, 'abc', '[]', 2, 0, 'completed', 0, 0, 'UTC', '2025-01-01T00:00:00Z')")
             .execute(&pool).await.unwrap();
-        sqlx::query("insert into review_task_runs (review_run_id, task_type, task_id, title, status, findings, comments, execution_mode, fallback_reason, context_elapsed_ms, fallback_elapsed_ms, started_at) values ('metadata-run', 'ai_review', 'known', 'Known', 'completed', 0, 0, 'diff_only_fallback', 'archive_limit_exceeded', 2400000, 386000, '2025-01-01T00:00:00Z'), ('metadata-run', 'ai_review', 'unknown', 'Unknown', 'completed', 0, 0, '<future-mode>', '<future-reason>', 1, 2, '2025-01-01T00:00:01Z')")
+        sqlx::query("insert into review_task_runs (review_run_id, task_type, task_id, title, status, findings, comments, execution_mode, fallback_reason, context_elapsed_ms, fallback_elapsed_ms, progress_phase, progress_message, progress_current, progress_total, progress_unit, progress_updated_at, started_at) values ('metadata-run', 'ai_review', 'known', 'Known', 'completed', 0, 0, 'diff_only_fallback', 'archive_limit_exceeded', 2400000, 386000, 'reviewing_batch', '正在审查第 2 / 5 个批次', 2, 5, 'batch', '2025-01-01T00:00:02Z', '2025-01-01T00:00:00Z'), ('metadata-run', 'ai_review', 'unknown', 'Unknown', 'completed', 0, 0, '<future-mode>', '<future-reason>', 1, 2, null, null, null, null, null, null, '2025-01-01T00:00:01Z')")
             .execute(&pool).await.unwrap();
         pool.close().await;
 
@@ -1052,6 +1071,21 @@ values ('legacy-run', 'script_task', 'legacy-script', 'Legacy Script', 'complete
         assert_eq!(
             detail.tasks[0].ai_total_elapsed_display.as_deref(),
             Some("46 分 26 秒")
+        );
+        assert_eq!(
+            detail.tasks[0].progress_phase.as_deref(),
+            Some("reviewing_batch")
+        );
+        assert_eq!(
+            detail.tasks[0].progress_message.as_deref(),
+            Some("正在审查第 2 / 5 个批次")
+        );
+        assert_eq!(detail.tasks[0].progress_current, Some(2));
+        assert_eq!(detail.tasks[0].progress_total, Some(5));
+        assert_eq!(detail.tasks[0].progress_unit.as_deref(), Some("batch"));
+        assert_eq!(
+            detail.tasks[0].progress_updated_at.as_deref(),
+            Some("2025-01-01T00:00:02Z")
         );
         assert_eq!(
             detail.tasks[1].execution_mode.as_deref(),
@@ -1185,6 +1219,12 @@ create table review_task_runs (
     fallback_reason text,
     context_elapsed_ms integer,
     fallback_elapsed_ms integer,
+    progress_phase text,
+    progress_message text,
+    progress_current integer,
+    progress_total integer,
+    progress_unit text,
+    progress_updated_at text,
     started_at text not null,
     finished_at text
 );

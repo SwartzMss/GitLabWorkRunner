@@ -96,6 +96,11 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     .dot.info { background: #2f80ed; }
     .progress { width: 82px; height: 5px; background: #e8edf5; border-radius: 999px; overflow: hidden; display: inline-block; vertical-align: middle; margin-left: 8px; }
     .progress span { display: block; height: 100%; background: #16a05d; }
+    .task-progress { padding: 16px 20px 0; display: grid; gap: 9px; }
+    .task-progress-title { display: flex; justify-content: space-between; gap: 12px; color: #1f2a44; font-size: 13px; font-weight: 650; }
+    .task-progress-meta { color: var(--muted); font-size: 12px; }
+    .task-progress-bar { height: 7px; background: #e8edf5; border-radius: 999px; overflow: hidden; }
+    .task-progress-bar span { display: block; height: 100%; background: #315bea; }
     .empty { padding: 20px; color: var(--muted); }
     .wrap { white-space: normal; max-width: 520px; }
     .failure { margin: 0 20px 18px; padding: 14px; border-left: 3px solid #cf3131; background: #fff7f7; display: grid; gap: 8px; }
@@ -165,7 +170,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
   </div>
   <script>
     const $ = (id) => document.getElementById(id);
-    const state = { view: "dashboard", summary: null, findingSummary: null, runs: [], projects: [], mrs: [], findings: [] };
+    const state = { view: "dashboard", summary: null, findingSummary: null, runs: [], projects: [], mrs: [], findings: [], activeRunDetail: null };
     const titles = {
       dashboard: ["仪表盘", "Review 自动化与系统活动概览"],
       projects: ["项目", "按 GitLab 项目汇总的 Review 活动"],
@@ -249,11 +254,27 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       return `<div class="detail-list">${rows.join("")}</div>`;
     }
 
+    function renderTaskProgress(task) {
+      if (!task.progress_phase && !task.progress_message) return "";
+      const current = task.progress_current ?? 0;
+      const total = task.progress_total ?? 0;
+      const hasTotal = total > 0;
+      const width = hasTotal ? Math.min(100, Math.max(0, Math.round((current / total) * 100))) : 100;
+      const count = hasTotal ? `${esc(current)} / ${esc(total)} ${esc(task.progress_unit || "")}` : esc(task.progress_phase || "");
+      const updated = task.progress_updated_at ? `最后更新 ${relative(task.progress_updated_at)}` : "";
+      return `<div class="task-progress">
+        <div class="task-progress-title"><span>${esc(task.progress_message || task.progress_phase)}</span><span>${count}</span></div>
+        <div class="task-progress-bar"><span style="width:${width}%"></span></div>
+        <div class="task-progress-meta">${updated}</div>
+      </div>`;
+    }
+
     function renderTaskCoverage(task) {
       const metadata = renderExecutionMetadata(task);
+      const progress = renderTaskProgress(task);
       if (task.coverage_total_files == null) {
         const failure = renderFailure(task.error ? { code: task.error_code, message: task.error } : null);
-        return `<div class="detail-list">
+        return `${progress}<div class="detail-list">
           <div class="detail-row"><span>任务</span><span>${esc(task.title)}</span></div>
           <div class="detail-row"><span>状态</span><span>${badge(task.status)}</span></div>
           <div class="detail-row"><span>问题</span><span>${esc(task.findings ?? 0)}</span></div>
@@ -262,7 +283,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       const batchStats = `${task.coverage_completed_batches ?? 0} 已用 / ${fmtLimit(task.coverage_max_batches)} 上限`;
       const toolCallStats = `${task.tool_calls_used ?? 0} 单批峰值 / ${fmtLimit(task.max_tool_calls)} 每批上限`;
       if (task.status === "failed" && (task.coverage_completed_batches === 0 || task.coverage_reviewed_diff_bytes === 0)) {
-        return `<div class="detail-list">
+        return `${progress}<div class="detail-list">
           <div class="detail-row"><span>覆盖情况</span><span></span></div>
           <div class="detail-row"><span>批次</span><span>${batchStats}</span></div>
           <div class="detail-row"><span>工具调用</span><span>${toolCallStats}</span></div>
@@ -271,7 +292,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       const state = task.coverage_complete ? "完整" : "部分";
       const files = task.incomplete_files || [];
       const incomplete = files.length ? `<table><thead><tr><th>文件</th><th>状态</th><th>原因</th><th>已审查 Diff</th><th>总 Diff</th></tr></thead><tbody>${files.map((file) => row([esc(file.path), file.status === "partial" ? "部分" : "未审查", coverageReason(file.reason), fmtBytes(file.reviewed_diff_bytes), fmtBytes(file.total_diff_bytes)])).join("")}</tbody></table>` : "";
-      return `<div class="detail-list">
+      return `${progress}<div class="detail-list">
         <div class="detail-row"><span>覆盖情况</span><span class="badge ${task.coverage_complete ? "completed" : "warning"}">${state}</span></div>
         <div class="detail-row"><span>文件</span><span>${task.coverage_fully_reviewed_files} 完整 / ${task.coverage_partially_reviewed_files} 部分 / ${task.coverage_unreviewed_files} 未审查 / ${task.coverage_total_files} 总计</span></div>
         <div class="detail-row"><span>Diff</span><span>${fmtBytes(task.coverage_reviewed_diff_bytes)} / ${fmtBytes(task.coverage_total_diff_bytes)} (${pct(task.coverage_reviewed_diff_bytes, task.coverage_total_diff_bytes)}%)</span></div>
@@ -425,8 +446,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       </div></section>`;
     }
 
-    async function openRunDetail(reviewRunId) {
-      const detail = await json(`/api/runs/${encodeURIComponent(reviewRunId)}`);
+    function renderRunDetail(detail) {
       $("content").innerHTML = `<div class="detail-grid">
         <section class="panel"><div class="panel-header"><div class="panel-title">Review 运行详情</div><button class="link" id="backToRuns">返回运行列表</button></div><div class="detail-list">
           <div class="detail-row"><span>运行 ID</span><code>${esc(detail.run.review_run_id)}</code></div>
@@ -441,8 +461,15 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       $("backToRuns").addEventListener("click", () => setView("runs"));
     }
 
+    async function openRunDetail(reviewRunId) {
+      state.activeRunDetail = reviewRunId;
+      const detail = await json(`/api/runs/${encodeURIComponent(reviewRunId)}`);
+      renderRunDetail(detail);
+    }
+
     function setView(view) {
       state.view = view;
+      state.activeRunDetail = null;
       window.location.hash = view;
       render();
     }
@@ -467,6 +494,10 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     $("refresh").addEventListener("click", () => load().catch(showError));
     $("apply").addEventListener("click", () => load().catch(showError));
     $("reset").addEventListener("click", () => { $("status").value = ""; $("project").value = ""; $("mr").value = ""; load().catch(showError); });
+    setInterval(() => {
+      if (!state.activeRunDetail) return;
+      json(`/api/runs/${encodeURIComponent(state.activeRunDetail)}`).then(renderRunDetail).catch(showError);
+    }, 2000);
     const initialView = window.location.hash.replace("#", "");
     if (titles[initialView]) state.view = initialView;
     load().catch(showError);
@@ -515,6 +546,16 @@ mod tests {
         assert!(DASHBOARD_HTML.contains("达到批次上限"));
         assert!(DASHBOARD_HTML.contains("单文件 Diff 超过批次限制"));
         assert!(DASHBOARD_HTML.contains("批次执行失败"));
+    }
+
+    #[test]
+    fn run_detail_polls_and_renders_task_progress() {
+        assert!(DASHBOARD_HTML.contains("activeRunDetail"));
+        assert!(DASHBOARD_HTML.contains("setInterval(() =>"));
+        assert!(DASHBOARD_HTML.contains("}, 2000);"));
+        assert!(DASHBOARD_HTML.contains("task.progress_phase"));
+        assert!(DASHBOARD_HTML.contains("task.progress_message"));
+        assert!(DASHBOARD_HTML.contains("task-progress-bar"));
     }
 
     #[test]
