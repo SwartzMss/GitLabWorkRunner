@@ -31,6 +31,30 @@ struct AiReviewExecutionWithMetadata {
     metadata: AiReviewExecutionMetadata,
 }
 
+#[derive(Clone, Copy)]
+enum AiReviewContextPass {
+    Initial,
+    CleanConfirmation,
+}
+
+impl AiReviewContextPass {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Initial => "initial",
+            Self::CleanConfirmation => "clean_confirmation",
+        }
+    }
+}
+
+struct TimeoutFallbackRequest<'a> {
+    review: &'a AiReviewConfig,
+    changes: &'a [GitLabChange],
+    event: &'a MergeRequestEvent,
+    context_pass: AiReviewContextPass,
+    review_request: Option<&'a str>,
+    context_started: Instant,
+}
+
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TestAiExecutionCall {
@@ -846,17 +870,55 @@ impl ReviewService {
 
     async fn timeout_fallback_for_execution(
         &self,
-        review: &AiReviewConfig,
-        changes: &[GitLabChange],
-        review_request: Option<&str>,
+        request: TimeoutFallbackRequest<'_>,
         execution: &AiReviewExecution,
         context: &mut Option<AiReviewContextWorkDir>,
-        context_started: Instant,
     ) -> Option<AiReviewExecutionWithMetadata> {
+        let TimeoutFallbackRequest {
+            review,
+            changes,
+            event,
+            context_pass,
+            review_request,
+            context_started,
+        } = request;
         let error = execution.result.as_ref().err()?;
         let reason = timeout_fallback_reason(error)?;
-        drop(context.take());
+        let original_error_code = error
+            .review_failure()
+            .expect("eligible timeout errors have structured review failures")
+            .code
+            .as_str();
         let context_elapsed_ms = elapsed_ms(context_started);
+        warn!(
+            project_id = event.project_id,
+            mr_iid = event.mr_iid,
+            commit = %event.commit_sha,
+            ai_review_id = %review.id,
+            context_pass = context_pass.as_str(),
+            original_error_code,
+            context_elapsed_ms,
+            execution_mode = AiReviewExecutionMode::Context.as_str(),
+            fallback_reason = reason.as_str(),
+            fallback_recursive = false,
+            max_fallback_attempts = 1,
+            "context-assisted AI review timed out; transitioning to one-shot diff-only fallback"
+        );
+        drop(context.take());
+        info!(
+            project_id = event.project_id,
+            mr_iid = event.mr_iid,
+            commit = %event.commit_sha,
+            ai_review_id = %review.id,
+            context_pass = context_pass.as_str(),
+            original_error_code,
+            context_elapsed_ms,
+            execution_mode = AiReviewExecutionMode::DiffOnlyFallback.as_str(),
+            fallback_reason = reason.as_str(),
+            fallback_recursive = false,
+            max_fallback_attempts = 1,
+            "context work directory removed; starting one-shot diff-only AI review fallback"
+        );
         let fallback_started = Instant::now();
         let mut fallback_review = review.clone();
         fallback_review.second_pass_on_clean = false;
@@ -869,13 +931,57 @@ impl ReviewService {
                 Some(TIMEOUT_DIFF_ONLY_INSTRUCTION),
             )
             .await;
+        let fallback_elapsed_ms = elapsed_ms(fallback_started);
+        match &fallback.result {
+            Ok(_) => info!(
+                project_id = event.project_id,
+                mr_iid = event.mr_iid,
+                commit = %event.commit_sha,
+                ai_review_id = %review.id,
+                context_pass = context_pass.as_str(),
+                original_error_code,
+                context_elapsed_ms,
+                fallback_elapsed_ms,
+                execution_mode = AiReviewExecutionMode::DiffOnlyFallback.as_str(),
+                fallback_reason = reason.as_str(),
+                outcome = "completed",
+                fallback_recursive = false,
+                further_fallback_allowed = false,
+                max_fallback_attempts = 1,
+                "one-shot diff-only AI review fallback completed"
+            ),
+            Err(final_error) => {
+                let final_error_code = final_error
+                    .review_failure()
+                    .map(|failure| failure.code.as_str())
+                    .unwrap_or(ReviewErrorCode::Internal.as_str());
+                warn!(
+                    project_id = event.project_id,
+                    mr_iid = event.mr_iid,
+                    commit = %event.commit_sha,
+                    ai_review_id = %review.id,
+                    context_pass = context_pass.as_str(),
+                    original_error_code,
+                    final_error_code,
+                    context_elapsed_ms,
+                    fallback_elapsed_ms,
+                    execution_mode = AiReviewExecutionMode::DiffOnlyFallback.as_str(),
+                    fallback_reason = reason.as_str(),
+                    outcome = "failed",
+                    fallback_recursive = false,
+                    further_fallback_allowed = false,
+                    max_fallback_attempts = 1,
+                    "one-shot diff-only AI review fallback failed; no further fallback will run"
+                );
+            }
+        }
         Some(AiReviewExecutionWithMetadata {
             execution: fallback,
             metadata: AiReviewExecutionMetadata {
                 execution_mode: AiReviewExecutionMode::DiffOnlyFallback,
                 fallback_reason: Some(reason),
                 context_elapsed_ms: Some(context_elapsed_ms),
-                fallback_elapsed_ms: Some(elapsed_ms(fallback_started)),
+                fallback_elapsed_ms: Some(fallback_elapsed_ms),
             },
         })
     }
@@ -963,12 +1069,16 @@ impl ReviewService {
         };
         if let Some(fallback) = self
             .timeout_fallback_for_execution(
-                review,
-                &changes.changes,
-                review_request,
+                TimeoutFallbackRequest {
+                    review,
+                    changes: &changes.changes,
+                    event,
+                    context_pass: AiReviewContextPass::Initial,
+                    review_request,
+                    context_started,
+                },
                 &execution,
                 &mut context,
-                context_started,
             )
             .await
         {
@@ -998,12 +1108,16 @@ impl ReviewService {
         };
         if let Some(fallback) = self
             .timeout_fallback_for_execution(
-                review,
-                &changes.changes,
-                review_request,
+                TimeoutFallbackRequest {
+                    review,
+                    changes: &changes.changes,
+                    event,
+                    context_pass: AiReviewContextPass::CleanConfirmation,
+                    review_request,
+                    context_started,
+                },
                 &execution,
                 &mut context,
-                context_started,
             )
             .await
         {
