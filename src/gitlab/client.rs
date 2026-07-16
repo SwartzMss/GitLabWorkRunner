@@ -690,7 +690,10 @@ mod tests {
         );
         let err = client.merge_request_changes(1, 2).await.unwrap_err();
 
-        assert!(err.to_string().contains("timed out"));
+        assert_eq!(
+            err.review_failure().map(|failure| failure.code),
+            Some(ReviewErrorCode::GitLabApiTimeout)
+        );
     }
 
     #[tokio::test]
