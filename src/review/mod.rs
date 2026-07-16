@@ -3,6 +3,7 @@ pub(crate) mod ai_http;
 pub(crate) mod ai_prompt;
 pub(crate) mod ai_schema;
 pub(crate) mod ai_tools;
+pub(crate) mod archive;
 pub mod comments;
 pub mod diff;
 pub(crate) mod notifier;

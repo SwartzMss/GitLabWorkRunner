@@ -5,11 +5,9 @@ use crate::{
     comments::{build_comment_drafts, CommentDraft},
     error::{AppError, AppResult, ReviewErrorCode, ReviewFailure},
     gitlab::{CreateDiscussionRequest, DiscussionPosition, GitLabChange, GitLabClient},
+    review::archive::{extract_zip_archive, ArchiveLimits},
     rules::{AiReviewConfig, Finding, Ruleset, Severity},
-    script_tasks::{
-        extract_zip_archive, ArchiveLimits, ScriptTaskContext, ScriptTaskResult, ScriptTaskRunner,
-        ScriptTaskStatus,
-    },
+    script_tasks::{ScriptTaskContext, ScriptTaskResult, ScriptTaskRunner, ScriptTaskStatus},
     storage::{
         ReviewRequestStart, StateStore, StoredComment, StoredFinding, StoredReviewCoverage,
         StoredReviewCoverageFile, TaskRunFinish, TaskRunStart,
