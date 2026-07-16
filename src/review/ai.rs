@@ -629,6 +629,7 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
     } = context;
     let mut body = first_body.to_string();
     let mut tool_call_limit_notice_sent = false;
+    let mut unavailable_context_tool_notice_sent = false;
     loop {
         let response: OpenAiChatResponse = serde_json::from_str(&body).map_err(|err| {
             AppError::ai_review(ReviewErrorCode::AiResponseParseFailed, err.to_string())
@@ -668,123 +669,153 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
         if context_tool_calls.is_empty() {
             return parse_openai_message(&config.id, &config.title, message);
         }
-        let tool_call_names = context_tool_calls
-            .iter()
-            .map(|tool_call| tool_call.function.name.as_str())
-            .collect::<Vec<_>>()
-            .join(",");
-        info!(
-            ai_review_id = %config.id,
-            model = %config.model,
-            attempt,
-            requested_tool_calls = context_tool_calls.len(),
-            tool_call_names = %tool_call_names,
-            tool_calls_used = *tool_calls_used,
-            max_tool_calls = config.max_tool_calls,
-            batch_index = batch.map(|(index, _)| index),
-            batch_count = batch.map(|(_, count)| count),
-            "AI review context tool calls requested"
-        );
-        let unlimited_tool_calls = config.max_tool_calls == 0;
-        let remaining_tool_calls = if unlimited_tool_calls {
-            usize::MAX
-        } else {
-            config.max_tool_calls.saturating_sub(*tool_calls_used)
-        };
-        if !unlimited_tool_calls && remaining_tool_calls == 0 && tool_call_limit_notice_sent {
+        if !tool_context.source_available() {
+            if unavailable_context_tool_notice_sent {
+                return Err(AppError::ai_review(
+                    ReviewErrorCode::AiResponseParseFailed,
+                    format!(
+                        "AI review {} repeatedly requested unavailable context tools",
+                        config.id
+                    ),
+                ));
+            }
+            unavailable_context_tool_notice_sent = true;
             warn!(
                 ai_review_id = %config.id,
                 model = %config.model,
                 requested_tool_calls = context_tool_calls.len(),
-                tool_calls_used = *tool_calls_used,
-                max_tool_calls = config.max_tool_calls,
                 batch_index = batch.map(|(index, _)| index),
                 batch_count = batch.map(|(_, count)| count),
-                "AI review context tool call limit already reported"
+                "AI review requested unavailable context tools; requesting final findings"
             );
-            return Err(AppError::ai_review(
-                ReviewErrorCode::AiRequestFailed,
-                format!(
-                    "AI review {} exhausted context tool calls before submitting findings",
-                    config.id
+            messages.push(ChatMessage {
+                role: "user".into(),
+                content: Some(
+                    "Context tools are unavailable for this diff-only review. Do not call read_file, search_code, or list_files. Submit final findings now using submit_review_findings."
+                        .into(),
                 ),
-            ));
-        }
-        if !unlimited_tool_calls && context_tool_calls.len() > remaining_tool_calls {
-            warn!(
+                tool_call_id: None,
+                tool_calls: None,
+            });
+        } else {
+            let tool_call_names = context_tool_calls
+                .iter()
+                .map(|tool_call| tool_call.function.name.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            info!(
                 ai_review_id = %config.id,
                 model = %config.model,
+                attempt,
                 requested_tool_calls = context_tool_calls.len(),
-                remaining_tool_calls,
+                tool_call_names = %tool_call_names,
                 tool_calls_used = *tool_calls_used,
                 max_tool_calls = config.max_tool_calls,
                 batch_index = batch.map(|(index, _)| index),
                 batch_count = batch.map(|(_, count)| count),
-                "AI review context tool call limit reached"
+                "AI review context tool calls requested"
             );
-        }
-        let context_tool_calls = synthesize_context_tool_call_ids(context_tool_calls);
-
-        messages.push(ChatMessage {
-            role: "assistant".into(),
-            content: message.content.clone(),
-            tool_call_id: None,
-            tool_calls: Some(context_tool_calls.clone()),
-        });
-        for (tool_call_index, tool_call) in context_tool_calls.into_iter().enumerate() {
-            let tool_call_id = non_empty_tool_call_id(&tool_call);
-            let tool_name = tool_call.function.name.as_str();
-            let arguments_summary =
-                tool_call_argument_summary(tool_name, &tool_call.function.arguments);
-            let result = if tool_call_index < remaining_tool_calls {
-                let result = tool_context.call(&tool_call);
-                *tool_calls_used += 1;
-                info!(
-                    ai_review_id = %config.id,
-                    model = %config.model,
-                    tool_name,
-                    tool_call_id = %tool_call_id,
-                    arguments_summary = %arguments_summary,
-                    result_bytes = tool_result_bytes(&result),
-                    result_truncated = tool_result_truncated(&result),
-                    result_limit_reached = tool_result_limit_reached(&result, config.max_tool_result_bytes),
-                    tool_call_limit_reached = false,
-                    tool_calls_used = *tool_calls_used,
-                    total_tool_calls_used = *tool_calls_used,
-                    max_tool_calls = config.max_tool_calls,
-                    batch_index = batch.map(|(index, _)| index),
-                    batch_count = batch.map(|(_, count)| count),
-                    "AI review context tool result returned"
-                );
-                result
+            let unlimited_tool_calls = config.max_tool_calls == 0;
+            let remaining_tool_calls = if unlimited_tool_calls {
+                usize::MAX
             } else {
-                tool_call_limit_notice_sent = true;
-                let result = context_tool_call_limit_result(config);
+                config.max_tool_calls.saturating_sub(*tool_calls_used)
+            };
+            if !unlimited_tool_calls && remaining_tool_calls == 0 && tool_call_limit_notice_sent {
                 warn!(
                     ai_review_id = %config.id,
                     model = %config.model,
-                    tool_name,
-                    tool_call_id = %tool_call_id,
-                    arguments_summary = %arguments_summary,
-                    result_bytes = tool_result_bytes(&result),
-                    result_truncated = tool_result_truncated(&result),
-                    result_limit_reached = tool_result_limit_reached(&result, config.max_tool_result_bytes),
-                    tool_call_limit_reached = true,
+                    requested_tool_calls = context_tool_calls.len(),
                     tool_calls_used = *tool_calls_used,
-                    total_tool_calls_used = *tool_calls_used,
                     max_tool_calls = config.max_tool_calls,
                     batch_index = batch.map(|(index, _)| index),
                     batch_count = batch.map(|(_, count)| count),
-                    "AI review context tool call skipped because limit was reached"
+                    "AI review context tool call limit already reported"
                 );
-                result
-            };
+                return Err(AppError::ai_review(
+                    ReviewErrorCode::AiRequestFailed,
+                    format!(
+                        "AI review {} exhausted context tool calls before submitting findings",
+                        config.id
+                    ),
+                ));
+            }
+            if !unlimited_tool_calls && context_tool_calls.len() > remaining_tool_calls {
+                warn!(
+                    ai_review_id = %config.id,
+                    model = %config.model,
+                    requested_tool_calls = context_tool_calls.len(),
+                    remaining_tool_calls,
+                    tool_calls_used = *tool_calls_used,
+                    max_tool_calls = config.max_tool_calls,
+                    batch_index = batch.map(|(index, _)| index),
+                    batch_count = batch.map(|(_, count)| count),
+                    "AI review context tool call limit reached"
+                );
+            }
+            let context_tool_calls = synthesize_context_tool_call_ids(context_tool_calls);
+
             messages.push(ChatMessage {
-                role: "tool".into(),
-                content: Some(result),
-                tool_call_id: Some(tool_call_id),
-                tool_calls: None,
+                role: "assistant".into(),
+                content: message.content.clone(),
+                tool_call_id: None,
+                tool_calls: Some(context_tool_calls.clone()),
             });
+            for (tool_call_index, tool_call) in context_tool_calls.into_iter().enumerate() {
+                let tool_call_id = non_empty_tool_call_id(&tool_call);
+                let tool_name = tool_call.function.name.as_str();
+                let arguments_summary =
+                    tool_call_argument_summary(tool_name, &tool_call.function.arguments);
+                let result = if tool_call_index < remaining_tool_calls {
+                    let result = tool_context.call(&tool_call);
+                    *tool_calls_used += 1;
+                    info!(
+                        ai_review_id = %config.id,
+                        model = %config.model,
+                        tool_name,
+                        tool_call_id = %tool_call_id,
+                        arguments_summary = %arguments_summary,
+                        result_bytes = tool_result_bytes(&result),
+                        result_truncated = tool_result_truncated(&result),
+                        result_limit_reached = tool_result_limit_reached(&result, config.max_tool_result_bytes),
+                        tool_call_limit_reached = false,
+                        tool_calls_used = *tool_calls_used,
+                        total_tool_calls_used = *tool_calls_used,
+                        max_tool_calls = config.max_tool_calls,
+                        batch_index = batch.map(|(index, _)| index),
+                        batch_count = batch.map(|(_, count)| count),
+                        "AI review context tool result returned"
+                    );
+                    result
+                } else {
+                    tool_call_limit_notice_sent = true;
+                    let result = context_tool_call_limit_result(config);
+                    warn!(
+                        ai_review_id = %config.id,
+                        model = %config.model,
+                        tool_name,
+                        tool_call_id = %tool_call_id,
+                        arguments_summary = %arguments_summary,
+                        result_bytes = tool_result_bytes(&result),
+                        result_truncated = tool_result_truncated(&result),
+                        result_limit_reached = tool_result_limit_reached(&result, config.max_tool_result_bytes),
+                        tool_call_limit_reached = true,
+                        tool_calls_used = *tool_calls_used,
+                        total_tool_calls_used = *tool_calls_used,
+                        max_tool_calls = config.max_tool_calls,
+                        batch_index = batch.map(|(index, _)| index),
+                        batch_count = batch.map(|(_, count)| count),
+                        "AI review context tool call skipped because limit was reached"
+                    );
+                    result
+                };
+                messages.push(ChatMessage {
+                    role: "tool".into(),
+                    content: Some(result),
+                    tool_call_id: Some(tool_call_id),
+                    tool_calls: None,
+                });
+            }
         }
 
         let request_body =
@@ -1971,12 +2002,95 @@ mod tests {
             diff: "@@ -1 +1 @@\n+panic!();\n".into(),
         }];
 
-        let findings = run_ai_review(&config, &changes).await.unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let findings =
+            run_ai_review_execution_with_context(&config, &changes, Some(source.path()), None)
+                .await
+                .result
+                .unwrap();
 
         assert!(findings.is_empty());
         assert_eq!(request_count.load(Ordering::SeqCst), 2);
         assert_eq!(tool_message_count.load(Ordering::SeqCst), 2);
         assert_eq!(limit_result_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn diff_only_review_does_not_echo_or_execute_hallucinated_context_tool_calls() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let invalid_call_leaked = Arc::new(AtomicUsize::new(0));
+        let request_count_for_server = Arc::clone(&request_count);
+        let invalid_call_leaked_for_server = Arc::clone(&invalid_call_leaked);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request_count = Arc::clone(&request_count_for_server);
+                let invalid_call_leaked = Arc::clone(&invalid_call_leaked_for_server);
+                tokio::spawn(async move {
+                    let request_index = request_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    let request = read_http_json_request(&mut stream).await;
+                    let tool_names = request["tools"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|tool| tool["function"]["name"].as_str().unwrap())
+                        .collect::<Vec<_>>();
+                    assert_eq!(tool_names, vec!["submit_review_findings"]);
+                    let body = if request_index == 1 {
+                        r#"{"choices":[{"message":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"src/lib.rs\"}"}}]}}]}"#
+                    } else {
+                        let leaked =
+                            request["messages"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .any(|message| {
+                                    message["role"] == "tool"
+                                        || message["tool_calls"].as_array().is_some_and(|calls| {
+                                            calls.iter().any(|call| {
+                                                matches!(
+                                                    call["function"]["name"].as_str(),
+                                                    Some(
+                                                        "read_file" | "search_code" | "list_files"
+                                                    )
+                                                )
+                                            })
+                                        })
+                                });
+                        invalid_call_leaked.store(usize::from(leaked), Ordering::SeqCst);
+                        r#"{"choices":[{"message":{"tool_calls":[{"id":"submit_1","type":"function","function":{"name":"submit_review_findings","arguments":"{\"findings\":[]}"}}]}}]}"#
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    stream.write_all(body.as_bytes()).await.unwrap();
+                });
+            }
+        });
+
+        let config = AiReviewConfig {
+            base_url: format!("http://{}", addr),
+            ..test_ai_review_config()
+        };
+        let changes = vec![GitLabChange {
+            old_path: "src/lib.rs".into(),
+            new_path: "src/lib.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "@@ -1 +1 @@\n+panic!();\n".into(),
+        }];
+
+        let execution = run_ai_review_execution_with_context(&config, &changes, None, None).await;
+
+        assert!(execution.result.unwrap().is_empty());
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        assert_eq!(invalid_call_leaked.load(Ordering::SeqCst), 0);
+        assert_eq!(execution.coverage.unwrap().tool_calls_used, 0);
     }
 
     #[tokio::test]
@@ -2050,7 +2164,12 @@ mod tests {
             diff: "@@ -1 +1 @@\n+panic!();\n".into(),
         }];
 
-        let findings = run_ai_review(&config, &changes).await.unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let findings =
+            run_ai_review_execution_with_context(&config, &changes, Some(source.path()), None)
+                .await
+                .result
+                .unwrap();
 
         assert!(findings.is_empty());
         assert_eq!(request_count.load(Ordering::SeqCst), 3);

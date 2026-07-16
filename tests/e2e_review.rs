@@ -1430,7 +1430,12 @@ async fn ai_review_synthesizes_matching_ids_for_empty_context_tool_calls() {
         diff: "@@ -1 +1 @@\n+panic!();\n".into(),
     }];
 
-    let findings = run_ai_review(&config, &changes).await.unwrap();
+    let source = tempfile::tempdir().unwrap();
+    let findings =
+        run_ai_review_execution_with_context(&config, &changes, Some(source.path()), None)
+            .await
+            .result
+            .unwrap();
 
     assert!(findings.is_empty());
     assert_eq!(ai_request_count.load(Ordering::SeqCst), 2);
@@ -1636,7 +1641,7 @@ async fn archive_limit_falls_back_to_diff_only_ai_review_without_retrying_second
             post(move |body: Bytes| {
                 let ai_request_count = Arc::clone(&ai_request_count_for_handler);
                 async move {
-                    ai_request_count.fetch_add(1, Ordering::SeqCst);
+                    let attempt = ai_request_count.fetch_add(1, Ordering::SeqCst) + 1;
                     let body: Value = serde_json::from_slice(&body).unwrap();
                     let tool_names: Vec<_> = body["tools"]
                         .as_array()
@@ -1650,6 +1655,33 @@ async fn archive_limit_falls_back_to_diff_only_ai_review_without_retrying_second
                         .unwrap()
                         .iter()
                         .all(|message| message["role"] != "tool"));
+                    if attempt % 2 == 1 {
+                        return Json(json!({
+                            "choices": [{
+                                "message": {
+                                    "content": "",
+                                    "tool_calls": [{
+                                        "id": "hallucinated-read",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "read_file",
+                                            "arguments": "{\"path\":\"src/lib.rs\"}"
+                                        }
+                                    }]
+                                }
+                            }]
+                        }));
+                    }
+                    assert!(body["messages"].as_array().unwrap().iter().all(|message| {
+                        message["tool_calls"].as_array().is_none_or(|calls| {
+                            calls.iter().all(|call| {
+                                !matches!(
+                                    call["function"]["name"].as_str(),
+                                    Some("read_file" | "search_code" | "list_files")
+                                )
+                            })
+                        })
+                    }));
                     Json(json!({
                         "choices": [{
                             "message": {
@@ -1696,7 +1728,7 @@ second_pass_on_clean = true
         .unwrap();
 
     assert_eq!(archive_request_count.load(Ordering::SeqCst), 1);
-    assert_eq!(ai_request_count.load(Ordering::SeqCst), 2);
+    assert_eq!(ai_request_count.load(Ordering::SeqCst), 4);
     assert_eq!(summary.findings, 0);
     assert_eq!(summary.comments, 0);
 }

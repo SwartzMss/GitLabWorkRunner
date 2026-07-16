@@ -994,7 +994,7 @@ impl ReviewService {
                 warn!(
                     project_id = event.project_id,
                     mr_iid = event.mr_iid,
-                    commit_sha = archive_sha,
+                    commit = %event.commit_sha,
                     ai_review_id = %review.id,
                     error_code,
                     error = %err,
