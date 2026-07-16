@@ -171,7 +171,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       projects: ["项目", "按 GitLab 项目汇总的 Review 活动"],
       mrs: ["合并请求", "按合并请求汇总的 Review 活动"],
       runs: ["Review 运行", "手动 Review 执行与任务结果"],
-      findings: ["问题", "AI 与脚本解析出的结果"],
+      findings: ["问题", "AI Review 解析出的结果"],
       system: ["系统", "仪表盘服务与存储状态"]
     };
     const json = async (url) => {
@@ -225,7 +225,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       ai_request_timeout: "AI 请求超时", ai_request_failed: "AI 请求失败",
       ai_tool_loop_timeout: "AI 工具循环超时", ai_response_parse_failed: "AI 响应解析失败",
       review_run_timeout: "Review 整体超时", gitlab_comment_failed: "GitLab 发布失败", permission_denied: "权限不足",
-      invalid_configuration: "配置无效", script_task_failed: "脚本任务失败", internal: "内部错误"
+      invalid_configuration: "配置无效", internal: "内部错误"
     }[code] || code || "未分类错误");
     const renderFailure = (failure) => failure ? `<div class="failure"><div><span class="badge failed">${esc(errorCodeText(failure.code))}</span>${failure.code ? ` <code>${esc(failure.code)}</code>` : ""}</div><pre class="failure-message">${esc(failure.message || "-")}</pre></div>` : "";
 
@@ -471,6 +471,13 @@ mod tests {
         assert!(!DASHBOARD_HTML.contains("renderCommentsPage"));
         assert!(!DASHBOARD_HTML.contains("/api/comments"));
         assert!(!DASHBOARD_HTML.contains("评论"));
+    }
+
+    #[test]
+    fn dashboard_copy_is_ai_review_only() {
+        assert!(DASHBOARD_HTML.contains("AI Review 解析出的结果"));
+        assert!(!DASHBOARD_HTML.contains("AI 与脚本解析出的结果"));
+        assert!(!DASHBOARD_HTML.contains("script_task_failed"));
     }
 
     #[test]

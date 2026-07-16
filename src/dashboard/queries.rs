@@ -59,7 +59,6 @@ pub struct DashboardRun {
     pub note_id: Option<i64>,
     pub requested_ids_json: String,
     pub selected_ai_reviews: i64,
-    pub selected_script_tasks: i64,
     pub status: String,
     pub findings: i64,
     pub comments: i64,
@@ -357,7 +356,7 @@ from review_findings
 select
     rr.review_run_id, rr.trigger_type, rr.project_id, rr.mr_iid, rr.commit_sha, rr.note_id, rr.requested_ids_json,
     coalesce(nullif(rr.project_path_with_namespace, ''), nullif(rr.project_name, ''), '#' || rr.project_id) as project_label,
-    rr.selected_ai_reviews, rr.selected_script_tasks,
+    rr.selected_ai_reviews,
     case
         when rr.status = 'running' then 'running'
         when rr.status = 'completed'
@@ -391,7 +390,7 @@ where 1 = 1
 select
     rr.review_run_id, rr.trigger_type, rr.project_id, rr.mr_iid, rr.commit_sha, rr.note_id, rr.requested_ids_json,
     coalesce(nullif(rr.project_path_with_namespace, ''), nullif(rr.project_name, ''), '#' || rr.project_id) as project_label,
-    rr.selected_ai_reviews, rr.selected_script_tasks,
+    rr.selected_ai_reviews,
     case
         when rr.status = 'running' then 'running'
         when rr.status = 'completed'
@@ -849,7 +848,6 @@ fn row_to_run(row: SqliteRow) -> DashboardRun {
         note_id: row.get("note_id"),
         requested_ids_json: row.get("requested_ids_json"),
         selected_ai_reviews: row.get("selected_ai_reviews"),
-        selected_script_tasks: row.get("selected_script_tasks"),
         status: row.get("status"),
         findings: row.get("findings"),
         comments: row.get("comments"),
@@ -900,6 +898,49 @@ fn row_to_comment(row: SqliteRow) -> DashboardComment {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn run_detail_reads_legacy_request_with_selected_script_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let database_url = format!("sqlite://{}", dir.path().join("state.db").display());
+        let state_store = crate::storage::StateStore::connect(&database_url)
+            .await
+            .unwrap();
+        state_store.migrate().await.unwrap();
+        drop(state_store);
+        let write_pool = SqlitePool::connect(&database_url).await.unwrap();
+        sqlx::query(
+            r#"
+insert into review_requests
+(review_run_id, trigger_type, project_id, mr_iid, commit_sha, requested_ids_json,
+ selected_ai_reviews, selected_script_tasks, status, findings, comments, timezone, started_at)
+values ('legacy-run', 'manual_note', 1, 2, 'abc', '["legacy-script"]',
+        1, 2, 'completed', 0, 0, 'UTC', '2025-01-01T00:00:00Z')
+"#,
+        )
+        .execute(&write_pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+insert into review_task_runs
+(review_run_id, task_type, task_id, title, status, findings, comments, started_at, finished_at)
+values ('legacy-run', 'script_task', 'legacy-script', 'Legacy Script', 'completed', 0, 0,
+        '2025-01-01T00:00:00Z', '2025-01-01T00:00:01Z')
+"#,
+        )
+        .execute(&write_pool)
+        .await
+        .unwrap();
+        write_pool.close().await;
+        let store = DashboardStore::connect(&database_url).await.unwrap();
+
+        let detail = store.run_detail("legacy-run").await.unwrap().unwrap();
+
+        assert_eq!(detail.run.review_run_id, "legacy-run");
+        assert_eq!(detail.tasks.len(), 1);
+        assert_eq!(detail.tasks[0].task_type, "script_task");
+    }
 
     #[test]
     fn error_preview_is_utf8_safe_and_limited_to_four_kibibytes() {

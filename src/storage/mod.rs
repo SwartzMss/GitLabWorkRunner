@@ -26,7 +26,6 @@ pub struct ReviewRequestStart<'a> {
     pub note_id: Option<i64>,
     pub requested_ids_json: &'a str,
     pub selected_ai_reviews: usize,
-    pub selected_script_tasks: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -321,7 +320,7 @@ on conflict(review_run_id) do update set
         .bind(request.note_id)
         .bind(request.requested_ids_json)
         .bind(request.selected_ai_reviews as i64)
-        .bind(request.selected_script_tasks as i64)
+        .bind(0_i64)
         .bind(REVIEW_TIMEZONE)
         .bind(&now)
         .execute(&self.pool)
@@ -590,7 +589,6 @@ mod tests {
                 note_id: Some(9),
                 requested_ids_json: r#"["ai-review"]"#,
                 selected_ai_reviews: 1,
-                selected_script_tasks: 0,
             })
             .await
             .unwrap();
@@ -607,6 +605,14 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(count, 1);
+        let selected_script_tasks: i64 = sqlx::query_scalar(
+            "select selected_script_tasks from review_requests where review_run_id = ?",
+        )
+        .bind("rr-1")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(selected_script_tasks, 0);
     }
 
     #[tokio::test]
@@ -625,7 +631,6 @@ mod tests {
                 note_id: None,
                 requested_ids_json: "[]",
                 selected_ai_reviews: 1,
-                selected_script_tasks: 0,
             })
             .await
             .unwrap();

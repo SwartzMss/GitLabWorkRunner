@@ -146,7 +146,6 @@ impl ReviewService {
                 note_id: Some(event.note_id),
                 requested_ids_json: &requested_ids_json,
                 selected_ai_reviews: ai_reviews.len(),
-                selected_script_tasks: 0,
             })
             .await?;
 

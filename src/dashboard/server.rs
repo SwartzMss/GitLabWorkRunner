@@ -184,7 +184,6 @@ mod tests {
                 note_id: Some(987),
                 requested_ids_json: r#"["ai-review"]"#,
                 selected_ai_reviews: 1,
-                selected_script_tasks: 0,
             })
             .await
             .unwrap();
@@ -303,7 +302,6 @@ mod tests {
                 note_id: None,
                 requested_ids_json: "[]",
                 selected_ai_reviews: 1,
-                selected_script_tasks: 0,
             })
             .await
             .unwrap();
@@ -391,7 +389,6 @@ mod tests {
                 note_id: Some(987),
                 requested_ids_json: r#"["ai-review"]"#,
                 selected_ai_reviews: 1,
-                selected_script_tasks: 0,
             })
             .await
             .unwrap();
@@ -440,7 +437,6 @@ mod tests {
                 note_id: Some(654),
                 requested_ids_json: r#"["ai-review"]"#,
                 selected_ai_reviews: 1,
-                selected_script_tasks: 0,
             })
             .await
             .unwrap();
@@ -506,7 +502,6 @@ mod tests {
                 note_id: Some(987),
                 requested_ids_json: r#"["ai-review","strict-ai-review"]"#,
                 selected_ai_reviews: 2,
-                selected_script_tasks: 0,
             })
             .await
             .unwrap();
@@ -634,7 +629,6 @@ mod tests {
                 note_id: Some(987),
                 requested_ids_json: r#"["ai-review"]"#,
                 selected_ai_reviews: 1,
-                selected_script_tasks: 0,
             })
             .await
             .unwrap();
