@@ -161,4 +161,5 @@ jobs:
           else
             notes_arg=(--notes "Windows and Ubuntu x86-64 release for $version.")
           fi
+          gh release delete "$version" --repo "$GITHUB_REPOSITORY" --yes || true
           gh release create "$version" dist/* --repo "$GITHUB_REPOSITORY" --title "$version" "${notes_arg[@]}" --verify-tag
