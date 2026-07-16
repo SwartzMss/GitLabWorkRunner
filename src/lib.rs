@@ -28,10 +28,6 @@ pub mod rules {
     pub use crate::review::rules::*;
 }
 
-pub mod script_tasks {
-    pub use crate::review::scripts::*;
-}
-
 pub mod server {
     pub use crate::app::server::*;
 }

@@ -10,7 +10,7 @@ use crate::{
         notifier::{ReviewFailureNotification, ReviewNotifier},
         work_cleanup::{cleanup_stale_review_work, spawn_periodic_stale_review_work_cleanup},
     },
-    review::{service::manual_script_task_ids, ReviewService},
+    review::{service::manual_review_ids, ReviewService},
     rules::Ruleset,
     storage::StateStore,
     webhook::{parse_gitlab_webhook_event, validate_token, GitLabWebhookEvent},
@@ -168,7 +168,6 @@ async fn gitlab_webhook(
         review_run_id = %review_run_id,
         rules_file = %state.config.rules.file,
         ruleset_hash = %ruleset.hash(),
-        script_tasks = ruleset.script_task_count(),
         ai_reviews = ruleset.ai_review_count(),
         "ruleset loaded"
     );
@@ -428,10 +427,8 @@ fn event_requests_review(event: &GitLabWebhookEvent, ruleset: &Ruleset) -> bool 
             if !event.is_create_action() {
                 return false;
             }
-            let requested_ids = manual_script_task_ids(&event.note);
-            !requested_ids.is_empty()
-                && (!ruleset.script_tasks_by_ids(&requested_ids).is_empty()
-                    || !ruleset.ai_reviews_by_ids(&requested_ids).is_empty())
+            let requested_ids = manual_review_ids(&event.note);
+            !requested_ids.is_empty() && !ruleset.ai_reviews_by_ids(&requested_ids).is_empty()
         }
     }
 }

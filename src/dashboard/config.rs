@@ -33,7 +33,7 @@ mod tests {
             AppConfig, DashboardConfig as AppDashboardConfig, GitLabConfig, LoggingConfig,
             RulesConfig, ServerConfig, StorageConfig,
         },
-        review::scripts::ArchiveLimits,
+        review::archive::ArchiveLimits,
     };
 
     #[test]

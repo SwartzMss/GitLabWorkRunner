@@ -1,5 +1,5 @@
 use crate::error::{AppError, AppResult};
-use crate::review::scripts::ArchiveLimits;
+use crate::review::archive::ArchiveLimits;
 use serde::Deserialize;
 use std::{fs, path::Path};
 

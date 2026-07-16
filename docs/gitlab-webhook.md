@@ -109,29 +109,15 @@ object_attributes.noteable_type = "MergeRequest"
 - AI Review 手动触发按 `[[ai_reviews]].id` 精确匹配。
 - 同一个 commit 完成后可以再次触发。
 - 但同一个 `project_id + mr_iid + commit_sha` 如果仍在执行中，新的触发会被跳过；服务会给触发评论加 `eyes`，并回复一条 MR 评论提示当前 commit 已有 review 正在执行，请稍后再试。
-- 如果评论里没有合法脚本任务或 AI Review 命令，或 `@id` 不存在，服务只记录日志并返回 accepted。
+- 如果评论里没有合法 AI Review 命令，或 `@id` 不存在，服务只记录日志并返回 accepted。
 - issue、wiki、work item 等非 MR 评论会被忽略。
 
 权限边界：
 
 - Webhook 只负责把 MR 评论事件发给服务，不代表评论人一定有执行任务的额外权限。
 - 当前实现不会额外查询或校验评论人的 GitLab 角色。
-- 只要用户能在 MR 评论，并且评论内容包含合法的 `@id`，服务就会执行对应手动任务。
+- 只要用户能在 MR 评论，并且评论内容包含合法的 `@id`，服务就会执行对应 AI Review。
 - 如果需要限制只有 Maintainer 或指定用户可以手动触发，需要在服务侧增加评论人权限校验或 allowlist。
-
-如果确实需要可选脚本任务，也可以把高成本或低频脚本配置为：
-
-```toml
-[[script_tasks]]
-id = "check-todo-tbd"
-title = "TODO/TBD marker check"
-command = "python examples/scripts/check_todo_tbd.py"
-timeout_seconds = 30
-```
-
-平时 MR 更新不会自动执行；需要时在 MR 评论区发送 `@check-todo-tbd` 即可。
-
-脚本任务的手动触发规则和 AI Review 类似：只按 `@id` 精确匹配 `[[script_tasks]].id`。如果同一条评论同时包含脚本任务和 AI Review 的合法命令，服务会分别执行匹配项。
 
 ## 当前服务的处理流程
 
@@ -141,11 +127,11 @@ timeout_seconds = 30
 2. 解析 payload，确认是 `object_kind = "merge_request"` 或 MR `object_kind = "note"`。
 3. 对 MR event，记录项目、MR、commit 和分支信息后返回 ignored，reason 为 `merge_request_events_manual_triggers_only`。
 4. 对 MR comment event，提取 `project_id`、`mr_iid`、`last_commit.id` 和评论正文。
-5. 解析评论正文中的 `@id`，匹配脚本任务和 AI Review。
+5. 解析评论正文中的 `@id`，匹配 `[[ai_reviews]].id`。
 6. 对实际会执行 review 的事件，先登记运行中 key：`project_id + mr_iid + commit_sha`。
 7. 如果同一个 key 已经在运行中，跳过本次 review；MR comment 触发时会加 `eyes` 并发布提示评论。
 8. 通过 GitLab API 拉取 MR changes。
-9. 执行手动匹配到的脚本任务和 AI Review。
+9. 执行手动匹配到的 AI Review。
 10. 发布 GitLab MR Discussion。
 11. review 完成或失败后，释放运行中 key；因此同一个 commit 完成后可以再次手动触发。
 

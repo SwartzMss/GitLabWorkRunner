@@ -171,7 +171,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       projects: ["项目", "按 GitLab 项目汇总的 Review 活动"],
       mrs: ["合并请求", "按合并请求汇总的 Review 活动"],
       runs: ["Review 运行", "手动 Review 执行与任务结果"],
-      findings: ["问题", "AI 与脚本解析出的结果"],
+      findings: ["问题", "AI Review 解析出的结果"],
       system: ["系统", "仪表盘服务与存储状态"]
     };
     const json = async (url) => {
@@ -225,13 +225,18 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       ai_request_timeout: "AI 请求超时", ai_request_failed: "AI 请求失败",
       ai_tool_loop_timeout: "AI 工具循环超时", ai_response_parse_failed: "AI 响应解析失败",
       review_run_timeout: "Review 整体超时", gitlab_comment_failed: "GitLab 发布失败", permission_denied: "权限不足",
-      invalid_configuration: "配置无效", script_task_failed: "脚本任务失败", internal: "内部错误"
+      invalid_configuration: "配置无效", internal: "内部错误"
     }[code] || code || "未分类错误");
     const renderFailure = (failure) => failure ? `<div class="failure"><div><span class="badge failed">${esc(errorCodeText(failure.code))}</span>${failure.code ? ` <code>${esc(failure.code)}</code>` : ""}</div><pre class="failure-message">${esc(failure.message || "-")}</pre></div>` : "";
 
     function renderTaskCoverage(task) {
       if (task.coverage_total_files == null) {
-        return `<div class="detail-list"><div class="detail-row"><span>覆盖情况</span><span></span></div></div>`;
+        const failure = renderFailure(task.error ? { code: task.error_code, message: task.error } : null);
+        return `<div class="detail-list">
+          <div class="detail-row"><span>任务</span><span>${esc(task.title)}</span></div>
+          <div class="detail-row"><span>状态</span><span>${badge(task.status)}</span></div>
+          <div class="detail-row"><span>问题</span><span>${esc(task.findings ?? 0)}</span></div>
+        </div>${failure}`;
       }
       const batchStats = `${task.coverage_completed_batches ?? 0} 已用 / ${fmtLimit(task.coverage_max_batches)} 上限`;
       const toolCallStats = `${task.tool_calls_used ?? 0} 单批峰值 / ${fmtLimit(task.max_tool_calls)} 每批上限`;
@@ -474,6 +479,13 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_copy_is_ai_review_only() {
+        assert!(DASHBOARD_HTML.contains("AI Review 解析出的结果"));
+        assert!(!DASHBOARD_HTML.contains("AI 与脚本解析出的结果"));
+        assert!(!DASHBOARD_HTML.contains("script_task_failed"));
+    }
+
+    #[test]
     fn run_detail_shows_ai_review_coverage_without_comments() {
         assert!(DASHBOARD_HTML.contains("detail.findings"));
         assert!(DASHBOARD_HTML.contains("detail.tasks"));
@@ -482,6 +494,29 @@ mod tests {
         assert!(DASHBOARD_HTML.contains("达到批次上限"));
         assert!(DASHBOARD_HTML.contains("单文件 Diff 超过批次限制"));
         assert!(DASHBOARD_HTML.contains("批次执行失败"));
+    }
+
+    #[test]
+    fn run_detail_renders_generic_summary_for_legacy_task_without_coverage() {
+        let legacy_task = serde_json::json!({
+            "title": "Historical Task",
+            "status": "failed",
+            "findings": 3,
+            "error_code": null,
+            "error": "legacy failure",
+            "coverage_total_files": null
+        });
+
+        assert_eq!(legacy_task["coverage_total_files"], serde_json::Value::Null);
+        assert!(DASHBOARD_HTML.contains("${esc(task.title)}"));
+        assert!(DASHBOARD_HTML.contains("${badge(task.status)}"));
+        assert!(DASHBOARD_HTML.contains("${esc(task.findings ?? 0)}"));
+        assert!(DASHBOARD_HTML.contains(
+            "renderFailure(task.error ? { code: task.error_code, message: task.error } : null)"
+        ));
+        assert!(!DASHBOARD_HTML.contains(
+            r#"return `<div class="detail-list"><div class="detail-row"><span>覆盖情况</span><span></span></div></div>`;"#
+        ));
     }
 
     #[test]
