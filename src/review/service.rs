@@ -1031,8 +1031,13 @@ impl ReviewService {
             fs::remove_dir_all(&work_dir)?;
         }
         let source_dir = work_dir.join("source");
-        fs::create_dir_all(&source_dir)?;
-        let extracted_files = extract_zip_archive(&archive, &source_dir, &self.archive_limits)?;
+        let context = AiReviewContextWorkDir {
+            work_dir,
+            source_dir,
+        };
+        fs::create_dir_all(&context.source_dir)?;
+        let extracted_files =
+            extract_zip_archive(&archive, &context.source_dir, &self.archive_limits)?;
         info!(
             project_id = event.project_id,
             mr_iid = event.mr_iid,
@@ -1040,13 +1045,10 @@ impl ReviewService {
             ai_review_id = %review.id,
             archive_bytes = archive.len(),
             extracted_files,
-            source_dir = %source_dir.display(),
+            source_dir = %context.source_dir.display(),
             "AI review context archive extracted"
         );
-        Ok(AiReviewContextWorkDir {
-            work_dir,
-            source_dir,
-        })
+        Ok(context)
     }
 }
 
@@ -1273,6 +1275,98 @@ fn is_archive_limit_error(error: &AppError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{routing::get, Router};
+    use std::io::Write;
+    use tokio::net::TcpListener;
+    use zip::{write::SimpleFileOptions, ZipWriter};
+
+    fn archive_with_two_files() -> Vec<u8> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = ZipWriter::new(&mut bytes);
+            zip.start_file("repo-head/first.rs", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"first\n").unwrap();
+            zip.start_file("repo-head/second.rs", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"second\n").unwrap();
+            zip.finish().unwrap();
+        }
+        bytes.into_inner()
+    }
+
+    #[tokio::test]
+    async fn extraction_limit_fallback_removes_partially_extracted_work_dir() {
+        let archive = archive_with_two_files();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/api/v4/projects/1/repository/archive.zip",
+                    get(move || async move { archive.clone() }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let store = StateStore::connect("sqlite::memory:").await.unwrap();
+        store.migrate().await.unwrap();
+        let mut limits = ArchiveLimits::default();
+        limits.max_extracted_files = 1;
+        let run_id = format!("cleanup-regression-{}", std::process::id());
+        let service = ReviewService::new(
+            GitLabClient::new(format!("http://{addr}"), "token".into()),
+            store,
+            Ruleset::from_toml("").unwrap(),
+        )
+        .with_review_run_id(run_id.clone())
+        .with_archive_limits(limits);
+        let review = AiReviewConfig {
+            id: "cleanup-review".into(),
+            title: "Cleanup Review".into(),
+            base_url: "http://127.0.0.1".into(),
+            api_key: "key".into(),
+            model: "model".into(),
+            timeout_seconds: 1,
+            request_timeout_seconds: None,
+            second_pass_on_clean: false,
+            max_batch_diff_bytes: 1,
+            max_batches: 1,
+            extra_instructions: String::new(),
+            max_tool_calls: 1,
+            max_tool_result_bytes: 1,
+        };
+        let event = MergeRequestEvent {
+            project_id: 1,
+            project_name: None,
+            project_path_with_namespace: None,
+            mr_iid: 2,
+            commit_sha: "event-head".into(),
+            action: "test".into(),
+            source_branch: String::new(),
+            target_branch: String::new(),
+        };
+        let changes = crate::gitlab::MergeRequestChanges {
+            changes: Vec::new(),
+            diff_refs: crate::gitlab::DiffRefs {
+                base_sha: Some("base".into()),
+                start_sha: Some("start".into()),
+                head_sha: Some("archive-head".into()),
+            },
+        };
+        let work_dir =
+            ai_review_context_work_dir(1, 2, "archive-head", &review.id, Some(&run_id)).unwrap();
+
+        let context = service
+            .prepare_ai_review_context(&review, &changes, &event)
+            .await
+            .unwrap();
+
+        assert!(context.is_none());
+        assert!(!work_dir.exists());
+    }
 
     #[test]
     fn archive_limit_error_is_eligible_for_diff_only_fallback() {
