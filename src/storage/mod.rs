@@ -50,6 +50,18 @@ pub struct TaskRunFinish<'a> {
 }
 
 #[derive(Clone, Debug)]
+pub struct TaskRunProgress<'a> {
+    pub review_run_id: &'a str,
+    pub task_type: &'a str,
+    pub task_id: &'a str,
+    pub phase: &'a str,
+    pub message: &'a str,
+    pub current: Option<usize>,
+    pub total: Option<usize>,
+    pub unit: Option<&'a str>,
+}
+
+#[derive(Clone, Debug)]
 pub struct StoredReviewCoverage {
     pub total_files: usize,
     pub fully_reviewed_files: usize,
@@ -185,6 +197,8 @@ create table if not exists review_task_runs (
         self.ensure_column("review_task_runs", "fallback_elapsed_ms", "integer")
             .await?;
         for column in [
+            "progress_current",
+            "progress_total",
             "coverage_total_files",
             "coverage_fully_reviewed_files",
             "coverage_partially_reviewed_files",
@@ -200,6 +214,15 @@ create table if not exists review_task_runs (
             "coverage_complete",
         ] {
             self.ensure_column("review_task_runs", column, "integer")
+                .await?;
+        }
+        for column in [
+            "progress_phase",
+            "progress_message",
+            "progress_unit",
+            "progress_updated_at",
+        ] {
+            self.ensure_column("review_task_runs", column, "text")
                 .await?;
         }
         sqlx::query(
@@ -409,6 +432,12 @@ on conflict(review_run_id, task_type, task_id) do update set
     status = 'running',
     error_code = null,
     error = null,
+    progress_phase = null,
+    progress_message = null,
+    progress_current = null,
+    progress_total = null,
+    progress_unit = null,
+    progress_updated_at = null,
     finished_at = null
 "#,
         )
@@ -440,6 +469,30 @@ where review_run_id = ? and task_type = ? and task_id = ?
         .bind(task.review_run_id)
         .bind(task.task_type)
         .bind(task.task_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn update_task_progress(&self, progress: &TaskRunProgress<'_>) -> AppResult<()> {
+        let now = now_rfc3339();
+        sqlx::query(
+            r#"
+update review_task_runs
+set progress_phase = ?, progress_message = ?, progress_current = ?, progress_total = ?,
+    progress_unit = ?, progress_updated_at = ?
+where review_run_id = ? and task_type = ? and task_id = ?
+"#,
+        )
+        .bind(progress.phase)
+        .bind(progress.message)
+        .bind(progress.current.map(|value| value as i64))
+        .bind(progress.total.map(|value| value as i64))
+        .bind(progress.unit)
+        .bind(&now)
+        .bind(progress.review_run_id)
+        .bind(progress.task_type)
+        .bind(progress.task_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -694,6 +747,52 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(selected_script_tasks, 0);
+    }
+
+    #[tokio::test]
+    async fn records_task_progress() {
+        let store = StateStore::connect("sqlite::memory:").await.unwrap();
+        store.migrate().await.unwrap();
+        store
+            .start_task_run(&TaskRunStart {
+                review_run_id: "rr-progress",
+                task_type: "ai_review",
+                task_id: "ai-review",
+                title: "AI Review",
+            })
+            .await
+            .unwrap();
+
+        store
+            .update_task_progress(&TaskRunProgress {
+                review_run_id: "rr-progress",
+                task_type: "ai_review",
+                task_id: "ai-review",
+                phase: "reviewing_batch",
+                message: "正在审查第 2 / 5 个批次",
+                current: Some(2),
+                total: Some(5),
+                unit: Some("batch"),
+            })
+            .await
+            .unwrap();
+
+        let row = sqlx::query(
+            "select progress_phase, progress_message, progress_current, progress_total, progress_unit, progress_updated_at from review_task_runs where review_run_id = ?",
+        )
+        .bind("rr-progress")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<String, _>("progress_phase"), "reviewing_batch");
+        assert_eq!(
+            row.get::<String, _>("progress_message"),
+            "正在审查第 2 / 5 个批次"
+        );
+        assert_eq!(row.get::<i64, _>("progress_current"), 2);
+        assert_eq!(row.get::<i64, _>("progress_total"), 5);
+        assert_eq!(row.get::<String, _>("progress_unit"), "batch");
+        assert!(!row.get::<String, _>("progress_updated_at").is_empty());
     }
 
     #[tokio::test]

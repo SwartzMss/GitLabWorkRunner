@@ -9,6 +9,7 @@ use std::{
     path::Path,
     time::{Duration, Instant},
 };
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::{
@@ -118,6 +119,15 @@ pub struct AiReviewExecution {
     pub incomplete_files: Vec<ReviewCoverageFile>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AiReviewProgress {
+    pub phase: &'static str,
+    pub message: String,
+    pub current: Option<usize>,
+    pub total: Option<usize>,
+    pub unit: Option<&'static str>,
+}
+
 #[derive(Clone, Debug)]
 struct AiReviewBatchPlan {
     batches: Vec<Vec<GitLabChange>>,
@@ -172,12 +182,32 @@ pub(crate) async fn run_ai_review_execution_with_runtime_instruction(
     review_request: Option<&str>,
     trusted_runtime_instruction: Option<&str>,
 ) -> AiReviewExecution {
+    run_ai_review_execution_with_runtime_instruction_and_progress(
+        config,
+        changes,
+        source_dir,
+        review_request,
+        trusted_runtime_instruction,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn run_ai_review_execution_with_runtime_instruction_and_progress(
+    config: &AiReviewConfig,
+    changes: &[GitLabChange],
+    source_dir: Option<&Path>,
+    review_request: Option<&str>,
+    trusted_runtime_instruction: Option<&str>,
+    progress: Option<mpsc::UnboundedSender<AiReviewProgress>>,
+) -> AiReviewExecution {
     run_batched_ai_review(
         config,
         changes,
         source_dir,
         review_request,
         trusted_runtime_instruction,
+        progress,
     )
     .await
 }
@@ -483,6 +513,7 @@ async fn run_batched_ai_review(
     source_dir: Option<&Path>,
     review_request: Option<&str>,
     trusted_runtime_instruction: Option<&str>,
+    progress: Option<mpsc::UnboundedSender<AiReviewProgress>>,
 ) -> AiReviewExecution {
     let deadline = Instant::now() + Duration::from_secs(config.timeout_seconds.max(1));
     let mut plan = plan_ai_review_batches(
@@ -510,8 +541,28 @@ async fn run_batched_ai_review(
     let mut all_findings = Vec::new();
     let mut max_tool_calls_used_in_batch = 0_usize;
     let batch_count = batches.len();
+    send_ai_progress(
+        &progress,
+        AiReviewProgress {
+            phase: "planning_batches",
+            message: format!("已规划 {batch_count} 个审查批次"),
+            current: Some(0),
+            total: Some(batch_count),
+            unit: Some("batch"),
+        },
+    );
     for (index, batch) in batches.iter().enumerate() {
         let batch_index = index + 1;
+        send_ai_progress(
+            &progress,
+            AiReviewProgress {
+                phase: "reviewing_batch",
+                message: format!("正在审查第 {batch_index} / {batch_count} 个批次"),
+                current: Some(batch_index),
+                total: Some(batch_count),
+                unit: Some("batch"),
+            },
+        );
         info!(
             ai_review_id = %config.id,
             batch_index,
@@ -544,6 +595,16 @@ async fn run_batched_ai_review(
                     max_tool_calls_used_in_batch.max(batch_result.tool_calls_used);
                 all_findings.append(&mut batch_result.findings);
                 plan.coverage.completed_batches += 1;
+                send_ai_progress(
+                    &progress,
+                    AiReviewProgress {
+                        phase: "reviewing_batch",
+                        message: format!("已完成第 {batch_index} / {batch_count} 个批次"),
+                        current: Some(batch_index),
+                        total: Some(batch_count),
+                        unit: Some("batch"),
+                    },
+                );
             }
             Err(err) => {
                 plan.coverage.tool_calls_used = max_tool_calls_used_in_batch;
@@ -584,6 +645,15 @@ async fn run_batched_ai_review(
         result: Ok(all_findings),
         coverage: Some(plan.coverage),
         incomplete_files: plan.incomplete_files,
+    }
+}
+
+fn send_ai_progress(
+    progress: &Option<mpsc::UnboundedSender<AiReviewProgress>>,
+    event: AiReviewProgress,
+) {
+    if let Some(progress) = progress {
+        let _ = progress.send(event);
     }
 }
 
@@ -1467,7 +1537,6 @@ mod tests {
             model: "test-model".into(),
             timeout_seconds: 60,
             request_timeout_seconds: None,
-            second_pass_on_clean: false,
             max_batch_diff_bytes: 30_000,
             max_batches: 6,
             extra_instructions: String::new(),

@@ -18,7 +18,6 @@ api_key = "<your-ai-api-key>"
 model = "gpt-4.1-mini"
 timeout_seconds = 2400
 request_timeout_seconds = 420
-second_pass_on_clean = false
 # AI Review requests Chat Completions tool_calls by default and falls back to JSON content parsing when needed.
 # This does not require MCP; findings are read from submit_review_findings arguments when tool_calls are returned.
 max_batch_diff_bytes = 30000

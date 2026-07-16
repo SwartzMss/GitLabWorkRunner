@@ -1,8 +1,8 @@
 use crate::{
     ai_review::{
-        run_ai_review_execution_with_runtime_instruction, timeout_fallback_reason,
+        run_ai_review_execution_with_runtime_instruction_and_progress, timeout_fallback_reason,
         AiReviewExecution, AiReviewExecutionMetadata, AiReviewExecutionMode,
-        AiReviewFallbackReason, ReviewCoverage, ReviewCoverageFile,
+        AiReviewFallbackReason, AiReviewProgress, ReviewCoverage, ReviewCoverageFile,
     },
     comments::{build_comment_drafts, CommentDraft},
     error::{AppError, AppResult, ReviewErrorCode, ReviewFailure},
@@ -11,7 +11,7 @@ use crate::{
     rules::{AiReviewConfig, Finding, Ruleset, Severity},
     storage::{
         ReviewRequestStart, StateStore, StoredComment, StoredFinding, StoredReviewCoverage,
-        StoredReviewCoverageFile, TaskRunFinish, TaskRunStart,
+        StoredReviewCoverageFile, TaskRunFinish, TaskRunProgress, TaskRunStart,
     },
     webhook::{MergeRequestEvent, MergeRequestNoteEvent},
 };
@@ -34,14 +34,12 @@ struct AiReviewExecutionWithMetadata {
 #[derive(Clone, Copy)]
 enum AiReviewContextPass {
     Initial,
-    CleanConfirmation,
 }
 
 impl AiReviewContextPass {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Initial => "initial",
-            Self::CleanConfirmation => "clean_confirmation",
         }
     }
 }
@@ -59,7 +57,6 @@ struct TimeoutFallbackRequest<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TestAiExecutionCall {
     source_available: bool,
-    second_pass_on_clean: bool,
     timeout_seconds: u64,
     max_batches: usize,
     trusted_runtime_instruction: Option<String>,
@@ -400,13 +397,10 @@ impl ReviewService {
                 ai_review_id = %review.id,
                 "AI review started"
             );
+            self.update_ai_task_progress(&review, "started", "AI Review 已开始", None, None, None)
+                .await;
             let execution_with_metadata = self
-                .run_ai_review_with_optional_clean_second_pass(
-                    &review,
-                    changes,
-                    event,
-                    review_request,
-                )
+                .run_ai_review_with_timeout_fallback(&review, changes, event, review_request)
                 .await;
             let execution = execution_with_metadata.execution;
             let metadata = execution_with_metadata.metadata;
@@ -422,10 +416,28 @@ impl ReviewService {
                     summary.findings += review_findings;
                     self.record_findings("ai_review", &review.id, &findings)
                         .await?;
+                    self.update_ai_task_progress(
+                        &review,
+                        "publishing_findings",
+                        &format!("正在发布 {} 条审查评论", findings.len()),
+                        Some(0),
+                        Some(findings.len()),
+                        Some("comment"),
+                    )
+                    .await;
                     let comments = self
                         .publish_line_findings(event, changes, &findings)
                         .await?;
                     summary.comments += comments;
+                    self.update_ai_task_progress(
+                        &review,
+                        "completed",
+                        "AI Review 已完成",
+                        Some(comments),
+                        Some(findings.len()),
+                        Some("comment"),
+                    )
+                    .await;
                     self.finish_ai_task_run(
                         &TaskRunFinish {
                             review_run_id: self.review_run_id(),
@@ -467,6 +479,15 @@ impl ReviewService {
                 }
                 Err(err) => {
                     let failure = failure_for_error(&err, ReviewErrorCode::AiRequestFailed);
+                    self.update_ai_task_progress(
+                        &review,
+                        "failed",
+                        &format!("AI Review 失败: {}", failure.message),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
                     self.finish_ai_task_run(
                         &TaskRunFinish {
                             review_run_id: self.review_run_id(),
@@ -846,7 +867,6 @@ impl ReviewService {
         if let Some(seam) = &self.ai_execution_seam {
             seam.calls.lock().unwrap().push(TestAiExecutionCall {
                 source_available: source_dir.is_some(),
-                second_pass_on_clean: review.second_pass_on_clean,
                 timeout_seconds: review.timeout_seconds,
                 max_batches: review.max_batches,
                 trusted_runtime_instruction: trusted_runtime_instruction.map(str::to_string),
@@ -858,14 +878,91 @@ impl ReviewService {
                 .pop_front()
                 .expect("test AI execution seam exhausted");
         }
-        run_ai_review_execution_with_runtime_instruction(
+        let (progress_tx, mut progress_rx) =
+            tokio::sync::mpsc::unbounded_channel::<AiReviewProgress>();
+        let store = self.store.clone();
+        let review_run_id = self.review_run_id().to_string();
+        let review_id = review.id.clone();
+        let progress_writer = tokio::spawn(async move {
+            while let Some(progress) = progress_rx.recv().await {
+                let stored = TaskRunProgress {
+                    review_run_id: &review_run_id,
+                    task_type: "ai_review",
+                    task_id: &review_id,
+                    phase: progress.phase,
+                    message: &progress.message,
+                    current: progress.current,
+                    total: progress.total,
+                    unit: progress.unit,
+                };
+                if let Err(err) = store.update_task_progress(&stored).await {
+                    warn!(
+                        ai_review_id = %review_id,
+                        error = %err,
+                        "failed to persist AI review progress"
+                    );
+                }
+            }
+        });
+        let phase = if trusted_runtime_instruction.is_some() {
+            "reviewing_fallback"
+        } else if source_dir.is_some() {
+            "reviewing_context"
+        } else {
+            "reviewing_diff"
+        };
+        let message = match phase {
+            "reviewing_context" => "正在使用仓库上下文执行 AI Review",
+            "reviewing_fallback" => "正在使用 diff-only fallback 执行 AI Review",
+            _ => "正在使用 diff 执行 AI Review",
+        };
+        self.update_ai_task_progress(review, phase, message, None, None, None)
+            .await;
+        let execution = run_ai_review_execution_with_runtime_instruction_and_progress(
             review,
             changes,
             source_dir,
             review_request,
             trusted_runtime_instruction,
+            Some(progress_tx),
         )
-        .await
+        .await;
+        if let Err(err) = progress_writer.await {
+            warn!(
+                ai_review_id = %review.id,
+                error = %err,
+                "AI review progress writer task failed"
+            );
+        }
+        execution
+    }
+
+    async fn update_ai_task_progress(
+        &self,
+        review: &AiReviewConfig,
+        phase: &str,
+        message: &str,
+        current: Option<usize>,
+        total: Option<usize>,
+        unit: Option<&str>,
+    ) {
+        let progress = TaskRunProgress {
+            review_run_id: self.review_run_id(),
+            task_type: "ai_review",
+            task_id: &review.id,
+            phase,
+            message,
+            current,
+            total,
+            unit,
+        };
+        if let Err(err) = self.store.update_task_progress(&progress).await {
+            warn!(
+                ai_review_id = %review.id,
+                error = %err,
+                "failed to persist AI review progress"
+            );
+        }
     }
 
     async fn timeout_fallback_for_execution(
@@ -920,11 +1017,9 @@ impl ReviewService {
             "context work directory removed; starting one-shot diff-only AI review fallback"
         );
         let fallback_started = Instant::now();
-        let mut fallback_review = review.clone();
-        fallback_review.second_pass_on_clean = false;
         let fallback = self
             .execute_ai_review(
-                &fallback_review,
+                review,
                 changes,
                 None,
                 review_request,
@@ -986,7 +1081,7 @@ impl ReviewService {
         })
     }
 
-    async fn run_ai_review_with_optional_clean_second_pass(
+    async fn run_ai_review_with_timeout_fallback(
         &self,
         review: &AiReviewConfig,
         changes: &crate::gitlab::MergeRequestChanges,
@@ -1014,7 +1109,7 @@ impl ReviewService {
                     "AI review context archive exceeded limits; continuing with diff-only review"
                 );
                 let fallback_started = Instant::now();
-                let mut execution = self
+                let execution = self
                     .execute_ai_review(
                         review,
                         &changes.changes,
@@ -1023,19 +1118,6 @@ impl ReviewService {
                         Some(ARCHIVE_DIFF_ONLY_INSTRUCTION),
                     )
                     .await;
-                if review.second_pass_on_clean
-                    && matches!(&execution.result, Ok(findings) if findings.is_empty())
-                {
-                    execution = self
-                        .execute_ai_review(
-                            review,
-                            &changes.changes,
-                            None,
-                            review_request,
-                            Some(ARCHIVE_DIFF_ONLY_INSTRUCTION),
-                        )
-                        .await;
-                }
                 return AiReviewExecutionWithMetadata {
                     execution,
                     metadata: AiReviewExecutionMetadata {
@@ -1074,45 +1156,6 @@ impl ReviewService {
                     changes: &changes.changes,
                     event,
                     context_pass: AiReviewContextPass::Initial,
-                    review_request,
-                    context_started,
-                },
-                &execution,
-                &mut context,
-            )
-            .await
-        {
-            return fallback;
-        }
-        let is_clean = matches!(&execution.result, Ok(findings) if findings.is_empty());
-        if !review.second_pass_on_clean || !is_clean {
-            return AiReviewExecutionWithMetadata {
-                execution,
-                metadata: AiReviewExecutionMetadata {
-                    execution_mode: AiReviewExecutionMode::Context,
-                    fallback_reason: None,
-                    context_elapsed_ms: Some(elapsed_ms(context_started)),
-                    fallback_elapsed_ms: None,
-                },
-            };
-        }
-
-        info!(
-            ai_review_id = %review.id,
-            "AI review first pass was clean; running second confirmation pass"
-        );
-        let execution = {
-            let source_dir = context.as_ref().map(|context| context.source_dir.as_path());
-            self.execute_ai_review(review, &changes.changes, source_dir, review_request, None)
-                .await
-        };
-        if let Some(fallback) = self
-            .timeout_fallback_for_execution(
-                TimeoutFallbackRequest {
-                    review,
-                    changes: &changes.changes,
-                    event,
-                    context_pass: AiReviewContextPass::CleanConfirmation,
                     review_request,
                     context_started,
                 },
@@ -1532,7 +1575,6 @@ mod tests {
             model: "model".into(),
             timeout_seconds: 37,
             request_timeout_seconds: Some(11),
-            second_pass_on_clean: true,
             max_batch_diff_bytes: 7,
             max_batches: 3,
             extra_instructions: String::new(),
@@ -1587,7 +1629,7 @@ mod tests {
             let (service, seam, review, event, changes) =
                 scripted_timeout_service(vec![first, fallback], &format!("eligible-{index}")).await;
             let result = service
-                .run_ai_review_with_optional_clean_second_pass(&review, &changes, &event, None)
+                .run_ai_review_with_timeout_fallback(&review, &changes, &event, None)
                 .await;
 
             assert_eq!(result.metadata.fallback_reason, Some(reason));
@@ -1598,7 +1640,6 @@ mod tests {
             assert_eq!(calls.len(), 2);
             assert!(calls[0].source_available);
             assert!(!calls[1].source_available);
-            assert!(!calls[1].second_pass_on_clean);
             assert_eq!(calls[1].timeout_seconds, 37);
             assert_eq!(calls[1].max_batches, 3);
             assert_eq!(
@@ -1620,7 +1661,7 @@ mod tests {
         let (service, seam, review, event, changes) =
             scripted_timeout_service(vec![noneligible], "noneligible").await;
         let result = service
-            .run_ai_review_with_optional_clean_second_pass(&review, &changes, &event, None)
+            .run_ai_review_with_timeout_fallback(&review, &changes, &event, None)
             .await;
         assert!(
             matches!(result.execution.result, Err(ref error) if timeout_fallback_reason(error).is_none())
@@ -1644,79 +1685,12 @@ mod tests {
         let (service, seam, review, event, changes) =
             scripted_timeout_service(vec![first, second], "fallback-timeout").await;
         let result = service
-            .run_ai_review_with_optional_clean_second_pass(&review, &changes, &event, None)
+            .run_ai_review_with_timeout_fallback(&review, &changes, &event, None)
             .await;
         assert!(
             matches!(result.execution.result, Err(ref error) if timeout_fallback_reason(error) == Some(AiReviewFallbackReason::AiToolLoopTimeout))
         );
         assert_eq!(seam.calls.lock().unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn timeout_in_clean_context_confirmation_gets_one_independent_fallback() {
-        for (suffix, fallback_result) in [
-            ("success", scripted_execution(Ok(Vec::new()), 3)),
-            (
-                "timeout",
-                scripted_execution(
-                    Err(AppError::ai_review(
-                        ReviewErrorCode::AiRequestTimeout,
-                        "fallback timeout",
-                    )),
-                    4,
-                ),
-            ),
-        ] {
-            let clean_first = scripted_execution(Ok(Vec::new()), 1);
-            let timed_out_confirmation = scripted_execution(
-                Err(AppError::ai_review(
-                    ReviewErrorCode::AiToolLoopTimeout,
-                    "confirmation timeout",
-                )),
-                2,
-            );
-            let (service, seam, review, event, changes) = scripted_timeout_service(
-                vec![clean_first, timed_out_confirmation, fallback_result],
-                &format!("confirmation-{suffix}"),
-            )
-            .await;
-
-            let result = service
-                .run_ai_review_with_optional_clean_second_pass(&review, &changes, &event, None)
-                .await;
-
-            assert_eq!(
-                result.metadata.fallback_reason,
-                Some(AiReviewFallbackReason::AiToolLoopTimeout)
-            );
-            assert_eq!(
-                result.execution.coverage.as_ref().unwrap().total_files,
-                if suffix == "success" { 3 } else { 4 }
-            );
-            if suffix == "success" {
-                assert!(result.execution.result.is_ok());
-            } else {
-                assert!(matches!(
-                    result.execution.result,
-                    Err(ref error) if timeout_fallback_reason(error)
-                        == Some(AiReviewFallbackReason::AiRequestTimeout)
-                ));
-            }
-            let calls = seam.calls.lock().unwrap();
-            assert_eq!(
-                calls.len(),
-                3,
-                "fallback timeout must not trigger a fourth run"
-            );
-            assert!(calls[0].source_available);
-            assert!(calls[1].source_available);
-            assert!(!calls[2].source_available);
-            assert!(!calls[2].second_pass_on_clean);
-            assert_eq!(
-                calls[2].trusted_runtime_instruction.as_deref(),
-                Some(TIMEOUT_DIFF_ONLY_INSTRUCTION)
-            );
-        }
     }
 
     #[tokio::test]
@@ -1757,7 +1731,6 @@ mod tests {
             model: "model".into(),
             timeout_seconds: 1,
             request_timeout_seconds: None,
-            second_pass_on_clean: false,
             max_batch_diff_bytes: 1,
             max_batches: 1,
             extra_instructions: String::new(),
@@ -1794,7 +1767,7 @@ mod tests {
         assert!(!work_dir.exists());
 
         let result = service
-            .run_ai_review_with_optional_clean_second_pass(&review, &changes, &event, None)
+            .run_ai_review_with_timeout_fallback(&review, &changes, &event, None)
             .await;
         assert!(result.execution.result.is_ok());
         assert_eq!(
@@ -1895,7 +1868,6 @@ mod tests {
             model: "model".into(),
             timeout_seconds: 5,
             request_timeout_seconds: Some(2),
-            second_pass_on_clean: true,
             max_batch_diff_bytes: 30,
             max_batches: 2,
             extra_instructions: String::new(),
@@ -1948,7 +1920,7 @@ mod tests {
 
         let overall_started = Instant::now();
         let result = service
-            .run_ai_review_with_optional_clean_second_pass(&review, &changes, &event, None)
+            .run_ai_review_with_timeout_fallback(&review, &changes, &event, None)
             .await;
 
         assert!(result.execution.result.is_ok());
