@@ -1,6 +1,8 @@
 use crate::{
     ai_review::{
-        run_ai_review_execution_with_context, AiReviewExecution, ReviewCoverage, ReviewCoverageFile,
+        run_ai_review_execution_with_context, run_ai_review_execution_with_runtime_instruction,
+        timeout_fallback_reason, AiReviewExecution, AiReviewExecutionMetadata,
+        AiReviewExecutionMode, AiReviewFallbackReason, ReviewCoverage, ReviewCoverageFile,
     },
     comments::{build_comment_drafts, CommentDraft},
     error::{AppError, AppResult, ReviewErrorCode, ReviewFailure},
@@ -20,6 +22,13 @@ use std::{
     time::Instant,
 };
 use tracing::{info, warn};
+
+const DIFF_ONLY_FALLBACK_INSTRUCTION: &str = "Repository context is unavailable for this fallback execution. Review only the supplied MR diff. Do not request or rely on repository context tools.";
+
+struct AiReviewExecutionWithMetadata {
+    execution: AiReviewExecution,
+    metadata: AiReviewExecutionMetadata,
+}
 
 pub use crate::review::archive::ArchiveLimits;
 
@@ -336,7 +345,7 @@ impl ReviewService {
                 ai_review_id = %review.id,
                 "AI review started"
             );
-            let execution = self
+            let execution_with_metadata = self
                 .run_ai_review_with_optional_clean_second_pass(
                     &review,
                     changes,
@@ -344,6 +353,8 @@ impl ReviewService {
                     review_request,
                 )
                 .await;
+            let execution = execution_with_metadata.execution;
+            let _metadata = execution_with_metadata.metadata;
             let coverage = execution.coverage;
             let incomplete_files = execution.incomplete_files;
             if let Some(coverage) = coverage.as_ref() {
@@ -729,15 +740,62 @@ impl ReviewService {
         changes: &crate::gitlab::MergeRequestChanges,
         event: &MergeRequestEvent,
         review_request: Option<&str>,
-    ) -> AiReviewExecution {
-        let context = match self.prepare_ai_review_context(review, changes, event).await {
-            Ok(context) => context,
+    ) -> AiReviewExecutionWithMetadata {
+        let context_started = Instant::now();
+        let archive_sha = changes
+            .diff_refs
+            .head_sha
+            .as_deref()
+            .unwrap_or(&event.commit_sha);
+        let context = match self
+            .prepare_ai_review_context_inner(review, event, archive_sha)
+            .await
+        {
+            Ok(context) => Some(context),
+            Err(err) if is_archive_limit_error(&err) => {
+                let context_elapsed_ms = elapsed_ms(context_started);
+                warn!(
+                    project_id = event.project_id,
+                    mr_iid = event.mr_iid,
+                    ai_review_id = %review.id,
+                    error = %err,
+                    "AI review context archive exceeded limits; continuing with diff-only review"
+                );
+                let fallback_started = Instant::now();
+                let mut fallback_review = review.clone();
+                fallback_review.second_pass_on_clean = false;
+                let execution = run_ai_review_execution_with_runtime_instruction(
+                    &fallback_review,
+                    &changes.changes,
+                    None,
+                    review_request,
+                    Some(DIFF_ONLY_FALLBACK_INSTRUCTION),
+                )
+                .await;
+                return AiReviewExecutionWithMetadata {
+                    execution,
+                    metadata: AiReviewExecutionMetadata {
+                        execution_mode: AiReviewExecutionMode::DiffOnlyFallback,
+                        fallback_reason: Some(AiReviewFallbackReason::ArchiveLimitExceeded),
+                        context_elapsed_ms: Some(context_elapsed_ms),
+                        fallback_elapsed_ms: Some(elapsed_ms(fallback_started)),
+                    },
+                };
+            }
             Err(err) => {
-                return AiReviewExecution {
-                    result: Err(err),
-                    coverage: None,
-                    incomplete_files: Vec::new(),
-                }
+                return AiReviewExecutionWithMetadata {
+                    execution: AiReviewExecution {
+                        result: Err(err),
+                        coverage: None,
+                        incomplete_files: Vec::new(),
+                    },
+                    metadata: AiReviewExecutionMetadata {
+                        execution_mode: AiReviewExecutionMode::Context,
+                        fallback_reason: None,
+                        context_elapsed_ms: Some(elapsed_ms(context_started)),
+                        fallback_elapsed_ms: None,
+                    },
+                };
             }
         };
         let source_dir = context.as_ref().map(|context| context.source_dir.as_path());
@@ -748,19 +806,68 @@ impl ReviewService {
             review_request,
         )
         .await;
+        if let Err(error) = &execution.result {
+            if let Some(reason) = timeout_fallback_reason(error) {
+                drop(context);
+                let context_elapsed_ms = elapsed_ms(context_started);
+                let fallback_started = Instant::now();
+                let mut fallback_review = review.clone();
+                fallback_review.second_pass_on_clean = false;
+                let fallback = run_ai_review_execution_with_runtime_instruction(
+                    &fallback_review,
+                    &changes.changes,
+                    None,
+                    review_request,
+                    Some(DIFF_ONLY_FALLBACK_INSTRUCTION),
+                )
+                .await;
+                return AiReviewExecutionWithMetadata {
+                    execution: fallback,
+                    metadata: AiReviewExecutionMetadata {
+                        execution_mode: AiReviewExecutionMode::DiffOnlyFallback,
+                        fallback_reason: Some(reason),
+                        context_elapsed_ms: Some(context_elapsed_ms),
+                        fallback_elapsed_ms: Some(elapsed_ms(fallback_started)),
+                    },
+                };
+            }
+        }
         let is_clean = matches!(&execution.result, Ok(findings) if findings.is_empty());
         if !review.second_pass_on_clean || !is_clean {
-            return execution;
+            return AiReviewExecutionWithMetadata {
+                execution,
+                metadata: AiReviewExecutionMetadata {
+                    execution_mode: AiReviewExecutionMode::Context,
+                    fallback_reason: None,
+                    context_elapsed_ms: Some(elapsed_ms(context_started)),
+                    fallback_elapsed_ms: None,
+                },
+            };
         }
 
         info!(
             ai_review_id = %review.id,
             "AI review first pass was clean; running second confirmation pass"
         );
-        run_ai_review_execution_with_context(review, &changes.changes, source_dir, review_request)
-            .await
+        let execution = run_ai_review_execution_with_context(
+            review,
+            &changes.changes,
+            source_dir,
+            review_request,
+        )
+        .await;
+        AiReviewExecutionWithMetadata {
+            execution,
+            metadata: AiReviewExecutionMetadata {
+                execution_mode: AiReviewExecutionMode::Context,
+                fallback_reason: None,
+                context_elapsed_ms: Some(elapsed_ms(context_started)),
+                fallback_elapsed_ms: None,
+            },
+        }
     }
 
+    #[cfg(test)]
     async fn prepare_ai_review_context(
         &self,
         review: &AiReviewConfig,
@@ -1016,11 +1123,26 @@ fn is_archive_limit_error(error: &AppError) -> bool {
     )
 }
 
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{routing::get, Router};
-    use std::io::Write;
+    use axum::{
+        extract::State,
+        routing::{get, post},
+        Json, Router,
+    };
+    use std::{
+        io::Write,
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
+        time::Duration,
+    };
     use tokio::net::TcpListener;
     use zip::{write::SimpleFileOptions, ZipWriter};
 
@@ -1112,6 +1234,171 @@ mod tests {
 
         assert!(context.is_none());
         assert!(!work_dir.exists());
+
+        let result = service
+            .run_ai_review_with_optional_clean_second_pass(&review, &changes, &event, None)
+            .await;
+        assert!(result.execution.result.is_ok());
+        assert_eq!(
+            result.metadata.execution_mode,
+            AiReviewExecutionMode::DiffOnlyFallback
+        );
+        assert_eq!(
+            result.metadata.fallback_reason,
+            Some(AiReviewFallbackReason::ArchiveLimitExceeded)
+        );
+        assert!(result.metadata.context_elapsed_ms.is_some());
+        assert!(result.metadata.fallback_elapsed_ms.is_some());
+        assert!(!work_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn request_timeout_restarts_once_as_diff_only_with_fresh_batching() {
+        let archive = archive_with_two_files();
+        let archive_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let archive_addr = archive_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                archive_listener,
+                Router::new().route(
+                    "/api/v4/projects/1/repository/archive.zip",
+                    get(move || async move { archive.clone() }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+
+        #[derive(Clone)]
+        struct AiState {
+            calls: Arc<AtomicUsize>,
+            fallback_saw_removed_context: Arc<AtomicBool>,
+            bodies: Arc<Mutex<Vec<serde_json::Value>>>,
+            context_dir: PathBuf,
+        }
+        async fn ai_handler(
+            State(state): State<AiState>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            let call = state.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            state.bodies.lock().unwrap().push(body);
+            if call <= 2 {
+                tokio::time::sleep(Duration::from_millis(1_200)).await;
+            } else {
+                state
+                    .fallback_saw_removed_context
+                    .store(!state.context_dir.exists(), Ordering::SeqCst);
+            }
+            Json(serde_json::json!({
+                "choices": [{"message": {"tool_calls": [{
+                    "id": "submit_1", "type": "function",
+                    "function": {"name": "submit_review_findings", "arguments": "{\"findings\":[]}"}
+                }]}}]
+            }))
+        }
+
+        let run_id = format!("timeout-fallback-{}", std::process::id());
+        let context_dir =
+            ai_review_context_work_dir(1, 2, "head", "timeout-review", Some(&run_id)).unwrap();
+        let state = AiState {
+            calls: Arc::new(AtomicUsize::new(0)),
+            fallback_saw_removed_context: Arc::new(AtomicBool::new(false)),
+            bodies: Arc::new(Mutex::new(Vec::new())),
+            context_dir: context_dir.clone(),
+        };
+        let ai_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ai_addr = ai_listener.local_addr().unwrap();
+        let server_state = state.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                ai_listener,
+                Router::new()
+                    .route("/chat/completions", post(ai_handler))
+                    .with_state(server_state),
+            )
+            .await
+            .unwrap();
+        });
+
+        let store = StateStore::connect("sqlite::memory:").await.unwrap();
+        store.migrate().await.unwrap();
+        let service = ReviewService::new(
+            GitLabClient::new(format!("http://{archive_addr}"), "token".into()),
+            store,
+            Ruleset::from_toml("").unwrap(),
+        )
+        .with_review_run_id(run_id);
+        let review = AiReviewConfig {
+            id: "timeout-review".into(),
+            title: "Timeout Review".into(),
+            base_url: format!("http://{ai_addr}"),
+            api_key: "key".into(),
+            model: "model".into(),
+            timeout_seconds: 4,
+            request_timeout_seconds: Some(1),
+            second_pass_on_clean: true,
+            max_batch_diff_bytes: 30_000,
+            max_batches: 1,
+            extra_instructions: String::new(),
+            max_tool_calls: 1,
+            max_tool_result_bytes: 1_000,
+        };
+        let event = MergeRequestEvent {
+            project_id: 1,
+            project_name: None,
+            project_path_with_namespace: None,
+            mr_iid: 2,
+            commit_sha: "head".into(),
+            action: "test".into(),
+            source_branch: String::new(),
+            target_branch: String::new(),
+        };
+        let changes = crate::gitlab::MergeRequestChanges {
+            changes: vec![GitLabChange {
+                old_path: "first.rs".into(),
+                new_path: "first.rs".into(),
+                diff: "@@ -0,0 +1 @@\n+first\n".into(),
+                new_file: false,
+                renamed_file: false,
+                deleted_file: false,
+            }],
+            diff_refs: crate::gitlab::DiffRefs {
+                base_sha: Some("base".into()),
+                start_sha: Some("start".into()),
+                head_sha: Some("head".into()),
+            },
+        };
+
+        let result = service
+            .run_ai_review_with_optional_clean_second_pass(&review, &changes, &event, None)
+            .await;
+
+        assert!(result.execution.result.is_ok());
+        assert_eq!(state.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            result.metadata.fallback_reason,
+            Some(AiReviewFallbackReason::AiRequestTimeout)
+        );
+        assert!(state.fallback_saw_removed_context.load(Ordering::SeqCst));
+        assert!(!context_dir.exists());
+        let bodies = state.bodies.lock().unwrap();
+        let fallback = bodies.last().unwrap();
+        let fallback_messages = fallback["messages"].as_array().unwrap();
+        assert!(fallback_messages.iter().any(|message| {
+            message["role"] == "system"
+                && message["content"].as_str() == Some(DIFF_ONLY_FALLBACK_INSTRUCTION)
+        }));
+        let tool_names = fallback["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(tool_names, vec!["submit_review_findings"]);
+        assert!(fallback_messages.last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .contains("第 1 / 1 个批次"));
     }
 
     #[test]
