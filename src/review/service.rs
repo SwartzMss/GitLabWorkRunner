@@ -7,7 +7,6 @@ use crate::{
     gitlab::{CreateDiscussionRequest, DiscussionPosition, GitLabChange, GitLabClient},
     review::archive::extract_zip_archive,
     rules::{AiReviewConfig, Finding, Ruleset, Severity},
-    script_tasks::{ScriptTaskContext, ScriptTaskResult, ScriptTaskRunner, ScriptTaskStatus},
     storage::{
         ReviewRequestStart, StateStore, StoredComment, StoredFinding, StoredReviewCoverage,
         StoredReviewCoverageFile, TaskRunFinish, TaskRunStart,
@@ -115,10 +114,9 @@ impl ReviewService {
             });
         }
 
-        let requested_ids = manual_script_task_ids(&event.note);
-        let tasks = self.ruleset.script_tasks_by_ids(&requested_ids);
+        let requested_ids = manual_review_ids(&event.note);
         let ai_reviews = self.ruleset.ai_reviews_by_ids(&requested_ids);
-        if tasks.is_empty() && ai_reviews.is_empty() {
+        if ai_reviews.is_empty() {
             info!(
                 project_id = event.project_id,
                 mr_iid = event.mr_iid,
@@ -148,12 +146,12 @@ impl ReviewService {
                 note_id: Some(event.note_id),
                 requested_ids_json: &requested_ids_json,
                 selected_ai_reviews: ai_reviews.len(),
-                selected_script_tasks: tasks.len(),
+                selected_script_tasks: 0,
             })
             .await?;
 
         let result = self
-            .review_merge_request_note_inner(event, tasks, ai_reviews, requested_ids)
+            .review_merge_request_note_inner(event, ai_reviews, requested_ids)
             .await;
         match &result {
             Ok(summary) => {
@@ -193,11 +191,10 @@ impl ReviewService {
     async fn review_merge_request_note_inner(
         &self,
         event: &MergeRequestNoteEvent,
-        tasks: Vec<crate::rules::ScriptTaskConfig>,
         ai_reviews: Vec<AiReviewConfig>,
         requested_ids: Vec<String>,
     ) -> AppResult<ReviewSummary> {
-        let selected_ids = selected_manual_ids(&tasks, &ai_reviews);
+        let selected_ids = selected_manual_ids(&ai_reviews);
         let review_request = manual_review_request_text(&event.note, &selected_ids);
         let started = Instant::now();
         info!(
@@ -207,7 +204,6 @@ impl ReviewService {
             commit_sha = %event.commit_sha,
             action = %event.action,
             requested_task_ids = ?requested_ids,
-            selected_tasks = tasks.len(),
             selected_ai_reviews = ai_reviews.len(),
             "manual review started"
         );
@@ -248,21 +244,17 @@ impl ReviewService {
         let ai_result = self
             .run_selected_ai_reviews(&mr_event, &changes, ai_reviews, review_request.as_deref())
             .await?;
-        let script_result = self
-            .run_selected_script_tasks(&mr_event, &changes, tasks)
-            .await?;
-        let findings = ai_result.findings + script_result.findings;
+        let findings = ai_result.findings;
         let summary_comments = self
             .publish_manual_review_summary(
                 &mr_event,
                 &changes,
                 &ai_result,
-                &script_result,
                 review_request.as_deref(),
                 started.elapsed(),
             )
             .await?;
-        let comments = ai_result.comments + script_result.comments + summary_comments;
+        let comments = ai_result.comments + summary_comments;
         info!(
             project_id = event.project_id,
             mr_iid = event.mr_iid,
@@ -464,7 +456,6 @@ impl ReviewService {
         event: &MergeRequestEvent,
         changes: &crate::gitlab::MergeRequestChanges,
         ai_summary: &AiReviewRunSummary,
-        script_summary: &ScriptTaskRunSummary,
         review_request: Option<&str>,
         elapsed: std::time::Duration,
     ) -> AppResult<usize> {
@@ -473,7 +464,6 @@ impl ReviewService {
             changes,
             self.review_run_id(),
             ai_summary,
-            script_summary,
             review_request,
             elapsed,
         );
@@ -575,199 +565,6 @@ impl ReviewService {
         }
         Ok(published)
     }
-
-    async fn run_selected_script_tasks(
-        &self,
-        event: &MergeRequestEvent,
-        changes: &crate::gitlab::MergeRequestChanges,
-        tasks: Vec<crate::rules::ScriptTaskConfig>,
-    ) -> AppResult<ScriptTaskRunSummary> {
-        if tasks.is_empty() {
-            info!(
-                project_id = event.project_id,
-                mr_iid = event.mr_iid,
-                commit_sha = %event.commit_sha,
-                "no script tasks selected"
-            );
-            return Ok(ScriptTaskRunSummary::default());
-        }
-
-        let archive_sha = changes
-            .diff_refs
-            .head_sha
-            .as_deref()
-            .unwrap_or(&event.commit_sha);
-        if changes.diff_refs.head_sha.is_none() {
-            warn!(
-                project_id = event.project_id,
-                mr_iid = event.mr_iid,
-                event_commit_sha = %event.commit_sha,
-                "script task archive fallback to webhook commit sha because gitlab head_sha is missing"
-            );
-        }
-        let archive = self
-            .gitlab
-            .repository_archive(
-                event.project_id,
-                archive_sha,
-                self.archive_limits.max_archive_bytes,
-            )
-            .await?;
-        let runner = ScriptTaskRunner::new().with_archive_limits(self.archive_limits.clone());
-        let context = ScriptTaskContext {
-            project_id: event.project_id,
-            mr_iid: event.mr_iid,
-            commit_sha: archive_sha,
-        };
-        let mut summary = ScriptTaskRunSummary::default();
-        for task in tasks {
-            info!(
-                project_id = event.project_id,
-                mr_iid = event.mr_iid,
-                commit_sha = archive_sha,
-                script_task_id = %task.id,
-                "script task selected"
-            );
-            self.store
-                .start_task_run(&TaskRunStart {
-                    review_run_id: self.review_run_id(),
-                    task_type: "script_task",
-                    task_id: &task.id,
-                    title: &task.title,
-                })
-                .await?;
-            let result = match runner.run(&task, &context, &archive).await {
-                Ok(result) => result,
-                Err(err) => {
-                    let failure = failure_for_error(&err, ReviewErrorCode::ScriptTaskFailed);
-                    self.store
-                        .finish_task_run(&TaskRunFinish {
-                            review_run_id: self.review_run_id(),
-                            task_type: "script_task",
-                            task_id: &task.id,
-                            status: "failed",
-                            findings: 0,
-                            comments: 0,
-                            error_code: Some(failure.code.as_str()),
-                            error: Some(&failure.message),
-                        })
-                        .await?;
-                    return Err(err);
-                }
-            };
-            if result.status == ScriptTaskStatus::IssueFound {
-                let (comments, findings) = self
-                    .publish_script_task_result(event, changes, &result)
-                    .await?;
-                summary.comments += comments;
-                summary.findings += findings;
-                self.store
-                    .finish_task_run(&TaskRunFinish {
-                        review_run_id: self.review_run_id(),
-                        task_type: "script_task",
-                        task_id: &task.id,
-                        status: "completed",
-                        findings,
-                        comments,
-                        error_code: None,
-                        error: None,
-                    })
-                    .await?;
-            } else {
-                self.store
-                    .finish_task_run(&TaskRunFinish {
-                        review_run_id: self.review_run_id(),
-                        task_type: "script_task",
-                        task_id: &task.id,
-                        status: "completed",
-                        findings: 0,
-                        comments: 0,
-                        error_code: None,
-                        error: None,
-                    })
-                    .await?;
-                info!(
-                    project_id = event.project_id,
-                    mr_iid = event.mr_iid,
-                    commit_sha = archive_sha,
-                    script_task_id = %result.id,
-                    status = ?result.status,
-                    "script task produced no publishable issue"
-                );
-            }
-        }
-        info!(
-            project_id = event.project_id,
-            mr_iid = event.mr_iid,
-            commit_sha = archive_sha,
-            findings = summary.findings,
-            comments = summary.comments,
-            "script tasks completed"
-        );
-        Ok(summary)
-    }
-
-    async fn publish_script_task_result(
-        &self,
-        event: &MergeRequestEvent,
-        changes: &crate::gitlab::MergeRequestChanges,
-        result: &ScriptTaskResult,
-    ) -> AppResult<(usize, usize)> {
-        let result_text = match fs::read_to_string(&result.result_path) {
-            Ok(text) => text,
-            Err(err) => {
-                warn!(
-                    project_id = event.project_id,
-                    mr_iid = event.mr_iid,
-                    commit_sha = %event.commit_sha,
-                    script_task_id = %result.id,
-                    result_path = %result.result_path.display(),
-                    error = %err,
-                    "script task returned issue status but result file could not be read"
-                );
-                format!("[gitlab-work-runner] failed to read result.txt: {err}")
-            }
-        };
-        let findings = parse_script_result_findings(result, &result_text);
-        self.record_findings("script_task", &result.id, &findings)
-            .await?;
-        info!(
-            project_id = event.project_id,
-            mr_iid = event.mr_iid,
-            commit_sha = %event.commit_sha,
-            script_task_id = %result.id,
-            result_bytes = result_text.len(),
-            parsed_findings = findings.len(),
-            diff_refs_complete = changes.diff_refs.is_complete(),
-            "script task result parsed"
-        );
-        if !findings.is_empty() && changes.diff_refs.is_complete() {
-            let comments = self
-                .publish_line_findings(event, changes, &findings)
-                .await?;
-            return Ok((comments, findings.len()));
-        }
-
-        info!(
-            project_id = event.project_id,
-            mr_iid = event.mr_iid,
-            commit_sha = %event.commit_sha,
-            script_task_id = %result.id,
-            parsed_findings = findings.len(),
-            diff_refs_complete = changes.diff_refs.is_complete(),
-            "publishing script task result as merge-request-level summary"
-        );
-        let body = build_script_result_summary(result, &result_text);
-        let draft = CommentDraft {
-            path: String::new(),
-            new_line: None,
-            body,
-        };
-        let comments = self
-            .publish_comment_drafts(event, changes, &[draft], "script")
-            .await?;
-        Ok((comments, findings.len()))
-    }
 }
 
 fn discussion_position(
@@ -819,11 +616,10 @@ fn build_manual_review_summary_body(
     changes: &crate::gitlab::MergeRequestChanges,
     review_run_id: &str,
     ai_summary: &AiReviewRunSummary,
-    script_summary: &ScriptTaskRunSummary,
     review_request: Option<&str>,
     elapsed: std::time::Duration,
 ) -> String {
-    let findings = ai_summary.findings + script_summary.findings;
+    let findings = ai_summary.findings;
     let status = if ai_summary.failed_reviews > 0 {
         "部分失败"
     } else if ai_summary.skipped_reviews > 0 {
@@ -831,10 +627,7 @@ fn build_manual_review_summary_body(
     } else {
         "完成"
     };
-    let result = if ai_summary.skipped_reviews > 0
-        && ai_summary.successful_reviews == 0
-        && script_summary.findings == 0
-    {
+    let result = if ai_summary.skipped_reviews > 0 && ai_summary.successful_reviews == 0 {
         "AI Review 未执行，GitLab diff refs 不完整".to_string()
     } else if findings == 0 {
         "未发现高置信度问题".to_string()
@@ -1110,7 +903,7 @@ fn sanitize_work_path_segment(value: &str) -> String {
     }
 }
 
-pub(crate) fn manual_script_task_ids(text: &str) -> Vec<String> {
+pub(crate) fn manual_review_ids(text: &str) -> Vec<String> {
     let mut ids = BTreeSet::new();
     for raw in text.split_whitespace() {
         let token = trim_manual_trigger_token(raw);
@@ -1144,15 +937,8 @@ pub(crate) fn manual_review_request_text(text: &str, requested_ids: &[String]) -
     (!request.is_empty()).then(|| request.to_string())
 }
 
-fn selected_manual_ids(
-    tasks: &[crate::rules::ScriptTaskConfig],
-    ai_reviews: &[AiReviewConfig],
-) -> Vec<String> {
-    tasks
-        .iter()
-        .map(|task| task.id.clone())
-        .chain(ai_reviews.iter().map(|review| review.id.clone()))
-        .collect()
+fn selected_manual_ids(ai_reviews: &[AiReviewConfig]) -> Vec<String> {
+    ai_reviews.iter().map(|review| review.id.clone()).collect()
 }
 
 fn trim_manual_trigger_token(raw: &str) -> &str {
@@ -1177,47 +963,6 @@ fn trim_manual_trigger_token(raw: &str) -> &str {
                 | '`'
         )
     })
-}
-
-fn parse_script_result_findings(result: &ScriptTaskResult, text: &str) -> Vec<Finding> {
-    text.lines()
-        .filter_map(parse_script_result_line)
-        .map(|(path, line, message)| Finding {
-            rule_id: format!("script:{}", result.id),
-            severity: Severity::Warning,
-            path,
-            new_line: Some(line),
-            title: result.title.clone(),
-            message,
-        })
-        .collect()
-}
-
-fn parse_script_result_line(line: &str) -> Option<(String, u32, String)> {
-    let mut parts = line.splitn(3, ':');
-    let path = parts.next()?.trim().replace('\\', "/");
-    let line_no = parts.next()?.trim().parse().ok()?;
-    let message = parts.next()?.trim().to_string();
-    if path.is_empty() || message.is_empty() {
-        return None;
-    }
-    Some((path, line_no, message))
-}
-
-fn build_script_result_summary(result: &ScriptTaskResult, text: &str) -> String {
-    let content = if text.trim().is_empty() {
-        "(result.txt is empty)"
-    } else {
-        text.trim()
-    };
-    format!(
-        "**[警告] {}**\n\n脚本任务检测发现问题，但结果无法解析成 `path:line:message` 行级格式。\n\n```text\n{}\n```\n\n结果文件：`{}`\n运行日志：`{}`\n\n<!-- gitlab-work-runner:rule=script:{} -->",
-        result.title,
-        content,
-        result.result_path.display(),
-        result.run_log_path.display(),
-        result.id
-    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1250,12 +995,6 @@ struct AiReviewFailureSummary {
     title: String,
     error_code: String,
     error: String,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct ScriptTaskRunSummary {
-    findings: usize,
-    comments: usize,
 }
 
 fn failure_for_error(error: &AppError, fallback: ReviewErrorCode) -> ReviewFailure {
@@ -1396,17 +1135,17 @@ mod tests {
     }
 
     #[test]
-    fn parses_manual_script_task_ids() {
+    fn parses_manual_review_ids() {
         assert_eq!(
-            manual_script_task_ids("please run\n@check-todo-tbd, @other_check"),
+            manual_review_ids("please run\n@check-todo-tbd, @other_check"),
             vec!["check-todo-tbd".to_string(), "other_check".to_string()]
         );
     }
 
     #[test]
-    fn ignores_non_standalone_manual_script_task_ids() {
-        assert!(manual_script_task_ids("please@check-todo-tbd").is_empty());
-        assert!(manual_script_task_ids("@").is_empty());
+    fn ignores_non_standalone_manual_review_ids() {
+        assert!(manual_review_ids("please@check-todo-tbd").is_empty());
+        assert!(manual_review_ids("@").is_empty());
     }
 
     #[test]
@@ -1506,7 +1245,6 @@ mod tests {
             &changes,
             "rr-1",
             &ai_summary,
-            &ScriptTaskRunSummary::default(),
             Some("重点检查线程安全"),
             std::time::Duration::from_secs(42),
         );
@@ -1555,7 +1293,6 @@ mod tests {
             &changes,
             "rr-1",
             &AiReviewRunSummary::default(),
-            &ScriptTaskRunSummary::default(),
             None,
             std::time::Duration::from_secs(1),
         );

@@ -1,4 +1,4 @@
-# Default example: manual AI Review plus an optional manually triggered script task.
+# Default example: manual AI Review.
 
 # Global AI review prompt settings shared by every [[ai_reviews]] entry.
 # The built-in reviewer system prompt always applies; extra_instructions is appended
@@ -23,11 +23,3 @@ second_pass_on_clean = false
 # This does not require MCP; findings are read from submit_review_findings arguments when tool_calls are returned.
 max_batch_diff_bytes = 30000
 max_batches = 10
-
-[[script_tasks]]
-id = "check-todo-tbd"
-title = "TODO/TBD 标记检查"
-# Relative paths are resolved from the runner executable directory.
-# The checked MR source root and result file path are appended as arguments.
-command = "python examples/scripts/check_todo_tbd.py"
-timeout_seconds = 30

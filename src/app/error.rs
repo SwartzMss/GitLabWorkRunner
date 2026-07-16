@@ -14,7 +14,6 @@ pub enum ReviewErrorCode {
     GitLabCommentFailed,
     PermissionDenied,
     InvalidConfiguration,
-    ScriptTaskFailed,
     Internal,
 }
 
@@ -35,7 +34,6 @@ impl ReviewErrorCode {
             Self::GitLabCommentFailed => "gitlab_comment_failed",
             Self::PermissionDenied => "permission_denied",
             Self::InvalidConfiguration => "invalid_configuration",
-            Self::ScriptTaskFailed => "script_task_failed",
             Self::Internal => "internal",
         }
     }
@@ -72,8 +70,6 @@ pub enum AppError {
     Diff(String),
     #[error("rule error: {0}")]
     Rule(String),
-    #[error("script task error: {0}")]
-    ScriptTask(ReviewFailure),
     #[error("ai review error: {0}")]
     AiReview(ReviewFailure),
     #[error("gitlab api error: {0}")]
@@ -107,16 +103,11 @@ impl AppError {
         Self::Archive(ReviewFailure::new(code, message))
     }
 
-    pub fn script_task(code: ReviewErrorCode, message: impl Into<String>) -> Self {
-        Self::ScriptTask(ReviewFailure::new(code, message))
-    }
-
     pub fn review_failure(&self) -> Option<&ReviewFailure> {
         match self {
-            Self::AiReview(failure)
-            | Self::GitLab(failure)
-            | Self::Archive(failure)
-            | Self::ScriptTask(failure) => Some(failure),
+            Self::AiReview(failure) | Self::GitLab(failure) | Self::Archive(failure) => {
+                Some(failure)
+            }
             _ => None,
         }
     }

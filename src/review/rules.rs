@@ -4,22 +4,12 @@ use sha2::{Digest, Sha256};
 use std::{fs, path::Path};
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RulesFile {
     #[serde(default)]
     pub ai_review: AiReviewPromptConfig,
     #[serde(default)]
-    pub script_tasks: Vec<ScriptTaskConfig>,
-    #[serde(default)]
     pub ai_reviews: Vec<AiReviewConfig>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct ScriptTaskConfig {
-    pub id: String,
-    pub title: String,
-    pub command: String,
-    #[serde(default = "default_script_timeout_seconds")]
-    pub timeout_seconds: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -86,18 +76,12 @@ pub struct Finding {
 }
 
 #[derive(Clone)]
-pub struct CompiledScriptTask {
-    pub config: ScriptTaskConfig,
-}
-
-#[derive(Clone)]
 pub struct CompiledAiReview {
     pub config: AiReviewConfig,
 }
 
 pub struct Ruleset {
     hash: String,
-    script_tasks: Vec<CompiledScriptTask>,
     ai_reviews: Vec<CompiledAiReview>,
 }
 
@@ -109,10 +93,6 @@ impl Ruleset {
 
     pub fn from_toml(text: &str) -> AppResult<Self> {
         let parsed: RulesFile = toml::from_str(text)?;
-        let mut script_tasks = Vec::new();
-        for config in parsed.script_tasks {
-            script_tasks.push(CompiledScriptTask { config });
-        }
         let mut ai_reviews = Vec::new();
         for mut config in parsed.ai_reviews {
             config.extra_instructions = parsed.ai_review.extra_instructions.clone();
@@ -121,31 +101,15 @@ impl Ruleset {
             ai_reviews.push(CompiledAiReview { config });
         }
         let hash = format!("{:x}", Sha256::digest(text.as_bytes()));
-        Ok(Self {
-            hash,
-            script_tasks,
-            ai_reviews,
-        })
+        Ok(Self { hash, ai_reviews })
     }
 
     pub fn hash(&self) -> &str {
         &self.hash
     }
 
-    pub fn script_task_count(&self) -> usize {
-        self.script_tasks.len()
-    }
-
     pub fn ai_review_count(&self) -> usize {
         self.ai_reviews.len()
-    }
-
-    pub fn script_tasks_by_ids(&self, requested_ids: &[String]) -> Vec<ScriptTaskConfig> {
-        self.script_tasks
-            .iter()
-            .filter(|task| requested_ids.iter().any(|id| id == &task.config.id))
-            .map(|task| task.config.clone())
-            .collect()
     }
 
     pub fn ai_reviews_by_ids(&self, requested_ids: &[String]) -> Vec<AiReviewConfig> {
@@ -155,10 +119,6 @@ impl Ruleset {
             .map(|review| review.config.clone())
             .collect()
     }
-}
-
-fn default_script_timeout_seconds() -> u64 {
-    60
 }
 
 fn default_ai_timeout_seconds() -> u64 {
@@ -214,19 +174,20 @@ model = "gpt-4.1-mini"
     }
 
     #[test]
-    fn script_tasks_are_selected_by_manual_ids() {
-        let rules = Ruleset::from_toml(
+    fn legacy_script_tasks_are_rejected_as_unknown_fields() {
+        let error = match Ruleset::from_toml(
             r#"
 [[script_tasks]]
 id = "manual-check"
 title = "Manual check"
 command = "python check.py"
 "#,
-        )
-        .unwrap();
+        ) {
+            Ok(_) => panic!("legacy script_tasks unexpectedly parsed"),
+            Err(error) => error,
+        };
 
-        assert_eq!(rules.script_tasks_by_ids(&["manual-check".into()]).len(), 1);
-        assert!(rules.script_tasks_by_ids(&["other".into()]).is_empty());
+        assert!(error.to_string().contains("unknown field `script_tasks`"));
     }
 
     #[test]
@@ -298,11 +259,10 @@ max_batches = 6
         let rules = Ruleset::from_toml(include_str!("../../rules.example.toml")).unwrap();
 
         assert_eq!(rules.ai_review_count(), 1);
-        assert_eq!(rules.script_task_count(), 1);
         let reviews = rules.ai_reviews_by_ids(&["ai-review".into()]);
         assert_eq!(reviews.len(), 1);
         assert!(reviews[0].extra_instructions.is_empty());
-        assert_eq!(reviews[0].max_tool_calls, 30);
+        assert_eq!(reviews[0].max_tool_calls, 0);
     }
 
     #[test]
