@@ -1542,11 +1542,12 @@ mod tests {
             let call = state.calls.fetch_add(1, Ordering::SeqCst) + 1;
             state.bodies.lock().unwrap().push(body);
             if call <= 2 {
-                tokio::time::sleep(Duration::from_millis(1_200)).await;
+                tokio::time::sleep(Duration::from_millis(2_200)).await;
             } else {
                 state
                     .fallback_saw_removed_context
                     .store(!state.context_dir.exists(), Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(700)).await;
             }
             Json(serde_json::json!({
                 "choices": [{"message": {"tool_calls": [{
@@ -1593,8 +1594,8 @@ mod tests {
             base_url: format!("http://{ai_addr}"),
             api_key: "key".into(),
             model: "model".into(),
-            timeout_seconds: 4,
-            request_timeout_seconds: Some(1),
+            timeout_seconds: 5,
+            request_timeout_seconds: Some(2),
             second_pass_on_clean: true,
             max_batch_diff_bytes: 30,
             max_batches: 2,
@@ -1630,6 +1631,14 @@ mod tests {
                     renamed_file: false,
                     deleted_file: false,
                 },
+                GitLabChange {
+                    old_path: "third.rs".into(),
+                    new_path: "third.rs".into(),
+                    diff: "@@ -0,0 +1 @@\n+third\n".into(),
+                    new_file: false,
+                    renamed_file: false,
+                    deleted_file: false,
+                },
             ],
             diff_refs: crate::gitlab::DiffRefs {
                 base_sha: Some("base".into()),
@@ -1638,11 +1647,16 @@ mod tests {
             },
         };
 
+        let overall_started = Instant::now();
         let result = service
             .run_ai_review_with_optional_clean_second_pass(&review, &changes, &event, None)
             .await;
 
         assert!(result.execution.result.is_ok());
+        assert!(
+            overall_started.elapsed() > Duration::from_secs(review.timeout_seconds),
+            "fallback must succeed after the original shared deadline would have expired"
+        );
         assert_eq!(state.calls.load(Ordering::SeqCst), 4);
         assert_eq!(
             result.metadata.fallback_reason,
@@ -1650,7 +1664,21 @@ mod tests {
         );
         assert!(state.fallback_saw_removed_context.load(Ordering::SeqCst));
         assert!(!context_dir.exists());
+        let coverage = result.execution.coverage.as_ref().unwrap();
+        assert_eq!(coverage.required_batches, 3);
+        assert_eq!(coverage.planned_batches, 2);
+        assert_eq!(coverage.completed_batches, 2);
+        assert_eq!(coverage.max_batches, 2);
+        assert_eq!(coverage.unreviewed_files, 1);
+        assert!(result
+            .execution
+            .incomplete_files
+            .iter()
+            .any(|file| file.path == "third.rs"));
         let bodies = state.bodies.lock().unwrap();
+        assert!(bodies
+            .iter()
+            .all(|body| !body.to_string().contains("third.rs")));
         let fallback = &bodies[2];
         let fallback_messages = fallback["messages"].as_array().unwrap();
         assert!(fallback_messages.iter().any(|message| {
