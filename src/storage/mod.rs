@@ -5,7 +5,7 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
     Row, SqlitePool,
 };
-use std::str::FromStr;
+use std::{str::FromStr, time::Duration};
 use tracing::info;
 
 pub const REVIEW_TIMEZONE: &str = "UTC";
@@ -104,7 +104,9 @@ pub struct StoredComment<'a> {
 
 impl StateStore {
     pub async fn connect(database_url: &str) -> AppResult<Self> {
-        let options = SqliteConnectOptions::from_str(database_url)?.create_if_missing(true);
+        let options = SqliteConnectOptions::from_str(database_url)?
+            .create_if_missing(true)
+            .busy_timeout(Duration::from_secs(30));
         info!(database_url, "connecting state store");
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -289,20 +291,24 @@ create table if not exists review_notifications (
     }
 
     async fn ensure_column(&self, table: &str, column: &str, definition: &str) -> AppResult<()> {
+        if !self.column_exists(table, column).await? {
+            let sql = format!("alter table {table} add column {column} {definition}");
+            if let Err(error) = sqlx::query(&sql).execute(&self.pool).await {
+                if !self.column_exists(table, column).await? {
+                    return Err(error.into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn column_exists(&self, table: &str, column: &str) -> AppResult<bool> {
         let pragma = format!("pragma table_info({table})");
-        let exists = sqlx::query(&pragma)
+        Ok(sqlx::query(&pragma)
             .fetch_all(&self.pool)
             .await?
             .into_iter()
-            .any(|row| {
-                let name: String = row.get("name");
-                name == column
-            });
-        if !exists {
-            let sql = format!("alter table {table} add column {column} {definition}");
-            sqlx::query(&sql).execute(&self.pool).await?;
-        }
-        Ok(())
+            .any(|row| row.get::<String, _>("name") == column))
     }
 
     pub async fn start_review_request(&self, request: &ReviewRequestStart<'_>) -> AppResult<()> {
@@ -468,7 +474,10 @@ update review_task_runs set
     coverage_required_batches = ?, coverage_planned_batches = ?,
     coverage_completed_batches = ?, coverage_max_batches = ?,
     tool_calls_used = ?, max_tool_calls = ?, coverage_complete = ?,
-    execution_mode = ?, fallback_reason = ?, context_elapsed_ms = ?, fallback_elapsed_ms = ?
+    execution_mode = case when ? then ? else execution_mode end,
+    fallback_reason = case when ? then ? else fallback_reason end,
+    context_elapsed_ms = case when ? then ? else context_elapsed_ms end,
+    fallback_elapsed_ms = case when ? then ? else fallback_elapsed_ms end
 where review_run_id = ? and task_type = ? and task_id = ?
 "#,
         )
@@ -491,13 +500,17 @@ where review_run_id = ? and task_type = ? and task_id = ?
         .bind(coverage.tool_calls_used as i64)
         .bind(coverage.max_tool_calls as i64)
         .bind(coverage.complete)
+        .bind(metadata.is_some())
         .bind(metadata.map(|metadata| metadata.execution_mode.as_str()))
+        .bind(metadata.is_some())
         .bind(metadata.and_then(|metadata| {
             metadata
                 .fallback_reason
                 .map(|fallback_reason| fallback_reason.as_str())
         }))
+        .bind(metadata.is_some())
         .bind(metadata.and_then(|metadata| metadata.context_elapsed_ms.map(saturating_u64_to_i64)))
+        .bind(metadata.is_some())
         .bind(metadata.and_then(|metadata| metadata.fallback_elapsed_ms.map(saturating_u64_to_i64)))
         .bind(task.review_run_id)
         .bind(task.task_type)
@@ -815,6 +828,10 @@ mod tests {
             .finish_task_run_with_coverage_and_metadata(&finish, &coverage, &[], Some(&metadata))
             .await
             .unwrap();
+        store
+            .finish_task_run_with_coverage(&finish, &coverage, &[])
+            .await
+            .unwrap();
 
         let row = sqlx::query(
             "select execution_mode, fallback_reason, context_elapsed_ms, fallback_elapsed_ms from review_task_runs where review_run_id = ?",
@@ -830,6 +847,94 @@ mod tests {
         );
         assert_eq!(row.get::<i64, _>("context_elapsed_ms"), 2_400_000);
         assert_eq!(row.get::<i64, _>("fallback_elapsed_ms"), 386_000);
+    }
+
+    #[tokio::test]
+    async fn execution_metadata_elapsed_milliseconds_saturate_at_i64_max() {
+        let store = StateStore::connect("sqlite::memory:").await.unwrap();
+        store.migrate().await.unwrap();
+        store
+            .start_task_run(&TaskRunStart {
+                review_run_id: "rr-saturated-metadata",
+                task_type: "ai_review",
+                task_id: "ai-review",
+                title: "AI Review",
+            })
+            .await
+            .unwrap();
+        let coverage = StoredReviewCoverage {
+            total_files: 0,
+            fully_reviewed_files: 0,
+            partially_reviewed_files: 0,
+            unreviewed_files: 0,
+            total_diff_bytes: 0,
+            reviewed_diff_bytes: 0,
+            required_batches: 0,
+            planned_batches: 0,
+            completed_batches: 0,
+            max_batches: 0,
+            tool_calls_used: 0,
+            max_tool_calls: 0,
+            complete: true,
+        };
+        let finish = TaskRunFinish {
+            review_run_id: "rr-saturated-metadata",
+            task_type: "ai_review",
+            task_id: "ai-review",
+            status: "completed",
+            findings: 0,
+            comments: 0,
+            error_code: None,
+            error: None,
+        };
+        let metadata = AiReviewExecutionMetadata {
+            execution_mode: AiReviewExecutionMode::Context,
+            fallback_reason: None,
+            context_elapsed_ms: Some(u64::MAX),
+            fallback_elapsed_ms: Some(u64::MAX),
+        };
+
+        store
+            .finish_task_run_with_coverage_and_metadata(&finish, &coverage, &[], Some(&metadata))
+            .await
+            .unwrap();
+
+        let row = sqlx::query(
+            "select context_elapsed_ms, fallback_elapsed_ms from review_task_runs where review_run_id = ?",
+        )
+        .bind("rr-saturated-metadata")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<i64, _>("context_elapsed_ms"), i64::MAX);
+        assert_eq!(row.get::<i64, _>("fallback_elapsed_ms"), i64::MAX);
+    }
+
+    #[tokio::test]
+    async fn concurrent_migrations_from_two_connections_both_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let database_url = format!("sqlite://{}", dir.path().join("state.db").display());
+        let first = StateStore::connect(&database_url).await.unwrap();
+        let second = StateStore::connect(&database_url).await.unwrap();
+
+        let (first_result, second_result) = tokio::join!(first.migrate(), second.migrate());
+
+        first_result.unwrap();
+        second_result.unwrap();
+        let columns = sqlx::query("pragma table_info(review_task_runs)")
+            .fetch_all(&first.pool)
+            .await
+            .unwrap();
+        for expected in [
+            "execution_mode",
+            "fallback_reason",
+            "context_elapsed_ms",
+            "fallback_elapsed_ms",
+        ] {
+            assert!(columns
+                .iter()
+                .any(|row| row.get::<String, _>("name") == expected));
+        }
     }
 
     #[tokio::test]
