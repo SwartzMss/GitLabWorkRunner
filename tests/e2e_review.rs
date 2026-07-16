@@ -799,6 +799,12 @@ async fn runs_second_ai_review_pass_when_first_pass_is_clean() {
                 let ai_request_count = Arc::clone(&ai_request_count_for_handler);
                 async move {
                     let attempt = ai_request_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    if attempt == 2 {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(json!({ "error": "transient second-pass failure" })),
+                        );
+                    }
                     let findings = if attempt == 1 {
                         json!([])
                     } else {
@@ -810,15 +816,18 @@ async fn runs_second_ai_review_pass_when_first_pass_is_clean() {
                             "message": "Handle the None case instead of unwrapping."
                         }])
                     };
-                    Json(json!({
-                        "choices": [{
-                            "message": {
-                                "content": serde_json::json!({
-                                    "findings": findings
-                                }).to_string()
-                            }
-                        }]
-                    }))
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "choices": [{
+                                "message": {
+                                    "content": serde_json::json!({
+                                        "findings": findings
+                                    }).to_string()
+                                }
+                            }]
+                        })),
+                    )
                 }
             }),
         )
@@ -879,7 +888,9 @@ second_pass_on_clean = true
     assert_eq!(summary.findings, 1);
     assert_eq!(summary.comments, 2);
     assert!(!summary.skipped);
-    assert_eq!(ai_request_count.load(Ordering::SeqCst), 2);
+    // The first pass is clean. The second pass receives one retryable response
+    // before returning the finding, so two semantic passes use three attempts.
+    assert_eq!(ai_request_count.load(Ordering::SeqCst), 3);
     assert_eq!(discussion_count.load(Ordering::SeqCst), 2);
 }
 
