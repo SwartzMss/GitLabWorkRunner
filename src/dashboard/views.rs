@@ -229,24 +229,24 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       review_run_timeout: "Review 整体超时", gitlab_comment_failed: "GitLab 发布失败", permission_denied: "权限不足",
       invalid_configuration: "配置无效", internal: "内部错误"
     }[code] || code || "未分类错误");
-    const executionModeText = (mode) => ({ context: "Context", diff_only_fallback: "Diff-only 降級" }[mode] || mode || "");
+    const executionModeText = (mode) => ({ context: "Context", diff_only_fallback: "Diff-only 降级" }[mode] || mode || "");
     const fallbackReasonText = (reason) => ({
-      archive_limit_exceeded: "Archive 超出限制",
-      review_run_timeout: "Context 整体超时",
+      archive_limit_exceeded: "Archive 超出安全限制",
+      review_run_timeout: "Context Review 整体超时",
       ai_request_timeout: "AI 请求超时",
-      ai_tool_loop_timeout: "AI 工具循环超时"
+      ai_tool_loop_timeout: "Context tool loop 超时"
     }[reason] || reason || "");
     const renderFailure = (failure) => failure ? `<div class="failure"><div><span class="badge failed">${esc(errorCodeText(failure.code))}</span>${failure.code ? ` <code>${esc(failure.code)}</code>` : ""}</div><pre class="failure-message">${esc(failure.message || "-")}</pre></div>` : "";
 
     function renderExecutionMetadata(task) {
       const rows = [];
       if (task.execution_mode != null) rows.push(`<div class="detail-row"><span>执行模式</span><span>${esc(executionModeText(task.execution_mode))}</span></div>`);
-      if (task.fallback_reason != null) rows.push(`<div class="detail-row"><span>降級原因</span><span>${esc(fallbackReasonText(task.fallback_reason))}</span></div>`);
-      if (task.context_elapsed_ms != null) rows.push(`<div class="detail-row"><span>Context 阶段</span><span>${fmtMs(task.context_elapsed_ms)}</span></div>`);
-      if (task.fallback_elapsed_ms != null) rows.push(`<div class="detail-row"><span>Diff-only 阶段</span><span>${fmtMs(task.fallback_elapsed_ms)}</span></div>`);
+      if (task.fallback_reason != null) rows.push(`<div class="detail-row"><span>降级原因</span><span>${esc(fallbackReasonText(task.fallback_reason))}</span></div>`);
+      if (task.context_elapsed_ms != null) rows.push(`<div class="detail-row"><span>Context</span><span>${fmtMs(task.context_elapsed_ms)}</span></div>`);
+      if (task.fallback_elapsed_ms != null) rows.push(`<div class="detail-row"><span>Diff-only</span><span>${fmtMs(task.fallback_elapsed_ms)}</span></div>`);
       if (task.context_elapsed_ms != null || task.fallback_elapsed_ms != null) {
         const total = (task.context_elapsed_ms ?? 0) + (task.fallback_elapsed_ms ?? 0);
-        rows.push(`<div class="detail-row"><span>AI 总耗时</span><span>${fmtMs(total)}</span></div>`);
+        rows.push(`<div class="detail-row"><span>AI 合计</span><span>${fmtMs(total)}</span></div>`);
       }
       if (!rows.length) return "";
       return `<div class="detail-list">${rows.join("")}</div>`;
@@ -481,6 +481,32 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
+
+    fn render_task(task: serde_json::Value) -> String {
+        let script = DASHBOARD_HTML
+            .split_once("    const esc =")
+            .unwrap()
+            .1
+            .split_once("    function params(")
+            .unwrap()
+            .0;
+        let program = format!(
+            "const esc ={}\nconsole.log(renderTaskCoverage({}));",
+            script, task
+        );
+        let output = Command::new("node")
+            .arg("-e")
+            .arg(program)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
 
     #[test]
     fn dashboard_shell_is_localized_for_chinese_users() {
@@ -545,36 +571,58 @@ mod tests {
 
     #[test]
     fn run_detail_renders_execution_metadata_and_human_durations() {
-        assert!(
-            DASHBOARD_HTML.contains(r#"context: "Context", diff_only_fallback: "Diff-only 降級""#)
-        );
-        assert!(DASHBOARD_HTML.contains(r#"archive_limit_exceeded: "Archive 超出限制""#));
-        assert!(DASHBOARD_HTML.contains(r#"review_run_timeout: "Context 整体超时""#));
-        assert!(DASHBOARD_HTML.contains(r#"ai_request_timeout: "AI 请求超时""#));
-        assert!(DASHBOARD_HTML.contains(r#"ai_tool_loop_timeout: "AI 工具循环超时""#));
-        assert!(DASHBOARD_HTML.contains("<span>Context 阶段</span>"));
-        assert!(DASHBOARD_HTML.contains("<span>Diff-only 阶段</span>"));
-        assert!(DASHBOARD_HTML.contains("<span>AI 总耗时</span>"));
-        let total_seconds = (2_400_000 + 386_000) / 1_000;
-        assert_eq!(total_seconds / 60, 46);
-        assert_eq!(total_seconds % 60, 26);
-        assert!(DASHBOARD_HTML.contains(
-            "const total = (task.context_elapsed_ms ?? 0) + (task.fallback_elapsed_ms ?? 0)"
-        ));
-        assert!(DASHBOARD_HTML.contains("`${minutes} 分 ${seconds % 60} 秒`"));
-        assert!(DASHBOARD_HTML
-            .contains("`${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分 ${seconds % 60} 秒`"));
-        assert!(DASHBOARD_HTML
-            .contains("task.context_elapsed_ms != null || task.fallback_elapsed_ms != null"));
+        let html = render_task(serde_json::json!({
+            "title": "AI Review", "status": "completed", "findings": 0,
+            "coverage_total_files": null,
+            "execution_mode": "diff_only_fallback",
+            "fallback_reason": "ai_tool_loop_timeout",
+            "context_elapsed_ms": 2_400_000,
+            "fallback_elapsed_ms": 386_000
+        }));
+
+        assert!(html.contains("<span>执行模式</span><span>Diff-only 降级</span>"));
+        assert!(html.contains("<span>降级原因</span><span>Context tool loop 超时</span>"));
+        assert!(html.contains("<span>Context</span><span>40 分 0 秒</span>"));
+        assert!(html.contains("<span>Diff-only</span><span>6 分 26 秒</span>"));
+        assert!(html.contains("<span>AI 合计</span><span>46 分 26 秒</span>"));
+    }
+
+    #[test]
+    fn run_detail_renders_approved_fallback_reason_copy() {
+        for (reason, expected) in [
+            ("archive_limit_exceeded", "Archive 超出安全限制"),
+            ("review_run_timeout", "Context Review 整体超时"),
+            ("ai_request_timeout", "AI 请求超时"),
+            ("ai_tool_loop_timeout", "Context tool loop 超时"),
+        ] {
+            let html = render_task(serde_json::json!({
+                "title": "AI Review", "status": "completed", "findings": 0,
+                "coverage_total_files": null, "fallback_reason": reason
+            }));
+            assert!(html.contains(expected), "missing {expected} in {html}");
+        }
     }
 
     #[test]
     fn run_detail_escapes_unknown_execution_metadata_and_hides_null_rows() {
-        assert!(DASHBOARD_HTML.contains("esc(executionModeText(task.execution_mode))"));
-        assert!(DASHBOARD_HTML.contains("esc(fallbackReasonText(task.fallback_reason))"));
-        assert!(DASHBOARD_HTML.contains("if (!rows.length) return \"\";"));
-        assert!(DASHBOARD_HTML.contains("task.context_elapsed_ms != null"));
-        assert!(DASHBOARD_HTML.contains("task.fallback_elapsed_ms != null"));
+        let unknown = render_task(serde_json::json!({
+            "title": "AI Review", "status": "completed", "findings": 0,
+            "coverage_total_files": null,
+            "execution_mode": "<future-mode>", "fallback_reason": "<future-reason>"
+        }));
+        assert!(unknown.contains("&lt;future-mode&gt;"));
+        assert!(unknown.contains("&lt;future-reason&gt;"));
+        assert!(!unknown.contains("AI 合计"));
+
+        let legacy = render_task(serde_json::json!({
+            "title": "Legacy", "status": "completed", "findings": 0,
+            "coverage_total_files": null,
+            "execution_mode": null, "fallback_reason": null,
+            "context_elapsed_ms": null, "fallback_elapsed_ms": null
+        }));
+        assert!(!legacy.contains("执行模式"));
+        assert!(!legacy.contains("降级原因"));
+        assert!(!legacy.contains("AI 合计"));
     }
 
     #[test]
