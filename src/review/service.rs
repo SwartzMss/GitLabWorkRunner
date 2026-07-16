@@ -11,7 +11,8 @@ use crate::{
     rules::{AiReviewConfig, Finding, Ruleset, Severity},
     storage::{
         ReviewRequestStart, StateStore, StoredComment, StoredFinding, StoredReviewCoverage,
-        StoredReviewCoverageFile, TaskRunFinish, TaskRunProgress, TaskRunStart,
+        StoredReviewCoverageFile, TaskRunExecutionMetadata, TaskRunFinish, TaskRunProgress,
+        TaskRunStart,
     },
     webhook::{MergeRequestEvent, MergeRequestNoteEvent},
 };
@@ -965,6 +966,26 @@ impl ReviewService {
         }
     }
 
+    async fn update_ai_task_execution_metadata(
+        &self,
+        review: &AiReviewConfig,
+        metadata: &AiReviewExecutionMetadata,
+    ) {
+        let task = TaskRunExecutionMetadata {
+            review_run_id: self.review_run_id(),
+            task_type: "ai_review",
+            task_id: &review.id,
+            metadata,
+        };
+        if let Err(err) = self.store.update_task_execution_metadata(&task).await {
+            warn!(
+                ai_review_id = %review.id,
+                error = %err,
+                "failed to persist AI review execution metadata"
+            );
+        }
+    }
+
     async fn timeout_fallback_for_execution(
         &self,
         request: TimeoutFallbackRequest<'_>,
@@ -1001,6 +1022,14 @@ impl ReviewService {
             max_fallback_attempts = 1,
             "context-assisted AI review timed out; transitioning to one-shot diff-only fallback"
         );
+        let fallback_metadata = AiReviewExecutionMetadata {
+            execution_mode: AiReviewExecutionMode::DiffOnlyFallback,
+            fallback_reason: Some(reason),
+            context_elapsed_ms: Some(context_elapsed_ms),
+            fallback_elapsed_ms: None,
+        };
+        self.update_ai_task_execution_metadata(review, &fallback_metadata)
+            .await;
         drop(context.take());
         info!(
             project_id = event.project_id,
@@ -1108,6 +1137,14 @@ impl ReviewService {
                     error = %err,
                     "AI review context archive exceeded limits; continuing with diff-only review"
                 );
+                let fallback_metadata = AiReviewExecutionMetadata {
+                    execution_mode: AiReviewExecutionMode::DiffOnlyFallback,
+                    fallback_reason: Some(AiReviewFallbackReason::ArchiveLimitExceeded),
+                    context_elapsed_ms: Some(context_elapsed_ms),
+                    fallback_elapsed_ms: None,
+                };
+                self.update_ai_task_execution_metadata(review, &fallback_metadata)
+                    .await;
                 let fallback_started = Instant::now();
                 let execution = self
                     .execute_ai_review(
@@ -1144,6 +1181,14 @@ impl ReviewService {
                 };
             }
         };
+        let context_metadata = AiReviewExecutionMetadata {
+            execution_mode: AiReviewExecutionMode::Context,
+            fallback_reason: None,
+            context_elapsed_ms: Some(elapsed_ms(context_started)),
+            fallback_elapsed_ms: None,
+        };
+        self.update_ai_task_execution_metadata(review, &context_metadata)
+            .await;
         let execution = {
             let source_dir = context.as_ref().map(|context| context.source_dir.as_path());
             self.execute_ai_review(review, &changes.changes, source_dir, review_request, None)

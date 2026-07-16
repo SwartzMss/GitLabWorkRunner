@@ -591,7 +591,7 @@ dependencies = [
 
 [[package]]
 name = "gitlab-work-runner"
-version = "1.0.17"
+version = "3.0.0"
 dependencies = [
  "axum",
  "chrono",

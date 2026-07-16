@@ -98,6 +98,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     .progress span { display: block; height: 100%; background: #16a05d; }
     .task-progress { padding: 16px 20px 0; display: grid; gap: 9px; }
     .task-progress-title { display: flex; justify-content: space-between; gap: 12px; color: #1f2a44; font-size: 13px; font-weight: 650; }
+    .task-progress-mode { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; color: var(--muted); font-size: 12px; }
     .task-progress-meta { color: var(--muted); font-size: 12px; }
     .task-progress-bar { height: 7px; background: #e8edf5; border-radius: 999px; overflow: hidden; }
     .task-progress-bar span { display: block; height: 100%; background: #315bea; }
@@ -245,11 +246,9 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
 
     function renderExecutionMetadata(task) {
       const rows = [];
-      if (task.execution_mode != null) rows.push(`<div class="detail-row"><span>执行模式</span><span>${esc(executionModeText(task.execution_mode))}</span></div>`);
-      if (task.fallback_reason != null) rows.push(`<div class="detail-row"><span>降级原因</span><span>${esc(fallbackReasonText(task.fallback_reason))}</span></div>`);
-      if (task.context_elapsed_display != null) rows.push(`<div class="detail-row"><span>Context</span><span>${esc(task.context_elapsed_display)}</span></div>`);
-      if (task.fallback_elapsed_display != null) rows.push(`<div class="detail-row"><span>Diff-only</span><span>${esc(task.fallback_elapsed_display)}</span></div>`);
-      if (task.ai_total_elapsed_display != null) rows.push(`<div class="detail-row"><span>AI 合计</span><span>${esc(task.ai_total_elapsed_display)}</span></div>`);
+      if (task.status !== "running" && task.context_elapsed_display != null) rows.push(`<div class="detail-row"><span>Context</span><span>${esc(task.context_elapsed_display)}</span></div>`);
+      if (task.status !== "running" && task.fallback_elapsed_display != null) rows.push(`<div class="detail-row"><span>Diff-only</span><span>${esc(task.fallback_elapsed_display)}</span></div>`);
+      if (task.status !== "running" && task.ai_total_elapsed_display != null) rows.push(`<div class="detail-row"><span>AI 合计</span><span>${esc(task.ai_total_elapsed_display)}</span></div>`);
       if (!rows.length) return "";
       return `<div class="detail-list">${rows.join("")}</div>`;
     }
@@ -262,7 +261,11 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       const width = hasTotal ? Math.min(100, Math.max(0, Math.round((current / total) * 100))) : 100;
       const count = hasTotal ? `${esc(current)} / ${esc(total)} ${esc(task.progress_unit || "")}` : esc(task.progress_phase || "");
       const updated = task.progress_updated_at ? `最后更新 ${relative(task.progress_updated_at)}` : "";
+      const executionMode = task.execution_mode ? `<span class="badge ${task.execution_mode === "diff_only_fallback" ? "warning" : "info"}">${esc(executionModeText(task.execution_mode))}</span>` : "";
+      const fallbackReason = task.fallback_reason ? `<span>${esc(fallbackReasonText(task.fallback_reason))}</span>` : "";
+      const mode = executionMode || fallbackReason ? `<div class="task-progress-mode">${executionMode}${fallbackReason}</div>` : "";
       return `<div class="task-progress">
+        ${mode}
         <div class="task-progress-title"><span>${esc(task.progress_message || task.progress_phase)}</span><span>${count}</span></div>
         <div class="task-progress-bar"><span style="width:${width}%"></span></div>
         <div class="task-progress-meta">${updated}</div>
@@ -272,12 +275,12 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     function renderTaskCoverage(task) {
       const metadata = renderExecutionMetadata(task);
       const progress = renderTaskProgress(task);
+      const findingsRow = task.status !== "running" ? `<div class="detail-row"><span>问题</span><span>${esc(task.findings ?? 0)}</span></div>` : "";
       if (task.coverage_total_files == null) {
         const failure = renderFailure(task.error ? { code: task.error_code, message: task.error } : null);
         return `${progress}<div class="detail-list">
-          <div class="detail-row"><span>任务</span><span>${esc(task.title)}</span></div>
           <div class="detail-row"><span>状态</span><span>${badge(task.status)}</span></div>
-          <div class="detail-row"><span>问题</span><span>${esc(task.findings ?? 0)}</span></div>
+          ${findingsRow}
         </div>${metadata}${failure}`;
       }
       const batchStats = `${task.coverage_completed_batches ?? 0} 已用 / ${fmtLimit(task.coverage_max_batches)} 上限`;
@@ -570,8 +573,10 @@ mod tests {
         });
 
         assert_eq!(legacy_task["coverage_total_files"], serde_json::Value::Null);
-        assert!(DASHBOARD_HTML.contains("${esc(task.title)}"));
+        assert!(!DASHBOARD_HTML.contains("<span>任务</span>"));
         assert!(DASHBOARD_HTML.contains("${badge(task.status)}"));
+        assert!(DASHBOARD_HTML.contains("const findingsRow = task.status !== \"running\""));
+        assert!(DASHBOARD_HTML.contains("${findingsRow}"));
         assert!(DASHBOARD_HTML.contains("${esc(task.findings ?? 0)}"));
         assert!(DASHBOARD_HTML.contains(
             "renderFailure(task.error ? { code: task.error_code, message: task.error } : null)"
@@ -586,9 +591,18 @@ mod tests {
         assert!(DASHBOARD_HTML.contains("esc(task.context_elapsed_display)"));
         assert!(DASHBOARD_HTML.contains("esc(task.fallback_elapsed_display)"));
         assert!(DASHBOARD_HTML.contains("esc(task.ai_total_elapsed_display)"));
+        assert!(DASHBOARD_HTML.contains("task.status !== \"running\""));
         assert!(!DASHBOARD_HTML.contains("const total = (task.context_elapsed_ms"));
         assert!(!DASHBOARD_HTML.contains("fmtMs(task.context_elapsed_ms)"));
         assert!(!DASHBOARD_HTML.contains("fmtMs(task.fallback_elapsed_ms)"));
+    }
+
+    #[test]
+    fn run_detail_renders_execution_mode_inside_running_progress() {
+        assert!(DASHBOARD_HTML.contains("task-progress-mode"));
+        assert!(DASHBOARD_HTML.contains("task.execution_mode === \"diff_only_fallback\""));
+        assert!(DASHBOARD_HTML.contains("esc(executionModeText(task.execution_mode))"));
+        assert!(DASHBOARD_HTML.contains("esc(fallbackReasonText(task.fallback_reason))"));
     }
 
     #[test]
@@ -608,6 +622,8 @@ mod tests {
     fn run_detail_escapes_unknown_execution_metadata_and_hides_null_rows() {
         assert!(DASHBOARD_HTML.contains("esc(executionModeText(task.execution_mode))"));
         assert!(DASHBOARD_HTML.contains("esc(fallbackReasonText(task.fallback_reason))"));
+        assert!(!DASHBOARD_HTML.contains("<span>执行模式</span>"));
+        assert!(!DASHBOARD_HTML.contains("<span>降级原因</span>"));
         assert!(DASHBOARD_HTML.contains("if (!rows.length) return \"\";"));
         assert!(DASHBOARD_HTML.contains("task.context_elapsed_display != null"));
         assert!(DASHBOARD_HTML.contains("task.fallback_elapsed_display != null"));

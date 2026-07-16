@@ -62,6 +62,14 @@ pub struct TaskRunProgress<'a> {
 }
 
 #[derive(Clone, Debug)]
+pub struct TaskRunExecutionMetadata<'a> {
+    pub review_run_id: &'a str,
+    pub task_type: &'a str,
+    pub task_id: &'a str,
+    pub metadata: &'a AiReviewExecutionMetadata,
+}
+
+#[derive(Clone, Debug)]
 pub struct StoredReviewCoverage {
     pub total_files: usize,
     pub fully_reviewed_files: usize,
@@ -493,6 +501,33 @@ where review_run_id = ? and task_type = ? and task_id = ?
         .bind(progress.review_run_id)
         .bind(progress.task_type)
         .bind(progress.task_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn update_task_execution_metadata(
+        &self,
+        task: &TaskRunExecutionMetadata<'_>,
+    ) -> AppResult<()> {
+        sqlx::query(
+            r#"
+update review_task_runs
+set execution_mode = ?, fallback_reason = ?, context_elapsed_ms = ?, fallback_elapsed_ms = ?
+where review_run_id = ? and task_type = ? and task_id = ?
+"#,
+        )
+        .bind(task.metadata.execution_mode.as_str())
+        .bind(
+            task.metadata
+                .fallback_reason
+                .map(|fallback_reason| fallback_reason.as_str()),
+        )
+        .bind(task.metadata.context_elapsed_ms.map(saturating_u64_to_i64))
+        .bind(task.metadata.fallback_elapsed_ms.map(saturating_u64_to_i64))
+        .bind(task.review_run_id)
+        .bind(task.task_type)
+        .bind(task.task_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -975,6 +1010,97 @@ mod tests {
         );
         assert_eq!(row.get::<i64, _>("context_elapsed_ms"), 2_400_000);
         assert_eq!(row.get::<i64, _>("fallback_elapsed_ms"), 386_000);
+    }
+
+    #[tokio::test]
+    async fn updates_ai_execution_metadata_before_task_finishes() {
+        let store = StateStore::connect("sqlite::memory:").await.unwrap();
+        store.migrate().await.unwrap();
+        store
+            .start_task_run(&TaskRunStart {
+                review_run_id: "rr-running-metadata",
+                task_type: "ai_review",
+                task_id: "ai-review",
+                title: "AI Review",
+            })
+            .await
+            .unwrap();
+        let metadata = AiReviewExecutionMetadata {
+            execution_mode: AiReviewExecutionMode::DiffOnlyFallback,
+            fallback_reason: Some(AiReviewFallbackReason::AiRequestTimeout),
+            context_elapsed_ms: Some(2_400_000),
+            fallback_elapsed_ms: None,
+        };
+
+        store
+            .update_task_execution_metadata(&TaskRunExecutionMetadata {
+                review_run_id: "rr-running-metadata",
+                task_type: "ai_review",
+                task_id: "ai-review",
+                metadata: &metadata,
+            })
+            .await
+            .unwrap();
+
+        let row = sqlx::query(
+            "select status, execution_mode, fallback_reason, context_elapsed_ms, fallback_elapsed_ms from review_task_runs where review_run_id = ?",
+        )
+        .bind("rr-running-metadata")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<String, _>("status"), "running");
+        assert_eq!(row.get::<String, _>("execution_mode"), "diff_only_fallback");
+        assert_eq!(
+            row.get::<String, _>("fallback_reason"),
+            "ai_request_timeout"
+        );
+        assert_eq!(row.get::<i64, _>("context_elapsed_ms"), 2_400_000);
+        assert!(row.get::<Option<i64>, _>("fallback_elapsed_ms").is_none());
+    }
+
+    #[tokio::test]
+    async fn updates_context_execution_metadata_before_task_finishes() {
+        let store = StateStore::connect("sqlite::memory:").await.unwrap();
+        store.migrate().await.unwrap();
+        store
+            .start_task_run(&TaskRunStart {
+                review_run_id: "rr-running-context",
+                task_type: "ai_review",
+                task_id: "ai-review",
+                title: "AI Review",
+            })
+            .await
+            .unwrap();
+        let metadata = AiReviewExecutionMetadata {
+            execution_mode: AiReviewExecutionMode::Context,
+            fallback_reason: None,
+            context_elapsed_ms: Some(215),
+            fallback_elapsed_ms: None,
+        };
+
+        store
+            .update_task_execution_metadata(&TaskRunExecutionMetadata {
+                review_run_id: "rr-running-context",
+                task_type: "ai_review",
+                task_id: "ai-review",
+                metadata: &metadata,
+            })
+            .await
+            .unwrap();
+
+        let row = sqlx::query(
+            "select status, execution_mode, fallback_reason, context_elapsed_ms, fallback_elapsed_ms from review_task_runs where review_run_id = ?",
+        )
+        .bind("rr-running-context")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<String, _>("status"), "running");
+        assert_eq!(row.get::<String, _>("execution_mode"), "context");
+        assert!(row.get::<Option<String>, _>("fallback_reason").is_none());
+        assert_eq!(row.get::<i64, _>("context_elapsed_ms"), 215);
+        assert!(row.get::<Option<i64>, _>("fallback_elapsed_ms").is_none());
     }
 
     #[tokio::test]
