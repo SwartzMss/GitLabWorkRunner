@@ -200,10 +200,10 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     const fmtMs = (value) => {
       if (value == null) return "-";
       const seconds = Math.max(0, Math.round(value / 1000));
-      if (seconds < 60) return `${seconds} 秒`;
+      if (seconds < 60) return `${pad(seconds)} 秒`;
       const minutes = Math.floor(seconds / 60);
-      if (minutes < 60) return `${minutes} 分 ${seconds % 60} 秒`;
-      return `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分 ${seconds % 60} 秒`;
+      if (minutes < 60) return `${minutes} 分 ${pad(seconds % 60)} 秒`;
+      return `${Math.floor(minutes / 60)} 小时 ${pad(minutes % 60)} 分 ${pad(seconds % 60)} 秒`;
     };
     const statusText = (status) => ({ running: "运行中", completed: "已完成", failed: "失败", error: "错误" }[status] || status || "-");
     const severityText = (severity) => ({ error: "严重", warning: "主要", info: "提示" }[severity] || severity || "-");
@@ -582,9 +582,16 @@ mod tests {
 
         assert!(html.contains("<span>执行模式</span><span>Diff-only 降级</span>"));
         assert!(html.contains("<span>降级原因</span><span>Context tool loop 超时</span>"));
-        assert!(html.contains("<span>Context</span><span>40 分 0 秒</span>"));
+        assert!(html.contains("<span>Context</span><span>40 分 00 秒</span>"));
         assert!(html.contains("<span>Diff-only</span><span>6 分 26 秒</span>"));
         assert!(html.contains("<span>AI 合计</span><span>46 分 26 秒</span>"));
+
+        let hours = render_task(serde_json::json!({
+            "title": "AI Review", "status": "completed", "findings": 0,
+            "coverage_total_files": null, "context_elapsed_ms": 3_723_000
+        }));
+        assert!(hours.contains("<span>Context</span><span>1 小时 02 分 03 秒</span>"));
+        assert!(hours.contains("<span>AI 合计</span><span>1 小时 02 分 03 秒</span>"));
     }
 
     #[test]
