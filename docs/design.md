@@ -10,11 +10,11 @@ The review loop is:
 
 1. Receive a GitLab MR note event containing a standalone `@id`.
 2. Validate the webhook token.
-3. Resolve the requested `[[ai_reviews]]` and `[[script_tasks]]` entries by exact id.
+3. Resolve the requested `[[ai_reviews]]` entries by exact id.
 4. Guard against duplicate in-flight work for `project_id + mr_iid + commit_sha`.
 5. Fetch MR changes through the GitLab API.
 6. Parse the diff and map added lines.
-7. Run the selected AI reviews and optional script tasks.
+7. Run the selected AI reviews.
 8. Publish line-level or MR-level comments.
 9. Store review runs, task runs, findings, and published comments in SQLite.
 
@@ -68,15 +68,14 @@ Manual commands are standalone tokens in MR comments:
 
 ```text
 @ai-review
-@check-todo-tbd
 ```
 
 Selection rules:
 
-- `@id` matches `[[ai_reviews]].id` and `[[script_tasks]].id`.
+- `@id` matches `[[ai_reviews]].id`.
 - Unknown ids are ignored.
 - Issue, wiki, work item, and other non-MR comments are ignored.
-- A single comment may request multiple configured tasks.
+- A single comment may request multiple configured AI reviews.
 - The same commit can be triggered again after the current run finishes.
 
 The current implementation does not perform an additional GitLab role check for the comment author. Any user who can comment on the MR and knows a configured `@id` can request that task.
@@ -125,39 +124,7 @@ Optional read-only context tools can be enabled under `[ai_review.context_tools]
 
 When these tools are enabled, the service downloads the MR head archive and exposes only repository-local text content. It does not execute shell commands and rejects or skips unsafe paths such as `.env`, `.git`, absolute paths, and `..` traversal.
 
-## Script Tasks
-
-Script tasks are configured with `[[script_tasks]]`. They are optional and are triggered manually by their `@id`.
-
-Example:
-
-```toml
-[[script_tasks]]
-id = "check-todo-tbd"
-title = "TODO/TBD marker check"
-command = "python examples/scripts/check_todo_tbd.py"
-timeout_seconds = 30
-```
-
-The script receives:
-
-```text
-<MR head source directory> <result.txt path>
-```
-
-Exit behavior:
-
-- `exit 0`: check passed.
-- `exit 1`: findings were written to `result.txt`; the service reads them and publishes comments.
-- Other exit codes, missing exit status, or timeout: task failure; the service keeps logs and does not publish task findings.
-
-Recommended `result.txt` line format:
-
-```text
-src/config.rs:5: //TODO aa
-```
-
-Script commands run from the runner executable directory, not from the target repository.
+If any configured `[archive]` download or extraction limit is exceeded, the service logs a warning and runs the AI Review with diff only. Context tools are unavailable in that fallback, and no archive-limit failure notification is posted. A normal archive still enables all configured context tools. A clean optional second pass reuses the same prepared context or diff-only fallback. Archive timeout, permission, HTTP, corrupt-ZIP, and filesystem errors remain fatal.
 
 ## Comment Builder
 
@@ -192,9 +159,8 @@ Timestamps are stored as RFC3339 UTC strings. The dashboard reads these tables t
 Downloaded archive zip bytes stay in memory and are not written to disk. When repository context is needed, the archive is extracted under `work/`:
 
 - AI context tools: `work/ai_review_context/.../<review_run_id>/source`
-- Script tasks: `work/script_tasks/.../<task_id>/source`
 
-After completion or failure, AI Review deletes the current context run directory. Script tasks delete `source` but keep `run.log` and `result.txt`.
+After completion or failure, AI Review deletes the current context run directory.
 
 The service cleans stale work directories older than 24 hours on startup and repeats cleanup hourly while running. Cleanup failures are logged as warnings and do not block reviews.
 
@@ -239,8 +205,9 @@ Review configuration lives in `rules.toml`; see `rules.example.toml` for a compl
 - Missing required payload fields: `400 Bad Request`.
 - Duplicate in-flight commit: skipped with an MR-level status comment for note triggers.
 - Queue busy: skipped with an MR-level queue-busy comment.
-- GitLab API failure, archive limit failure, diff processing failure, or internal fatal error: review run fails and posts an MR-level failure comment when possible.
-- Single AI review failure while other tasks can continue: a partial failure summary is posted before the run finishes.
+- GitLab API failure, non-limit archive failure, diff processing failure, or internal fatal error: review run fails and posts an MR-level failure comment when possible.
+- Archive safety limit: log a warning and continue AI Review with diff only.
+- Single AI review failure while other AI reviews can continue: a partial failure summary is posted before the run finishes.
 
 ## Dashboard
 
@@ -265,5 +232,4 @@ The dashboard does not run migrations; start the runner once first when using a 
 - Optional polling compensation for missed webhooks.
 - More AI provider adapters.
 - Richer MR-level summaries.
-- More structured script task output formats.
 - Permission checks or allowlists for manual command users.
