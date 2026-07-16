@@ -167,7 +167,11 @@ impl GitLabClient {
                         .set("PRIVATE-TOKEN", &token)
                         .call();
                     let response = ensure_gitlab_success_response(
-                        response_from_ureq_result(response)?,
+                        response_from_ureq_result(
+                            response,
+                            ReviewErrorCode::GitLabApiTimeout,
+                            ReviewErrorCode::GitLabApiFailed,
+                        )?,
                         "fetch merge request changes from gitlab",
                     )?;
                     let status = response.status();
@@ -243,7 +247,11 @@ impl GitLabClient {
                         .set("PRIVATE-TOKEN", &token)
                         .call();
                     let response = ensure_gitlab_success_response(
-                        response_from_ureq_result(response)?,
+                        response_from_ureq_result(
+                            response,
+                            ReviewErrorCode::ArchiveDownloadTimeout,
+                            ReviewErrorCode::ArchiveDownloadFailed,
+                        )?,
                         "download repository archive from gitlab",
                     )?;
                     let status = response.status();
@@ -314,7 +322,11 @@ impl GitLabClient {
                         .set("PRIVATE-TOKEN", &token)
                         .set("content-type", "application/json")
                         .send_string(&body);
-                    let response = response_from_ureq_result(response)?;
+                    let response = response_from_ureq_result(
+                        response,
+                        ReviewErrorCode::GitLabCommentFailed,
+                        ReviewErrorCode::GitLabCommentFailed,
+                    )?;
                     let status = response.status();
                     if status == 400 && request.position.is_some() {
                         let fallback = CreateDiscussionRequest {
@@ -329,7 +341,11 @@ impl GitLabClient {
                             .set("content-type", "application/json")
                             .send_string(&fallback_body);
                         let response = ensure_gitlab_success_response(
-                            response_from_ureq_result(created)?,
+                            response_from_ureq_result(
+                                created,
+                                ReviewErrorCode::GitLabCommentFailed,
+                                ReviewErrorCode::GitLabCommentFailed,
+                            )?,
                             "create fallback gitlab merge request discussion",
                         )?;
                         let body = read_ureq_text(response)?;
@@ -434,7 +450,11 @@ impl GitLabClient {
                         .timeout(timeout)
                         .set("PRIVATE-TOKEN", &token)
                         .call();
-                    let response = response_from_ureq_result(response)?;
+                    let response = response_from_ureq_result(
+                        response,
+                        ReviewErrorCode::GitLabCommentFailed,
+                        ReviewErrorCode::GitLabCommentFailed,
+                    )?;
                     let status = response.status();
                     if status == 409 {
                         return Ok(status);
@@ -521,15 +541,38 @@ fn longest_timeout(first: Duration, second: Duration) -> Duration {
 
 fn response_from_ureq_result(
     result: Result<ureq::Response, ureq::Error>,
+    timeout_code: ReviewErrorCode,
+    failure_code: ReviewErrorCode,
 ) -> AppResult<ureq::Response> {
     match result {
         Ok(response) => Ok(response),
         Err(ureq::Error::Status(_, response)) => Ok(response),
+        Err(err) if ureq_error_is_timeout(&err) => Err(AppError::gitlab(
+            timeout_code,
+            format!("GitLab HTTP request timed out: {err}"),
+        )),
         Err(err) => Err(AppError::gitlab(
-            ReviewErrorCode::GitLabApiFailed,
+            failure_code,
             format!("GitLab HTTP request failed: {err}"),
         )),
     }
+}
+
+fn ureq_error_is_timeout(error: &ureq::Error) -> bool {
+    if error.kind() != ureq::ErrorKind::Io {
+        return false;
+    }
+    let mut source = std::error::Error::source(error);
+    while let Some(err) = source {
+        if err
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
+        {
+            return true;
+        }
+        source = err.source();
+    }
+    false
 }
 
 fn ensure_gitlab_success_response(
