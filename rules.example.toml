@@ -9,6 +9,7 @@ extra_instructions = ""
 # and result size.
 max_tool_calls = 0
 max_tool_result_bytes = 60000
+max_tool_total_bytes = 40000
 
 [[ai_reviews]]
 id = "ai-review"

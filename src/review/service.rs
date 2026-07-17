@@ -1625,6 +1625,7 @@ mod tests {
             extra_instructions: String::new(),
             max_tool_calls: 4,
             max_tool_result_bytes: 100,
+            max_tool_total_bytes: 40_000,
         };
         let event = MergeRequestEvent {
             project_id: 1,
@@ -1781,6 +1782,7 @@ mod tests {
             extra_instructions: String::new(),
             max_tool_calls: 1,
             max_tool_result_bytes: 1,
+            max_tool_total_bytes: 40_000,
         };
         let event = MergeRequestEvent {
             project_id: 1,
@@ -1918,6 +1920,7 @@ mod tests {
             extra_instructions: String::new(),
             max_tool_calls: 1,
             max_tool_result_bytes: 1_000,
+            max_tool_total_bytes: 40_000,
         };
         let event = MergeRequestEvent {
             project_id: 1,

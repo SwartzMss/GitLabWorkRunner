@@ -230,8 +230,9 @@ Recommended `rules.toml` example:
 # Optional global AI Review prompt settings shared by every [[ai_reviews]] entry.
 # The built-in system prompt always applies; extra_instructions is appended to the system prompt as administrator review policy.
 extra_instructions = ""
-max_tool_calls = 30
-max_tool_result_bytes = 60000
+max_tool_calls = 8
+max_tool_result_bytes = 12000
+max_tool_total_bytes = 40000
 
 [[ai_reviews]]
 id = "ai-review"
@@ -240,7 +241,7 @@ base_url = "https://api.openai.com/v1"
 api_key = "<your-ai-api-key>"
 model = "gpt-4.1-mini"
 timeout_seconds = 1200
-request_timeout_seconds = 420
+request_timeout_seconds = 300
 max_batch_diff_bytes = 15000
 max_batches = 10
 ```
@@ -250,9 +251,11 @@ Posting a standalone `@ai-review` in an MR comment triggers the entry whose `id 
 `[ai_review]` is the global AI Review prompt configuration. The built-in system prompt always applies; `extra_instructions` is appended to the system prompt as administrator review policy. If omitted, only the built-in prompt is used.
 Text after `@ai-review` in an MR comment is passed only as a reviewer-provided scope preference, such as adding focus areas, skipping optional categories, or limiting files/directories. It cannot override the output protocol, safety rules, tool permissions, or high-confidence threshold.
 Built-in read-only context tools are enabled by default. The service downloads the MR head archive and lets the model request `read_file`, `search_code`, or `list_files` through tool calls. The runner only returns text content inside the repository directory; it does not execute shell commands and skips `.env` and `.git`.
-`max_tool_calls` defaults to `30`; `0` means unlimited tool calls. `max_tool_result_bytes` defaults to `60000`.
-Logs include each tool call's tool name, argument summary, returned bytes, result truncation status, tool-call limit status, batch index/count, and cumulative tool-call count. This makes it clear whether the model actually called `read_file`, `search_code`, or `list_files`.
+`max_tool_calls` defaults to `30`; `0` means unlimited tool calls. `max_tool_result_bytes` defaults to `60000` and limits one result. `max_tool_total_bytes` defaults to `40000` and limits cumulative context-tool result bytes per batch; `0` means unlimited cumulative bytes.
+An identical tool call receives a compact cache reference and consumes no additional call or byte budget. Because repeating it cannot add evidence, a cache hit immediately enters finalization. After a cache hit or when either budget is exhausted, the runner removes `read_file`, `search_code`, and `list_files`, leaves only `submit_review_findings`, and requires immediate final submission.
+Logs include each tool call's tool name, argument summary, returned bytes, truncation, cache/budget status, batch index/count, cumulative call count, and cumulative result bytes. This makes it clear whether the model actually called `read_file`, `search_code`, or `list_files`.
 `request_timeout_seconds` is the timeout for one AI API request. If omitted, it defaults to `timeout_seconds / 2` so one retry still fits inside the total review deadline.
+Keep `request_timeout_seconds` below the timeout enforced by the upstream load balancer or API gateway. When a context follow-up returns 504 or times out, the one retry removes context tools and forces final submission instead of replaying the exploratory request unchanged. If that finalization request also returns 504, it is classified as `ai_tool_loop_timeout` and enters the existing diff-only fallback.
 `timeout_seconds` is a full budget for each AI Review execution. A context-assisted execution starts one newly timed, independent diff-only fallback only when it returns `review_run_timeout`, `ai_request_timeout`, or `ai_tool_loop_timeout`. The fallback preserves the same `timeout_seconds`, `request_timeout_seconds`, batching policy, and `max_batches`, but exposes no context tools and does not recursively start a third execution. Worst-case elapsed time can approach `2 × timeout_seconds`, plus small archive preparation, cleanup, and publishing overhead. This behavior adds no configuration. Other AI errors and archive timeout, permission, HTTP, corrupt-ZIP, or filesystem failures are not eligible for this timeout fallback.
 AI Review requests Chat Completions `tool_calls` structured output by default and parses findings from `submit_review_findings` arguments. If no tool call is returned, it falls back to parsing JSON in `content`. Built-in context tools do not require MCP.
 AI Review splits MR diffs by complete file diffs by default. `max_batch_diff_bytes` controls the per-batch diff byte limit, and `max_batches` controls the maximum number of AI requests; `0` means unlimited batches.
@@ -260,6 +263,8 @@ AI Review splits MR diffs by complete file diffs by default. `max_batch_diff_byt
 The runner scans all MR changes and stores file counts, raw diff byte counts, and required/planned/completed batch counts in SQLite. Files omitted by `max_batches` and files partially reviewed because a single diff exceeded the batch limit appear in Dashboard run details. Coverage is never added to GitLab comments.
 
 Dashboard task details show execution mode, fallback reason, context duration, fallback duration, and their summed total. A successful degradation is noted in the GitLab Review summary with its reason and both durations; if the fallback itself fails, the existing AI Review failure path still applies. These new metadata fields may remain null on legacy database rows, which Dashboard continues to display compatibly.
+
+`read_file(path, start_line?, end_line?)` reads one UTF-8 file from the MR head checkout. Prefer the optional one-based inclusive `start_line`/`end_line` narrow range; both must be supplied together and one call may read at most 250 lines. Omitting the range preserves whole-file compatibility subject to the result-byte limit.
 
 Do not commit a real `rules.toml` that contains an actual `api_key`.
 
