@@ -34,6 +34,7 @@ use super::{
 const AI_RESPONSE_PREVIEW_CHARS: usize = 1000;
 const AI_HTTP_ATTEMPTS: usize = 2;
 const TOOL_ARGUMENT_SUMMARY_CHARS: usize = 160;
+const FINALIZATION_INSTRUCTION: &str = "上下文工具预算已用尽。放弃任何仍缺少证据的候选问题，不得继续请求 read_file、search_code 或 list_files。请立即提交最终审查结果并调用 submit_review_findings；没有已确认问题时提交空 findings。";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AiReviewExecutionMode {
@@ -801,6 +802,7 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
     let mut unavailable_context_tool_notice_sent = false;
     let mut tool_cache = HashMap::<String, String>::new();
     let mut tool_result_bytes_used = 0_usize;
+    let mut finalization_requested = false;
     loop {
         let response: OpenAiChatResponse = serde_json::from_str(&body).map_err(|err| {
             AppError::ai_review(ReviewErrorCode::AiResponseParseFailed, err.to_string())
@@ -839,6 +841,15 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
             .collect();
         if context_tool_calls.is_empty() {
             return parse_openai_message(&config.id, &config.title, message);
+        }
+        if finalization_requested {
+            return Err(AppError::ai_review(
+                ReviewErrorCode::AiRequestFailed,
+                format!(
+                    "AI review {} failed to submit findings after context tool finalization and requested another context tool",
+                    config.id
+                ),
+            ));
         }
         if !tool_context.source_available() {
             if unavailable_context_tool_notice_sent {
@@ -1039,10 +1050,27 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                     tool_calls: None,
                 });
             }
+            let tool_call_budget_exhausted =
+                config.max_tool_calls != 0 && *tool_calls_used >= config.max_tool_calls;
+            let tool_byte_budget_exhausted = config.max_tool_total_bytes != 0
+                && tool_result_bytes_used >= config.max_tool_total_bytes;
+            if tool_call_budget_exhausted || tool_byte_budget_exhausted {
+                finalization_requested = true;
+                messages.push(ChatMessage {
+                    role: "user".into(),
+                    content: Some(FINALIZATION_INSTRUCTION.into()),
+                    tool_call_id: None,
+                    tool_calls: None,
+                });
+            }
         }
 
-        let request_body =
-            serialize_review_request_body(config, messages, true, tool_context.source_available())?;
+        let request_body = serialize_review_request_body(
+            config,
+            messages,
+            true,
+            tool_context.source_available() && !finalization_requested,
+        )?;
         let mut last_error = None;
         let mut response = None;
         for followup_attempt in 1..=AI_HTTP_ATTEMPTS {
@@ -2233,17 +2261,21 @@ mod tests {
         let request_count = Arc::new(AtomicUsize::new(0));
         let tool_message_count = Arc::new(AtomicUsize::new(0));
         let limit_result_count = Arc::new(AtomicUsize::new(0));
+        let finalize_only_request_count = Arc::new(AtomicUsize::new(0));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let request_count_for_server = Arc::clone(&request_count);
         let tool_message_count_for_server = Arc::clone(&tool_message_count);
         let limit_result_count_for_server = Arc::clone(&limit_result_count);
+        let finalize_only_request_count_for_server = Arc::clone(&finalize_only_request_count);
         tokio::spawn(async move {
             loop {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let request_count = Arc::clone(&request_count_for_server);
                 let tool_message_count = Arc::clone(&tool_message_count_for_server);
                 let limit_result_count = Arc::clone(&limit_result_count_for_server);
+                let finalize_only_request_count =
+                    Arc::clone(&finalize_only_request_count_for_server);
                 tokio::spawn(async move {
                     let request_index = request_count.fetch_add(1, Ordering::SeqCst) + 1;
                     let request = read_http_json_request(&mut stream).await;
@@ -2252,6 +2284,23 @@ mod tests {
                             .as_bytes()
                             .to_vec()
                     } else {
+                        let tool_names = request["tools"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .filter_map(|tool| tool["function"]["name"].as_str())
+                            .collect::<Vec<_>>();
+                        let has_finalization_instruction = request["messages"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .filter(|message| message["role"] == "user")
+                            .filter_map(|message| message["content"].as_str())
+                            .any(|content| content.contains("立即提交最终审查结果"));
+                        if tool_names == ["submit_review_findings"] && has_finalization_instruction
+                        {
+                            finalize_only_request_count.fetch_add(1, Ordering::SeqCst);
+                        }
                         let messages = request["messages"].as_array().unwrap();
                         let tool_messages = messages
                             .iter()
@@ -2306,6 +2355,7 @@ mod tests {
         assert_eq!(request_count.load(Ordering::SeqCst), 2);
         assert_eq!(tool_message_count.load(Ordering::SeqCst), 2);
         assert_eq!(limit_result_count.load(Ordering::SeqCst), 1);
+        assert_eq!(finalize_only_request_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -2444,6 +2494,61 @@ mod tests {
         assert!(execution.result.unwrap().is_empty());
         assert_eq!(execution.coverage.unwrap().tool_calls_used, 1);
         assert_eq!(limit_result_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn context_request_after_finalization_fails_without_another_loop() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_server = Arc::clone(&request_count);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request_count = Arc::clone(&request_count_for_server);
+                tokio::spawn(async move {
+                    request_count.fetch_add(1, Ordering::SeqCst);
+                    let _ = read_http_json_request(&mut stream).await;
+                    let body = r#"{"choices":[{"message":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"search_code","arguments":"{\"query\":\"panic\"}"}}]}}]}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    stream.write_all(body.as_bytes()).await.unwrap();
+                });
+            }
+        });
+
+        let config = AiReviewConfig {
+            base_url: format!("http://{addr}"),
+            max_tool_calls: 1,
+            ..test_ai_review_config()
+        };
+        let changes = vec![GitLabChange {
+            old_path: "src/lib.rs".into(),
+            new_path: "src/lib.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "@@ -1 +1 @@\n+panic!();\n".into(),
+        }];
+        let source = tempfile::tempdir().unwrap();
+
+        let error =
+            run_ai_review_execution_with_context(&config, &changes, Some(source.path()), None)
+                .await
+                .result
+                .unwrap_err();
+
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            error.review_failure().map(|failure| failure.code),
+            Some(ReviewErrorCode::AiRequestFailed)
+        );
+        assert!(error
+            .to_string()
+            .contains("failed to submit findings after context tool finalization"));
     }
 
     #[tokio::test]
