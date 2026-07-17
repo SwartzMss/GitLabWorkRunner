@@ -946,6 +946,7 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
             });
             let mut real_calls_in_response = 0_usize;
             let mut tool_byte_limit_reached = false;
+            let mut cache_hit_requires_finalization = false;
             for tool_call in context_tool_calls {
                 let tool_call_id = non_empty_tool_call_id(&tool_call);
                 let tool_name = tool_call.function.name.as_str();
@@ -960,6 +961,7 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                         .saturating_sub(tool_result_bytes_used)
                 };
                 let result = if tool_cache.contains(&cache_key) {
+                    cache_hit_requires_finalization = true;
                     let result = cached_context_tool_result();
                     info!(
                         ai_review_id = %config.id,
@@ -1060,7 +1062,10 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
             let tool_byte_budget_exhausted = config.max_tool_total_bytes != 0
                 && (tool_result_bytes_used >= config.max_tool_total_bytes
                     || tool_byte_limit_reached);
-            if tool_call_budget_exhausted || tool_byte_budget_exhausted {
+            if tool_call_budget_exhausted
+                || tool_byte_budget_exhausted
+                || cache_hit_requires_finalization
+            {
                 request_finalization(messages, &mut finalization_requested);
             }
         }
@@ -2393,8 +2398,10 @@ mod tests {
     async fn duplicate_context_tool_call_reuses_compact_cached_result() {
         let request_count = Arc::new(AtomicUsize::new(0));
         let cached_result_count = Arc::new(AtomicUsize::new(0));
+        let finalize_only_request_count = Arc::new(AtomicUsize::new(0));
         let request_count_for_server = Arc::clone(&request_count);
         let cached_result_count_for_server = Arc::clone(&cached_result_count);
+        let finalize_only_request_count_for_server = Arc::clone(&finalize_only_request_count);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -2402,6 +2409,8 @@ mod tests {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let request_count = Arc::clone(&request_count_for_server);
                 let cached_result_count = Arc::clone(&cached_result_count_for_server);
+                let finalize_only_request_count =
+                    Arc::clone(&finalize_only_request_count_for_server);
                 tokio::spawn(async move {
                     let request_index = request_count.fetch_add(1, Ordering::SeqCst) + 1;
                     let request = read_http_json_request(&mut stream).await;
@@ -2410,6 +2419,24 @@ mod tests {
                             r#"{"choices":[{"message":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"search_code","arguments":"{\"query\":\"panic\",\"glob\":\"src/**/*.rs\"}"}}]}}]}"#
                         }
                         3 => {
+                            let tool_names = request["tools"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .filter_map(|tool| tool["function"]["name"].as_str())
+                                .collect::<Vec<_>>();
+                            let has_finalization_instruction = request["messages"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .filter(|message| message["role"] == "user")
+                                .filter_map(|message| message["content"].as_str())
+                                .any(|content| content.contains("立即提交最终审查结果"));
+                            if tool_names == ["submit_review_findings"]
+                                && has_finalization_instruction
+                            {
+                                finalize_only_request_count.fetch_add(1, Ordering::SeqCst);
+                            }
                             let cached = request["messages"]
                                 .as_array()
                                 .unwrap()
@@ -2457,6 +2484,7 @@ mod tests {
         assert!(execution.result.unwrap().is_empty());
         assert_eq!(execution.coverage.unwrap().tool_calls_used, 1);
         assert_eq!(cached_result_count.load(Ordering::SeqCst), 1);
+        assert_eq!(finalize_only_request_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

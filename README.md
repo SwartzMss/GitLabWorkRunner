@@ -251,7 +251,7 @@ max_batches = 10
 `@ai-review` 后面的评论内容只会作为触发者提供的审查范围偏好传给模型，例如增加关注方向、跳过可选检查类别或限定文件目录；它不能覆盖输出协议、安全规则、工具权限或高置信度门槛。
 内置只读上下文工具默认启用。服务会下载 MR head archive，让模型可以通过 tool call 请求 `read_file`、`search_code` 或 `list_files`；runner 只返回仓库目录内的文本内容，不执行 shell，也不会读取 `.env` 或 `.git`。
 `max_tool_calls` 默认是 `30`，`0` 表示不限制工具调用次数；`max_tool_result_bytes` 默认是 `60000`，限制单次工具结果；`max_tool_total_bytes` 默认是 `40000`，限制每个批次累计返回给模型的上下文工具结果，`0` 表示不限制累计字节数。
-完全相同的工具调用会返回紧凑缓存引用，不会再次消耗调用次数或累计字节预算。调用次数或累计字节预算耗尽后，runner 会移除 `read_file`、`search_code` 和 `list_files`，只保留 `submit_review_findings` 并要求模型立即提交结果。
+完全相同的工具调用会返回紧凑缓存引用，不会再次消耗调用次数或累计字节预算；由于重复调用不会产生新证据，缓存命中后 runner 会立即进入收尾模式。缓存命中、调用次数耗尽或累计字节预算耗尽后，runner 会移除 `read_file`、`search_code` 和 `list_files`，只保留 `submit_review_findings` 并要求模型立即提交结果。
 日志会记录每次工具调用的工具名、参数摘要、返回 bytes、结果是否截断、是否命中缓存或预算上限、batch index/count、累计 tool call 次数和累计结果 bytes，便于确认模型是否真的调用了 `read_file`、`search_code` 或 `list_files`。
 `request_timeout_seconds` 是单次 AI API 请求的超时；不配置时默认使用 `timeout_seconds / 2`，用于保留一次失败重试机会。
 部署时应确保 `request_timeout_seconds` 小于上游负载均衡器或 API 网关的超时。上下文 follow-up 返回 504 或请求超时时，runner 的一次重试会移除上下文工具并强制提交最终结果，而不是原样重发探索请求；如果该收尾请求仍返回 504，则归类为 `ai_tool_loop_timeout` 并进入现有的 diff-only fallback。
