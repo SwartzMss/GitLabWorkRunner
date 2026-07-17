@@ -1194,7 +1194,9 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
             })
         })?;
         if !(200..300).contains(&response.status) {
-            let code = if matches!(response.status, 401 | 403) {
+            let code = if response.status == 504 && finalization_requested {
+                ReviewErrorCode::AiToolLoopTimeout
+            } else if matches!(response.status, 401 | 403) {
                 ReviewErrorCode::PermissionDenied
             } else {
                 ReviewErrorCode::AiRequestFailed
@@ -2759,6 +2761,64 @@ mod tests {
         assert_eq!(request_count.load(Ordering::SeqCst), 3);
         assert_eq!(tool_message_count.load(Ordering::SeqCst), 1);
         assert_eq!(finalize_only_retry_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn repeated_504_after_context_finalization_is_tool_loop_timeout() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_server = Arc::clone(&request_count);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request_count = Arc::clone(&request_count_for_server);
+                tokio::spawn(async move {
+                    let request_index = request_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    let _ = read_http_json_request(&mut stream).await;
+                    let (status, body) = if request_index == 1 {
+                        (
+                            "200 OK",
+                            r#"{"choices":[{"message":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"search_code","arguments":"{\"query\":\"panic\"}"}}]}}]}"#,
+                        )
+                    } else {
+                        ("504 Gateway Time-out", "gateway timeout")
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    stream.write_all(body.as_bytes()).await.unwrap();
+                });
+            }
+        });
+
+        let config = AiReviewConfig {
+            base_url: format!("http://{addr}"),
+            ..test_ai_review_config()
+        };
+        let changes = vec![GitLabChange {
+            old_path: "src/lib.rs".into(),
+            new_path: "src/lib.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "@@ -1 +1 @@\n+panic!();\n".into(),
+        }];
+        let source = tempfile::tempdir().unwrap();
+
+        let error =
+            run_ai_review_execution_with_context(&config, &changes, Some(source.path()), None)
+                .await
+                .result
+                .unwrap_err();
+
+        assert_eq!(request_count.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            error.review_failure().map(|failure| failure.code),
+            Some(ReviewErrorCode::AiToolLoopTimeout)
+        );
     }
 
     #[tokio::test]

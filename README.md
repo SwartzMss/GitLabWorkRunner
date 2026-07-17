@@ -254,7 +254,7 @@ max_batches = 10
 完全相同的工具调用会返回紧凑缓存引用，不会再次消耗调用次数或累计字节预算。调用次数或累计字节预算耗尽后，runner 会移除 `read_file`、`search_code` 和 `list_files`，只保留 `submit_review_findings` 并要求模型立即提交结果。
 日志会记录每次工具调用的工具名、参数摘要、返回 bytes、结果是否截断、是否命中缓存或预算上限、batch index/count、累计 tool call 次数和累计结果 bytes，便于确认模型是否真的调用了 `read_file`、`search_code` 或 `list_files`。
 `request_timeout_seconds` 是单次 AI API 请求的超时；不配置时默认使用 `timeout_seconds / 2`，用于保留一次失败重试机会。
-部署时应确保 `request_timeout_seconds` 小于上游负载均衡器或 API 网关的超时。上下文 follow-up 返回 504 或请求超时时，runner 的一次重试会移除上下文工具并强制提交最终结果，而不是原样重发探索请求。
+部署时应确保 `request_timeout_seconds` 小于上游负载均衡器或 API 网关的超时。上下文 follow-up 返回 504 或请求超时时，runner 的一次重试会移除上下文工具并强制提交最终结果，而不是原样重发探索请求；如果该收尾请求仍返回 504，则归类为 `ai_tool_loop_timeout` 并进入现有的 diff-only fallback。
 `timeout_seconds` 是每次 AI Review 执行的完整预算。带上下文的执行只有在返回 `review_run_timeout`、`ai_request_timeout` 或 `ai_tool_loop_timeout` 时，才会启动一次新的、独立计时的 diff-only fallback；fallback 继续使用相同的 `timeout_seconds`、`request_timeout_seconds`、分批策略和 `max_batches`，但不提供上下文工具，也不会递归启动第三次执行。最坏耗时可能接近 `2 × timeout_seconds`，并另加少量 archive 准备、清理和发布开销；该行为不新增配置项。其他 AI 错误以及 archive 超时、权限、HTTP、损坏 ZIP、文件系统等错误不符合此 timeout fallback 条件。
 AI Review 默认请求 Chat Completions `tool_calls` 结构化输出，并从 `submit_review_findings` 的 arguments 解析 findings；如果响应没有 tool call，会回退解析 `content` 中的 JSON。内置 context tools 不需要 MCP，也不会调用外部服务。
 AI Review 默认按完整文件 diff 分批调用。`max_batch_diff_bytes` 控制单批 diff 字节上限，`max_batches` 控制最多请求批次数；`0` 表示不限制批次数。
