@@ -5,7 +5,7 @@ use crate::{
     rules::{AiReviewConfig, Finding, Severity},
 };
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashSet},
     path::Path,
     time::{Duration, Instant},
 };
@@ -34,6 +34,7 @@ use super::{
 const AI_RESPONSE_PREVIEW_CHARS: usize = 1000;
 const AI_HTTP_ATTEMPTS: usize = 2;
 const TOOL_ARGUMENT_SUMMARY_CHARS: usize = 160;
+const MIN_CONTEXT_TOOL_RESULT_BYTES: usize = 28;
 const FINALIZATION_INSTRUCTION: &str = "上下文工具预算已用尽。放弃任何仍缺少证据的候选问题，不得继续请求 read_file、search_code 或 list_files。请立即提交最终审查结果并调用 submit_review_findings；没有已确认问题时提交空 findings。";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -800,7 +801,7 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
     let mut body = first_body.to_string();
     let mut tool_call_limit_notice_sent = false;
     let mut unavailable_context_tool_notice_sent = false;
-    let mut tool_cache = HashMap::<String, String>::new();
+    let mut tool_cache = HashSet::<String>::new();
     let mut tool_result_bytes_used = 0_usize;
     let mut finalization_requested = false;
     loop {
@@ -944,6 +945,7 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                 tool_calls: Some(context_tool_calls.clone()),
             });
             let mut real_calls_in_response = 0_usize;
+            let mut tool_byte_limit_reached = false;
             for tool_call in context_tool_calls {
                 let tool_call_id = non_empty_tool_call_id(&tool_call);
                 let tool_name = tool_call.function.name.as_str();
@@ -957,7 +959,7 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                         .max_tool_total_bytes
                         .saturating_sub(tool_result_bytes_used)
                 };
-                let result = if tool_cache.contains_key(&cache_key) {
+                let result = if tool_cache.contains(&cache_key) {
                     let result = cached_context_tool_result();
                     info!(
                         ai_review_id = %config.id,
@@ -974,14 +976,16 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                         "AI review context tool result reused"
                     );
                     result
-                } else if real_calls_in_response < remaining_tool_calls && remaining_tool_bytes > 0
+                } else if real_calls_in_response < remaining_tool_calls
+                    && (config.max_tool_total_bytes == 0
+                        || remaining_tool_bytes >= MIN_CONTEXT_TOOL_RESULT_BYTES)
                 {
                     let result_limit = config.max_tool_result_bytes.min(remaining_tool_bytes);
                     let result = tool_context.call_with_result_limit(&tool_call, result_limit);
                     *tool_calls_used += 1;
                     real_calls_in_response += 1;
                     tool_result_bytes_used = tool_result_bytes_used.saturating_add(result.len());
-                    tool_cache.insert(cache_key, result.clone());
+                    tool_cache.insert(cache_key);
                     info!(
                         ai_review_id = %config.id,
                         model = %config.model,
@@ -1025,6 +1029,7 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                     );
                     result
                 } else {
+                    tool_byte_limit_reached = true;
                     let result = context_tool_result_byte_limit_result(config);
                     warn!(
                         ai_review_id = %config.id,
@@ -1053,7 +1058,8 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
             let tool_call_budget_exhausted =
                 config.max_tool_calls != 0 && *tool_calls_used >= config.max_tool_calls;
             let tool_byte_budget_exhausted = config.max_tool_total_bytes != 0
-                && tool_result_bytes_used >= config.max_tool_total_bytes;
+                && (tool_result_bytes_used >= config.max_tool_total_bytes
+                    || tool_byte_limit_reached);
             if tool_call_budget_exhausted || tool_byte_budget_exhausted {
                 request_finalization(messages, &mut finalization_requested);
             }
@@ -2497,7 +2503,7 @@ mod tests {
 
         let config = AiReviewConfig {
             base_url: format!("http://{addr}"),
-            max_tool_total_bytes: 20,
+            max_tool_total_bytes: 40,
             ..test_ai_review_config()
         };
         let changes = vec![GitLabChange {

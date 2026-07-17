@@ -498,20 +498,45 @@ fn optional_glob_matcher(pattern: Option<&str>) -> Result<Option<globset::GlobMa
 }
 
 fn truncate_json_result(value: serde_json::Value, max_bytes: usize) -> String {
+    let max_bytes = max_bytes.max(1);
     let text = value.to_string();
     if text.len() <= max_bytes {
         return text;
     }
-    let mut end = max_bytes;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    serde_json::json!({
+
+    let minimal = serde_json::json!({
         "ok": true,
         "truncated": true,
-        "content": &text[..end]
     })
-    .to_string()
+    .to_string();
+    if minimal.len() > max_bytes {
+        return "0".into();
+    }
+
+    let mut boundaries = text
+        .char_indices()
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    boundaries.push(text.len());
+    let mut low = 0_usize;
+    let mut high = boundaries.len();
+    let mut best = minimal;
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let candidate = serde_json::json!({
+            "ok": true,
+            "truncated": true,
+            "content": &text[..boundaries[middle]],
+        })
+        .to_string();
+        if candidate.len() <= max_bytes {
+            best = candidate;
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    best
 }
 
 fn tool_error(message: impl ToString) -> serde_json::Value {
@@ -793,5 +818,22 @@ mod tests {
                 r#"{"start_line":10,"path":"src/lib.rs","end_line":20}"#,
             ),
         );
+    }
+
+    #[test]
+    fn truncated_json_result_never_exceeds_requested_byte_limit() {
+        let value = serde_json::json!({
+            "ok": true,
+            "content": "一二三四五六七八九十".repeat(20),
+        });
+
+        for limit in [1, 4, 16, 40, 100] {
+            let result = truncate_json_result(value.clone(), limit);
+            assert!(
+                result.len() <= limit,
+                "result used {} bytes for limit {limit}: {result}",
+                result.len()
+            );
+        }
     }
 }
