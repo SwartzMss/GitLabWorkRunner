@@ -1,5 +1,14 @@
 # Changelog
 
+## v3.0.2 - 2026-07-17
+
+- AI Review 分批改为按 diff hunk/chunk 拆分超大单文件，避免只审查文件 diff 前半段。
+- 新增 `[ai_review].max_tool_rounds`，默认 `0` 表示不限制；非零限制触发收尾后，如果模型仍请求上下文工具，会清理工具对话历史并重试一次 diff-only finalization。
+- `search_code` 和 `list_files` 达到结果上限后会停止继续递归扫描仓库，减少大仓库工具耗时。
+- Dashboard 运行中进度现在展示当前批次的工具轮次和工具调用次数；Review 详情页新增总耗时，GitLab 汇总耗时改为时分秒格式。
+- 空 diff 文件不再计入 AI Review 覆盖率，避免被误标为达到批次上限未审查。
+- Linux 发布包新增 `scripts/linux-background.sh`，支持用 `nohup` 启停 runner 和 dashboard。
+
 ## v3.0.1 - 2026-07-17
 
 - AI Review 上下文工具改为候选缺陷验证优先，支持 `read_file` 行范围读取、重复调用去重和每批累计结果字节预算。

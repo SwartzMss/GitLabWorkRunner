@@ -259,16 +259,20 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       const total = task.progress_total ?? 0;
       const hasTotal = total > 0;
       const width = hasTotal ? Math.min(100, Math.max(0, Math.round((current / total) * 100))) : 100;
-      const count = hasTotal ? `${esc(current)} / ${esc(total)} ${esc(task.progress_unit || "")}` : esc(task.progress_phase || "");
+      const rawMessage = task.progress_message || task.progress_phase || "";
+      const messageParts = rawMessage.split("，");
+      const title = messageParts.shift() || rawMessage;
+      const progressDetail = messageParts.join("，");
       const updated = task.progress_updated_at ? `最后更新 ${relative(task.progress_updated_at)}` : "";
+      const meta = [progressDetail, updated].filter(Boolean).map(esc).join(" · ");
       const executionMode = task.execution_mode ? `<span class="badge ${task.execution_mode === "diff_only_fallback" ? "warning" : "info"}">${esc(executionModeText(task.execution_mode))}</span>` : "";
       const fallbackReason = task.fallback_reason ? `<span>${esc(fallbackReasonText(task.fallback_reason))}</span>` : "";
       const mode = executionMode || fallbackReason ? `<div class="task-progress-mode">${executionMode}${fallbackReason}</div>` : "";
       return `<div class="task-progress">
         ${mode}
-        <div class="task-progress-title"><span>${esc(task.progress_message || task.progress_phase)}</span><span>${count}</span></div>
+        <div class="task-progress-title"><span>${esc(title)}</span></div>
         <div class="task-progress-bar"><span style="width:${width}%"></span></div>
-        <div class="task-progress-meta">${updated}</div>
+        <div class="task-progress-meta">${meta}</div>
       </div>`;
     }
 
@@ -284,11 +288,13 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         </div>${metadata}${failure}`;
       }
       const batchStats = `${task.coverage_completed_batches ?? 0} 已用 / ${fmtLimit(task.coverage_max_batches)} 上限`;
+      const toolRoundStats = `${task.tool_rounds_used ?? 0} 单批峰值 / ${fmtLimit(task.max_tool_rounds)} 每批上限`;
       const toolCallStats = `${task.tool_calls_used ?? 0} 单批峰值 / ${fmtLimit(task.max_tool_calls)} 每批上限`;
       if (task.status === "failed" && (task.coverage_completed_batches === 0 || task.coverage_reviewed_diff_bytes === 0)) {
         return `${progress}<div class="detail-list">
           <div class="detail-row"><span>覆盖情况</span><span></span></div>
           <div class="detail-row"><span>批次</span><span>${batchStats}</span></div>
+          <div class="detail-row"><span>工具轮次</span><span>${toolRoundStats}</span></div>
           <div class="detail-row"><span>工具调用</span><span>${toolCallStats}</span></div>
         </div>${metadata}`;
       }
@@ -300,6 +306,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         <div class="detail-row"><span>文件</span><span>${task.coverage_fully_reviewed_files} 完整 / ${task.coverage_partially_reviewed_files} 部分 / ${task.coverage_unreviewed_files} 未审查 / ${task.coverage_total_files} 总计</span></div>
         <div class="detail-row"><span>Diff</span><span>${fmtBytes(task.coverage_reviewed_diff_bytes)} / ${fmtBytes(task.coverage_total_diff_bytes)} (${pct(task.coverage_reviewed_diff_bytes, task.coverage_total_diff_bytes)}%)</span></div>
         <div class="detail-row"><span>批次</span><span>${batchStats}</span></div>
+        <div class="detail-row"><span>工具轮次</span><span>${toolRoundStats}</span></div>
         <div class="detail-row"><span>工具调用</span><span>${toolCallStats}</span></div>
       </div>${metadata}${incomplete}`;
     }
@@ -457,6 +464,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
           <div class="detail-row"><span>项目 / MR</span><span>${esc(projectLabel(detail.run))} / !${esc(detail.run.mr_iid)}</span></div>
           <div class="detail-row"><span>Commit</span><code>${esc(detail.run.commit_sha)}</code></div>
           <div class="detail-row"><span>问题</span><span>${esc(detail.run.findings)}</span></div>
+          <div class="detail-row"><span>耗时</span><span>${fmtMs(detail.run.duration_ms)}</span></div>
         </div>${renderFailure(detail.failure)}</section>
         <section class="panel"><div class="panel-header"><div class="panel-title">Review 覆盖</div></div>${detail.tasks.length ? detail.tasks.map(renderTaskCoverage).join("") : `<div class="empty">暂无任务数据</div>`}</section>
         <section class="panel"><div class="panel-header"><div class="panel-title">问题</div></div><table><thead><tr><th>级别</th><th>路径</th><th>标题</th><th>消息</th></tr></thead><tbody>${detail.findings.length ? detail.findings.map((finding) => row([severityBadge(finding.severity), `${esc(finding.path)}${finding.new_line ? `:${esc(finding.new_line)}` : ""}`, esc(finding.title), `<span class="wrap">${esc(finding.message)}</span>`])).join("") : empty(4)}</tbody></table></section>
@@ -559,6 +567,9 @@ mod tests {
         assert!(DASHBOARD_HTML.contains("task.progress_phase"));
         assert!(DASHBOARD_HTML.contains("task.progress_message"));
         assert!(DASHBOARD_HTML.contains("task-progress-bar"));
+        assert!(DASHBOARD_HTML.contains(r#"rawMessage.split("，")"#));
+        assert!(DASHBOARD_HTML.contains("progressDetail"));
+        assert!(!DASHBOARD_HTML.contains("${count}"));
     }
 
     #[test]
@@ -644,6 +655,9 @@ mod tests {
         assert!(!DASHBOARD_HTML.contains("${completedTasks}/${totalTasks}"));
         assert!(DASHBOARD_HTML.contains(
             r#"<div class="detail-row"><span>运行 ID</span><code>${esc(detail.run.review_run_id)}</code></div>"#
+        ));
+        assert!(DASHBOARD_HTML.contains(
+            r#"<div class="detail-row"><span>耗时</span><span>${fmtMs(detail.run.duration_ms)}</span></div>"#
         ));
     }
 

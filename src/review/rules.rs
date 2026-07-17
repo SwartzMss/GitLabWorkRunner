@@ -32,6 +32,8 @@ pub struct AiReviewConfig {
     pub extra_instructions: String,
     #[serde(default = "default_ai_max_tool_calls")]
     pub max_tool_calls: usize,
+    #[serde(default = "default_ai_max_tool_rounds")]
+    pub max_tool_rounds: usize,
     #[serde(default = "default_ai_max_tool_result_bytes")]
     pub max_tool_result_bytes: usize,
     #[serde(default = "default_ai_max_tool_total_bytes")]
@@ -44,6 +46,8 @@ pub struct AiReviewPromptConfig {
     pub extra_instructions: String,
     #[serde(default = "default_ai_max_tool_calls")]
     pub max_tool_calls: usize,
+    #[serde(default = "default_ai_max_tool_rounds")]
+    pub max_tool_rounds: usize,
     #[serde(default = "default_ai_max_tool_result_bytes")]
     pub max_tool_result_bytes: usize,
     #[serde(default = "default_ai_max_tool_total_bytes")]
@@ -55,6 +59,7 @@ impl Default for AiReviewPromptConfig {
         Self {
             extra_instructions: String::new(),
             max_tool_calls: default_ai_max_tool_calls(),
+            max_tool_rounds: default_ai_max_tool_rounds(),
             max_tool_result_bytes: default_ai_max_tool_result_bytes(),
             max_tool_total_bytes: default_ai_max_tool_total_bytes(),
         }
@@ -101,6 +106,7 @@ impl Ruleset {
         for mut config in parsed.ai_reviews {
             config.extra_instructions = parsed.ai_review.extra_instructions.clone();
             config.max_tool_calls = parsed.ai_review.max_tool_calls;
+            config.max_tool_rounds = parsed.ai_review.max_tool_rounds;
             config.max_tool_result_bytes = parsed.ai_review.max_tool_result_bytes;
             config.max_tool_total_bytes = parsed.ai_review.max_tool_total_bytes;
             ai_reviews.push(CompiledAiReview { config });
@@ -140,6 +146,10 @@ fn default_ai_max_batches() -> usize {
 
 fn default_ai_max_tool_calls() -> usize {
     30
+}
+
+fn default_ai_max_tool_rounds() -> usize {
+    0
 }
 
 fn default_ai_max_tool_result_bytes() -> usize {
@@ -246,6 +256,7 @@ model = "gpt-4.1-mini"
         assert_eq!(reviews[0].max_batches, 6);
         assert!(reviews[0].extra_instructions.is_empty());
         assert_eq!(reviews[0].max_tool_calls, 30);
+        assert_eq!(reviews[0].max_tool_rounds, 0);
         assert_eq!(reviews[0].max_tool_result_bytes, 60_000);
         assert_eq!(reviews[0].max_tool_total_bytes, 40_000);
     }
@@ -257,6 +268,7 @@ model = "gpt-4.1-mini"
 [ai_review]
 extra_instructions = "Focus on C++ lifetime bugs."
 max_tool_calls = 4
+max_tool_rounds = 2
 max_tool_result_bytes = 12000
 max_tool_total_bytes = 12345
 
@@ -283,6 +295,7 @@ max_batches = 6
         assert_eq!(reviews[0].max_batches, 6);
         assert_eq!(reviews[0].extra_instructions, "Focus on C++ lifetime bugs.");
         assert_eq!(reviews[0].max_tool_calls, 4);
+        assert_eq!(reviews[0].max_tool_rounds, 2);
         assert_eq!(reviews[0].max_tool_result_bytes, 12_000);
         assert_eq!(reviews[0].max_tool_total_bytes, 12_345);
     }
@@ -295,7 +308,10 @@ max_batches = 6
         let reviews = rules.ai_reviews_by_ids(&["ai-review".into()]);
         assert_eq!(reviews.len(), 1);
         assert!(reviews[0].extra_instructions.is_empty());
-        assert_eq!(reviews[0].max_tool_calls, 0);
+        assert_eq!(reviews[0].max_tool_calls, 35);
+        assert_eq!(reviews[0].max_tool_rounds, 0);
+        assert_eq!(reviews[0].max_tool_result_bytes, 60_000);
+        assert_eq!(reviews[0].max_tool_total_bytes, 40_000);
     }
 
     #[test]

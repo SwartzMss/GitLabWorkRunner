@@ -757,6 +757,7 @@ fn test_ai_review_config(base_url: String) -> AiReviewConfig {
         max_batches: 6,
         extra_instructions: String::new(),
         max_tool_calls: 8,
+        max_tool_rounds: 3,
         max_tool_result_bytes: 60_000,
         max_tool_total_bytes: 40_000,
     }
@@ -806,7 +807,7 @@ async fn ai_review_batches_large_merge_request_by_file() {
 
     let config = AiReviewConfig {
         base_url: format!("http://{}", addr),
-        max_batch_diff_bytes: 160,
+        max_batch_diff_bytes: 24,
         max_batches: 2,
         ..test_ai_review_config(format!("http://{}", addr))
     };
@@ -884,7 +885,7 @@ async fn batched_ai_review_preserves_coverage_when_total_deadline_fires() {
         base_url: format!("http://{}", addr),
         timeout_seconds: 1,
         request_timeout_seconds: Some(5),
-        max_batch_diff_bytes: 160,
+        max_batch_diff_bytes: 28,
         max_batches: 2,
         ..test_ai_review_config(format!("http://{}", addr))
     };

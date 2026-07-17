@@ -343,19 +343,19 @@ impl AiReviewToolContext {
         let mut matches = Vec::new();
         collect_files(root, root, &mut |relative, path| {
             if matches.len() >= SEARCH_MAX_MATCHES {
-                return;
+                return WalkControl::Stop;
             }
             if is_low_value_context_path(relative) || file_too_large(path, SEARCH_MAX_FILE_BYTES) {
-                return;
+                return WalkControl::Continue;
             }
             if !matcher
                 .as_ref()
                 .is_none_or(|matcher| matcher.is_match(relative))
             {
-                return;
+                return WalkControl::Continue;
             }
             let Ok(content) = fs::read_to_string(path) else {
-                return;
+                return WalkControl::Continue;
             };
             let lines: Vec<_> = content.lines().collect();
             let mut file_matches = 0_usize;
@@ -376,6 +376,11 @@ impl AiReviewToolContext {
                         break;
                     }
                 }
+            }
+            if matches.len() >= SEARCH_MAX_MATCHES {
+                WalkControl::Stop
+            } else {
+                WalkControl::Continue
             }
         });
         serde_json::json!({
@@ -405,16 +410,21 @@ impl AiReviewToolContext {
         let mut files = Vec::new();
         collect_files(root, root, &mut |relative, _path| {
             if files.len() >= LIST_MAX_FILES {
-                return;
+                return WalkControl::Stop;
             }
             if is_low_value_context_path(relative) {
-                return;
+                return WalkControl::Continue;
             }
             if matcher
                 .as_ref()
                 .is_none_or(|matcher| matcher.is_match(relative))
             {
                 files.push(relative.to_string());
+            }
+            if files.len() >= LIST_MAX_FILES {
+                WalkControl::Stop
+            } else {
+                WalkControl::Continue
             }
         });
         serde_json::json!({
@@ -457,9 +467,19 @@ impl AiReviewToolContext {
     }
 }
 
-fn collect_files(root: &Path, current: &Path, visit: &mut impl FnMut(&str, &Path)) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WalkControl {
+    Continue,
+    Stop,
+}
+
+fn collect_files(
+    root: &Path,
+    current: &Path,
+    visit: &mut impl FnMut(&str, &Path) -> WalkControl,
+) -> WalkControl {
     let Ok(entries) = fs::read_dir(current) else {
-        return;
+        return WalkControl::Continue;
     };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -474,7 +494,9 @@ fn collect_files(root: &Path, current: &Path, visit: &mut impl FnMut(&str, &Path
             if is_low_value_context_path(&relative) || is_sensitive_path(&relative) {
                 continue;
             }
-            collect_files(root, &path, visit);
+            if collect_files(root, &path, visit) == WalkControl::Stop {
+                return WalkControl::Stop;
+            }
         } else if file_type.is_file() {
             let Ok(relative) = path.strip_prefix(root) else {
                 continue;
@@ -483,9 +505,12 @@ fn collect_files(root: &Path, current: &Path, visit: &mut impl FnMut(&str, &Path
             if is_sensitive_path(&relative) {
                 continue;
             }
-            visit(&relative, &path);
+            if visit(&relative, &path) == WalkControl::Stop {
+                return WalkControl::Stop;
+            }
         }
     }
+    WalkControl::Continue
 }
 
 fn optional_glob_matcher(pattern: Option<&str>) -> Result<Option<globset::GlobMatcher>, String> {
@@ -676,6 +701,7 @@ mod tests {
             max_batches: 6,
             extra_instructions: String::new(),
             max_tool_calls: 8,
+            max_tool_rounds: 3,
             max_tool_result_bytes: 60_000,
             max_tool_total_bytes: 40_000,
         }
@@ -719,6 +745,22 @@ mod tests {
     }
 
     #[test]
+    fn search_code_stops_after_result_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        for index in 0..(SEARCH_MAX_MATCHES + 25) {
+            std::fs::write(temp.path().join(format!("src/{index:03}.rs")), "needle\n").unwrap();
+        }
+        let context = AiReviewToolContext::new(&test_config(), Some(temp.path()));
+
+        let result = context.search_code(r#"{"query":"needle","glob":"src/**/*.rs"}"#);
+        let matches = result["matches"].as_array().unwrap();
+
+        assert_eq!(matches.len(), SEARCH_MAX_MATCHES);
+        assert_eq!(result["truncated"], true);
+    }
+
+    #[test]
     fn list_files_skips_low_value_paths() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join("src")).unwrap();
@@ -745,10 +787,49 @@ mod tests {
 
         collect_files(temp.path(), temp.path(), &mut |relative, _path| {
             visited.push(relative.to_string());
+            WalkControl::Continue
         });
         visited.sort();
 
         assert_eq!(visited, vec!["src/lib.rs"]);
+    }
+
+    #[test]
+    fn collect_files_stops_recursing_when_visitor_stops() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("a")).unwrap();
+        std::fs::create_dir_all(temp.path().join("b")).unwrap();
+        std::fs::write(temp.path().join("a/first.rs"), "first\n").unwrap();
+        std::fs::write(temp.path().join("b/second.rs"), "second\n").unwrap();
+        let mut visited = Vec::new();
+
+        let control = collect_files(temp.path(), temp.path(), &mut |relative, _path| {
+            visited.push(relative.to_string());
+            WalkControl::Stop
+        });
+
+        assert_eq!(control, WalkControl::Stop);
+        assert_eq!(visited.len(), 1);
+    }
+
+    #[test]
+    fn list_files_stops_after_result_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        for index in 0..(LIST_MAX_FILES + 25) {
+            std::fs::write(
+                temp.path().join(format!("src/{index:03}.rs")),
+                "pub fn value() {}\n",
+            )
+            .unwrap();
+        }
+        let context = AiReviewToolContext::new(&test_config(), Some(temp.path()));
+
+        let result = context.list_files(r#"{"glob":"src/**/*.rs"}"#);
+        let files = result["files"].as_array().unwrap();
+
+        assert_eq!(files.len(), LIST_MAX_FILES);
+        assert_eq!(result["truncated"], true);
     }
 
     #[test]

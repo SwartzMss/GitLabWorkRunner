@@ -81,6 +81,8 @@ pub struct StoredReviewCoverage {
     pub planned_batches: usize,
     pub completed_batches: usize,
     pub max_batches: usize,
+    pub tool_rounds_used: usize,
+    pub max_tool_rounds: usize,
     pub tool_calls_used: usize,
     pub max_tool_calls: usize,
     pub complete: bool,
@@ -217,6 +219,8 @@ create table if not exists review_task_runs (
             "coverage_planned_batches",
             "coverage_completed_batches",
             "coverage_max_batches",
+            "tool_rounds_used",
+            "max_tool_rounds",
             "tool_calls_used",
             "max_tool_calls",
             "coverage_complete",
@@ -613,6 +617,7 @@ coverage_partially_reviewed_files = ?, coverage_unreviewed_files = ?,
 coverage_total_diff_bytes = ?, coverage_reviewed_diff_bytes = ?,
 coverage_required_batches = ?, coverage_planned_batches = ?,
 coverage_completed_batches = ?, coverage_max_batches = ?,
+tool_rounds_used = ?, max_tool_rounds = ?,
 tool_calls_used = ?, max_tool_calls = ?, coverage_complete = ?
 where review_run_id = ? and task_type = ? and task_id = ?"#,
         )
@@ -626,6 +631,8 @@ where review_run_id = ? and task_type = ? and task_id = ?"#,
         .bind(coverage.planned_batches as i64)
         .bind(coverage.completed_batches as i64)
         .bind(coverage.max_batches as i64)
+        .bind(coverage.tool_rounds_used as i64)
+        .bind(coverage.max_tool_rounds as i64)
         .bind(coverage.tool_calls_used as i64)
         .bind(coverage.max_tool_calls as i64)
         .bind(coverage.complete)
@@ -896,6 +903,8 @@ mod tests {
             planned_batches: 2,
             completed_batches: 2,
             max_batches: 4,
+            tool_rounds_used: 2,
+            max_tool_rounds: 3,
             tool_calls_used: 5,
             max_tool_calls: 8,
             complete: false,
@@ -933,11 +942,13 @@ mod tests {
         .fetch_one(&store.pool)
         .await
         .unwrap();
-        let task_row = sqlx::query("select coverage_reviewed_diff_bytes, coverage_max_batches, tool_calls_used, max_tool_calls from review_task_runs where review_run_id = 'rr-coverage'")
+        let task_row = sqlx::query("select coverage_reviewed_diff_bytes, coverage_max_batches, tool_rounds_used, max_tool_rounds, tool_calls_used, max_tool_calls from review_task_runs where review_run_id = 'rr-coverage'")
             .fetch_one(&store.pool).await.unwrap();
         assert_eq!(rows, 1);
         assert_eq!(task_row.get::<i64, _>("coverage_reviewed_diff_bytes"), 15);
         assert_eq!(task_row.get::<i64, _>("coverage_max_batches"), 4);
+        assert_eq!(task_row.get::<i64, _>("tool_rounds_used"), 2);
+        assert_eq!(task_row.get::<i64, _>("max_tool_rounds"), 3);
         assert_eq!(task_row.get::<i64, _>("tool_calls_used"), 5);
         assert_eq!(task_row.get::<i64, _>("max_tool_calls"), 8);
     }
@@ -966,6 +977,8 @@ mod tests {
             planned_batches: 1,
             completed_batches: 1,
             max_batches: 1,
+            tool_rounds_used: 1,
+            max_tool_rounds: 2,
             tool_calls_used: 2,
             max_tool_calls: 4,
             complete: true,
@@ -1127,6 +1140,8 @@ mod tests {
             planned_batches: 0,
             completed_batches: 0,
             max_batches: 0,
+            tool_rounds_used: 0,
+            max_tool_rounds: 0,
             tool_calls_used: 0,
             max_tool_calls: 0,
             complete: true,
@@ -1238,6 +1253,8 @@ mod tests {
             planned_batches: 1,
             completed_batches: 1,
             max_batches: 1,
+            tool_rounds_used: 1,
+            max_tool_rounds: 2,
             tool_calls_used: 1,
             max_tool_calls: 2,
             complete: false,

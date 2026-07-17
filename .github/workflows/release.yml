@@ -121,6 +121,7 @@ jobs:
           cp README.md "$package_dir/"
           cp README.en.md "$package_dir/"
           cp LICENSE "$package_dir/"
+          cp -r scripts "$package_dir/"
           if [ -d examples ]; then
             cp -r examples "$package_dir/"
           fi

@@ -338,6 +338,8 @@ mod tests {
                     planned_batches: 2,
                     completed_batches: 2,
                     max_batches: 4,
+                    tool_rounds_used: 2,
+                    max_tool_rounds: 3,
                     tool_calls_used: 5,
                     max_tool_calls: 8,
                     complete: false,
@@ -365,6 +367,8 @@ mod tests {
         assert_eq!(detail.tasks[0].coverage_required_batches, Some(3));
         assert_eq!(detail.tasks[0].coverage_completed_batches, Some(2));
         assert_eq!(detail.tasks[0].coverage_max_batches, Some(4));
+        assert_eq!(detail.tasks[0].tool_rounds_used, Some(2));
+        assert_eq!(detail.tasks[0].max_tool_rounds, Some(3));
         assert_eq!(detail.tasks[0].tool_calls_used, Some(5));
         assert_eq!(detail.tasks[0].max_tool_calls, Some(8));
         assert_eq!(detail.tasks[0].coverage_complete, Some(false));

@@ -140,6 +140,8 @@ pub struct DashboardTaskRun {
     pub coverage_planned_batches: Option<i64>,
     pub coverage_completed_batches: Option<i64>,
     pub coverage_max_batches: Option<i64>,
+    pub tool_rounds_used: Option<i64>,
+    pub max_tool_rounds: Option<i64>,
     pub tool_calls_used: Option<i64>,
     pub max_tool_calls: Option<i64>,
     pub coverage_complete: Option<bool>,
@@ -268,6 +270,8 @@ impl DashboardStore {
             "coverage_planned_batches",
             "coverage_completed_batches",
             "coverage_max_batches",
+            "tool_rounds_used",
+            "max_tool_rounds",
             "tool_calls_used",
             "max_tool_calls",
             "coverage_complete",
@@ -641,7 +645,8 @@ select task_type, task_id, title, status, findings, comments, error_code, error,
     coverage_total_files, coverage_fully_reviewed_files, coverage_partially_reviewed_files,
     coverage_unreviewed_files, coverage_total_diff_bytes, coverage_reviewed_diff_bytes,
     coverage_required_batches, coverage_planned_batches, coverage_completed_batches,
-    coverage_max_batches, tool_calls_used, max_tool_calls, coverage_complete
+    coverage_max_batches, tool_rounds_used, max_tool_rounds, tool_calls_used, max_tool_calls,
+    coverage_complete
 from review_task_runs
 where review_run_id = ?
 order by started_at asc, id asc
@@ -711,6 +716,8 @@ from review_coverage_files where review_run_id = ? and task_type = ? and task_id
                 coverage_planned_batches: row.get("coverage_planned_batches"),
                 coverage_completed_batches: row.get("coverage_completed_batches"),
                 coverage_max_batches: row.get("coverage_max_batches"),
+                tool_rounds_used: row.get("tool_rounds_used"),
+                max_tool_rounds: row.get("max_tool_rounds"),
                 tool_calls_used: row.get("tool_calls_used"),
                 max_tool_calls: row.get("max_tool_calls"),
                 coverage_complete: row.get("coverage_complete"),
@@ -1212,6 +1219,8 @@ create table review_task_runs (
     coverage_planned_batches integer,
     coverage_completed_batches integer,
     coverage_max_batches integer,
+    tool_rounds_used integer,
+    max_tool_rounds integer,
     tool_calls_used integer,
     max_tool_calls integer,
     coverage_complete integer,

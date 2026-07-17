@@ -11,6 +11,8 @@ usage() {
   echo "usage: $0 {start|stop|restart|status} [all|runner|dashboard]"
   echo
   echo "default service is all, which manages runner and dashboard together."
+  echo "by default, binaries are resolved from the release package root first,"
+  echo "then from target/release for source-tree development."
   echo "environment overrides:"
   echo "  RUNNER_BIN=/path/to/gitlab-work-runner"
   echo "  DASHBOARD_BIN=/path/to/gitlab-work-runner-dashboard"
@@ -37,10 +39,22 @@ service_bin_name() {
 service_bin_path() {
   case "$1" in
     runner)
-      echo "${RUNNER_BIN:-$ROOT_DIR/target/release/gitlab-work-runner}"
+      if [[ -n "${RUNNER_BIN:-}" ]]; then
+        echo "$RUNNER_BIN"
+      elif [[ -x "$ROOT_DIR/gitlab-work-runner" ]]; then
+        echo "$ROOT_DIR/gitlab-work-runner"
+      else
+        echo "$ROOT_DIR/target/release/gitlab-work-runner"
+      fi
       ;;
     dashboard)
-      echo "${DASHBOARD_BIN:-$ROOT_DIR/target/release/gitlab-work-runner-dashboard}"
+      if [[ -n "${DASHBOARD_BIN:-}" ]]; then
+        echo "$DASHBOARD_BIN"
+      elif [[ -x "$ROOT_DIR/gitlab-work-runner-dashboard" ]]; then
+        echo "$ROOT_DIR/gitlab-work-runner-dashboard"
+      else
+        echo "$ROOT_DIR/target/release/gitlab-work-runner-dashboard"
+      fi
       ;;
   esac
 }
@@ -75,7 +89,8 @@ start_service() {
 
   if [[ ! -x "$bin_path" ]]; then
     echo "binary is not executable: $bin_path" >&2
-    echo "build it first: cargo build --release" >&2
+    echo "build it first with: cargo build --release" >&2
+    echo "or set RUNNER_BIN/DASHBOARD_BIN to an executable path." >&2
     exit 1
   fi
 

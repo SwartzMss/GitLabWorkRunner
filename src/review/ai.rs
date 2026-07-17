@@ -1,5 +1,5 @@
 use crate::{
-    diff::{parse_unified_diff, DiffLineKind},
+    diff::{parse_unified_diff, DiffHunk, DiffLineKind},
     error::{AppError, AppResult, ReviewErrorCode},
     gitlab::GitLabChange,
     rules::{AiReviewConfig, Finding, Severity},
@@ -19,7 +19,7 @@ use super::{
     },
     ai_prompt::{
         build_review_prompt_with_options, formatted_change_payload, initial_chat_messages,
-        limited_diff_payload_details, ReviewBatchInfo, ReviewOutputMode,
+        ReviewBatchInfo, ReviewOutputMode,
     },
     ai_schema::{
         AiFindingsResponse, ChatMessage, OpenAiChatRequest, OpenAiChatResponse, OpenAiMessage,
@@ -36,6 +36,7 @@ const AI_HTTP_ATTEMPTS: usize = 2;
 const TOOL_ARGUMENT_SUMMARY_CHARS: usize = 160;
 const MIN_CONTEXT_TOOL_RESULT_BYTES: usize = 28;
 const FINALIZATION_INSTRUCTION: &str = "上下文工具预算已用尽。放弃任何仍缺少证据的候选问题，不得继续请求 read_file、search_code 或 list_files。请立即提交最终审查结果并调用 submit_review_findings；没有已确认问题时提交空 findings。";
+const DIFF_ONLY_FINALIZATION_INSTRUCTION: &str = "上下文工具已关闭。请只基于原始 diff 和已明确提供的信息完成审查，不得继续请求 read_file、search_code 或 list_files。放弃任何仍缺少证据的候选问题，并立即调用 submit_review_findings；没有已确认问题时提交空 findings。";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AiReviewExecutionMode {
@@ -100,6 +101,8 @@ pub struct ReviewCoverage {
     pub planned_batches: usize,
     pub completed_batches: usize,
     pub max_batches: usize,
+    pub tool_rounds_used: usize,
+    pub max_tool_rounds: usize,
     pub tool_calls_used: usize,
     pub max_tool_calls: usize,
     pub complete: bool,
@@ -137,10 +140,25 @@ struct AiReviewBatchPlan {
     incomplete_files: Vec<ReviewCoverageFile>,
 }
 
+#[derive(Clone, Debug)]
+struct ReviewWorkItem {
+    change: GitLabChange,
+    chunk_diff_bytes: usize,
+}
+
 #[derive(Debug)]
 struct AiReviewSingleResult {
     findings: Vec<Finding>,
+    tool_rounds_used: usize,
     tool_calls_used: usize,
+}
+
+struct AiReviewSingleOptions<'a> {
+    batch: Option<(usize, usize)>,
+    source_dir: Option<&'a Path>,
+    review_request: Option<&'a str>,
+    trusted_runtime_instruction: Option<&'a str>,
+    progress: Option<mpsc::UnboundedSender<AiReviewProgress>>,
 }
 
 pub async fn run_ai_review(
@@ -250,11 +268,15 @@ async fn run_ai_review_single(
     config: &AiReviewConfig,
     changes: &[GitLabChange],
     diff_limit_bytes: usize,
-    batch: Option<(usize, usize)>,
-    source_dir: Option<&Path>,
-    review_request: Option<&str>,
-    trusted_runtime_instruction: Option<&str>,
+    options: AiReviewSingleOptions<'_>,
 ) -> AppResult<AiReviewSingleResult> {
+    let AiReviewSingleOptions {
+        batch,
+        source_dir,
+        review_request,
+        trusted_runtime_instruction,
+        progress,
+    } = options;
     let api_key = config.api_key.trim();
     if api_key.is_empty() {
         return Err(AppError::ai_review(
@@ -426,6 +448,7 @@ async fn run_ai_review_single(
                         ));
                     }
                     let mut tool_calls_used = 0_usize;
+                    let mut tool_rounds_used = 0_usize;
                     let findings = complete_ai_review_response(AiReviewCompletion {
                         client,
                         config,
@@ -440,6 +463,8 @@ async fn run_ai_review_single(
                         request_guard_timeout,
                         batch,
                         tool_calls_used: &mut tool_calls_used,
+                        tool_rounds_used: &mut tool_rounds_used,
+                        progress: progress.clone(),
                     })
                     .await?;
                     let raw_finding_count = findings.len();
@@ -456,6 +481,7 @@ async fn run_ai_review_single(
                     );
                     return Ok(AiReviewSingleResult {
                         findings: filtered,
+                        tool_rounds_used,
                         tool_calls_used,
                     });
                 }
@@ -524,6 +550,7 @@ async fn run_batched_ai_review(
         config.max_batches,
     );
     plan.coverage.max_tool_calls = config.max_tool_calls;
+    plan.coverage.max_tool_rounds = config.max_tool_rounds;
     let batches = &plan.batches;
     info!(
         ai_review_id = %config.id,
@@ -541,6 +568,7 @@ async fn run_batched_ai_review(
     );
 
     let mut all_findings = Vec::new();
+    let mut max_tool_rounds_used_in_batch = 0_usize;
     let mut max_tool_calls_used_in_batch = 0_usize;
     let batch_count = batches.len();
     send_ai_progress(
@@ -579,11 +607,14 @@ async fn run_batched_ai_review(
             run_ai_review_single(
                 config,
                 batch,
-                config.max_batch_diff_bytes.max(1),
-                Some((batch_index, batch_count)),
-                source_dir,
-                review_request,
-                trusted_runtime_instruction,
+                batch_prompt_payload_limit(batch),
+                AiReviewSingleOptions {
+                    batch: Some((batch_index, batch_count)),
+                    source_dir,
+                    review_request,
+                    trusted_runtime_instruction,
+                    progress: progress.clone(),
+                },
             ),
         )
         .await
@@ -593,6 +624,8 @@ async fn run_batched_ai_review(
         };
         match result {
             Ok(mut batch_result) => {
+                max_tool_rounds_used_in_batch =
+                    max_tool_rounds_used_in_batch.max(batch_result.tool_rounds_used);
                 max_tool_calls_used_in_batch =
                     max_tool_calls_used_in_batch.max(batch_result.tool_calls_used);
                 all_findings.append(&mut batch_result.findings);
@@ -609,6 +642,7 @@ async fn run_batched_ai_review(
                 );
             }
             Err(err) => {
+                plan.coverage.tool_rounds_used = max_tool_rounds_used_in_batch;
                 plan.coverage.tool_calls_used = max_tool_calls_used_in_batch;
                 apply_batch_failure_coverage(
                     &mut plan,
@@ -628,6 +662,7 @@ async fn run_batched_ai_review(
         && plan.coverage.unreviewed_files == 0
         && plan.coverage.completed_batches == plan.coverage.planned_batches;
     plan.coverage.tool_calls_used = max_tool_calls_used_in_batch;
+    plan.coverage.tool_rounds_used = max_tool_rounds_used_in_batch;
     info!(
         ai_review_id = %config.id,
         coverage_files = %format!("{}/{}", plan.coverage.fully_reviewed_files + plan.coverage.partially_reviewed_files, plan.coverage.total_files),
@@ -636,6 +671,8 @@ async fn run_batched_ai_review(
         planned_batches = plan.coverage.planned_batches,
         completed_batches = plan.coverage.completed_batches,
         max_batches = plan.coverage.max_batches,
+        max_tool_rounds_used_in_batch = plan.coverage.tool_rounds_used,
+        max_tool_rounds = plan.coverage.max_tool_rounds,
         max_tool_calls_used_in_batch = plan.coverage.tool_calls_used,
         max_tool_calls = plan.coverage.max_tool_calls,
         partially_reviewed_files = plan.coverage.partially_reviewed_files,
@@ -659,51 +696,81 @@ fn send_ai_progress(
     }
 }
 
+fn send_ai_tool_progress(
+    progress: &Option<mpsc::UnboundedSender<AiReviewProgress>>,
+    config: &AiReviewConfig,
+    batch: Option<(usize, usize)>,
+    tool_rounds_used: usize,
+    tool_calls_used: usize,
+) {
+    let (current, total, scope) = match batch {
+        Some((index, count)) => (
+            Some(index),
+            Some(count),
+            format!("第 {index} / {count} 个批次"),
+        ),
+        None => (None, None, "当前批次".to_string()),
+    };
+    send_ai_progress(
+        progress,
+        AiReviewProgress {
+            phase: "reviewing_batch",
+            message: format!(
+                "正在审查{scope}，工具轮次 {} / {}，工具调用 {} / {}",
+                tool_rounds_used,
+                format_progress_limit(config.max_tool_rounds),
+                tool_calls_used,
+                format_progress_limit(config.max_tool_calls)
+            ),
+            current,
+            total,
+            unit: Some("batch"),
+        },
+    );
+}
+
+fn format_progress_limit(limit: usize) -> String {
+    if limit == 0 {
+        "不限".into()
+    } else {
+        limit.to_string()
+    }
+}
+
 fn apply_batch_failure_coverage(
     plan: &mut AiReviewBatchPlan,
     changes: &[GitLabChange],
     failed_batch_index: usize,
-    max_batch_diff_bytes: usize,
+    _max_batch_diff_bytes: usize,
 ) {
-    let successful_files = plan
+    let successful_items = plan
         .batches
         .iter()
         .take(failed_batch_index)
-        .map(Vec::len)
-        .sum::<usize>();
-    let planned_files = plan.batches.iter().map(Vec::len).sum::<usize>();
-    plan.incomplete_files
-        .retain(|file| file.reason == "max_batches_reached");
-    let mut reviewed_diff_bytes = 0;
-    let mut partial = 0;
-    for batch in plan.batches.iter().take(failed_batch_index) {
-        for file in limited_diff_payload_details(batch, max_batch_diff_bytes).files {
-            reviewed_diff_bytes += file.reviewed_diff_bytes;
-            if file.truncated {
-                partial += 1;
-                plan.incomplete_files.push(ReviewCoverageFile {
-                    path: file.path,
-                    status: "partial",
-                    reason: "single_file_diff_truncated",
-                    total_diff_bytes: file.total_diff_bytes,
-                    reviewed_diff_bytes: file.reviewed_diff_bytes,
-                });
-            }
+        .flat_map(|batch| batch.iter())
+        .map(|change| ReviewWorkItem {
+            change: change.clone(),
+            chunk_diff_bytes: change.diff.len(),
+        })
+        .collect::<Vec<_>>();
+    let failed_paths = plan
+        .batches
+        .iter()
+        .skip(failed_batch_index)
+        .flat_map(|batch| batch.iter())
+        .map(|change| change.new_path.as_str())
+        .collect::<HashSet<_>>();
+    let mut summary = summarize_planned_work_items(changes, &successful_items);
+    for file in &mut summary.incomplete_files {
+        if failed_paths.contains(file.path.as_str()) {
+            file.reason = "batch_execution_failed";
         }
     }
-    for change in changes.iter().take(planned_files).skip(successful_files) {
-        plan.incomplete_files.push(ReviewCoverageFile {
-            path: change.new_path.clone(),
-            status: "unreviewed",
-            reason: "batch_execution_failed",
-            total_diff_bytes: change.diff.len(),
-            reviewed_diff_bytes: 0,
-        });
-    }
-    plan.coverage.fully_reviewed_files = successful_files.saturating_sub(partial);
-    plan.coverage.partially_reviewed_files = partial;
-    plan.coverage.unreviewed_files = changes.len().saturating_sub(successful_files);
-    plan.coverage.reviewed_diff_bytes = reviewed_diff_bytes;
+    plan.coverage.fully_reviewed_files = summary.fully_reviewed_files;
+    plan.coverage.partially_reviewed_files = summary.partially_reviewed_files;
+    plan.coverage.unreviewed_files = summary.unreviewed_files;
+    plan.coverage.reviewed_diff_bytes = summary.reviewed_diff_bytes;
+    plan.incomplete_files = summary.incomplete_files;
     plan.coverage.complete = false;
 }
 
@@ -780,6 +847,8 @@ struct AiReviewCompletion<'a> {
     request_guard_timeout: Duration,
     batch: Option<(usize, usize)>,
     tool_calls_used: &'a mut usize,
+    tool_rounds_used: &'a mut usize,
+    progress: Option<mpsc::UnboundedSender<AiReviewProgress>>,
 }
 
 async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResult<Vec<Finding>> {
@@ -797,6 +866,8 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
         request_guard_timeout,
         batch,
         tool_calls_used,
+        tool_rounds_used,
+        progress,
     } = context;
     let mut body = first_body.to_string();
     let mut tool_call_limit_notice_sent = false;
@@ -804,6 +875,8 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
     let mut tool_cache = HashSet::<String>::new();
     let mut tool_result_bytes_used = 0_usize;
     let mut finalization_requested = false;
+    let mut diff_only_fallback_requested = false;
+    let base_message_count = messages.len();
     loop {
         let response: OpenAiChatResponse = serde_json::from_str(&body).map_err(|err| {
             AppError::ai_review(ReviewErrorCode::AiResponseParseFailed, err.to_string())
@@ -826,6 +899,8 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                     attempt,
                     total_tool_calls_used = *tool_calls_used,
                     max_tool_calls = config.max_tool_calls,
+                    tool_rounds_used = *tool_rounds_used,
+                    max_tool_rounds = config.max_tool_rounds,
                     batch_index = batch.map(|(index, _)| index),
                     batch_count = batch.map(|(_, count)| count),
                     "AI review context tool calls completed"
@@ -844,15 +919,26 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
             return parse_openai_message(&config.id, &config.title, message);
         }
         if finalization_requested {
-            return Err(AppError::ai_review(
-                ReviewErrorCode::AiRequestFailed,
-                format!(
-                    "AI review {} failed to submit findings after context tool finalization and requested another context tool",
-                    config.id
-                ),
-            ));
-        }
-        if !tool_context.source_available() {
+            if diff_only_fallback_requested {
+                return Err(AppError::ai_review(
+                    ReviewErrorCode::AiRequestFailed,
+                    format!(
+                        "AI review {} failed to submit findings after diff-only finalization fallback and requested another context tool",
+                        config.id
+                    ),
+                ));
+            }
+            diff_only_fallback_requested = true;
+            warn!(
+                ai_review_id = %config.id,
+                model = %config.model,
+                requested_tool_calls = context_tool_calls.len(),
+                batch_index = batch.map(|(index, _)| index),
+                batch_count = batch.map(|(_, count)| count),
+                "AI review requested context tools after finalization; retrying with diff-only finalization"
+            );
+            request_diff_only_finalization(messages, base_message_count);
+        } else if !tool_context.source_available() {
             if unavailable_context_tool_notice_sent {
                 return Err(AppError::ai_review(
                     ReviewErrorCode::AiResponseParseFailed,
@@ -881,15 +967,21 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                 tool_calls: None,
             });
         } else {
+            *tool_rounds_used += 1;
             let tool_call_names = context_tool_calls
                 .iter()
                 .map(|tool_call| tool_call.function.name.as_str())
                 .collect::<Vec<_>>()
                 .join(",");
+            let unlimited_tool_rounds = config.max_tool_rounds == 0;
+            let tool_round_budget_exhausted =
+                !unlimited_tool_rounds && *tool_rounds_used >= config.max_tool_rounds;
             info!(
                 ai_review_id = %config.id,
                 model = %config.model,
                 attempt,
+                tool_rounds_used = *tool_rounds_used,
+                max_tool_rounds = config.max_tool_rounds,
                 requested_tool_calls = context_tool_calls.len(),
                 tool_call_names = %tool_call_names,
                 tool_calls_used = *tool_calls_used,
@@ -897,6 +989,13 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                 batch_index = batch.map(|(index, _)| index),
                 batch_count = batch.map(|(_, count)| count),
                 "AI review context tool calls requested"
+            );
+            send_ai_tool_progress(
+                &progress,
+                config,
+                batch,
+                *tool_rounds_used,
+                *tool_calls_used,
             );
             let unlimited_tool_calls = config.max_tool_calls == 0;
             let remaining_tool_calls = if unlimited_tool_calls {
@@ -1008,6 +1107,13 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                         batch_count = batch.map(|(_, count)| count),
                         "AI review context tool result returned"
                     );
+                    send_ai_tool_progress(
+                        &progress,
+                        config,
+                        batch,
+                        *tool_rounds_used,
+                        *tool_calls_used,
+                    );
                     result
                 } else if real_calls_in_response >= remaining_tool_calls {
                     tool_call_limit_notice_sent = true;
@@ -1063,6 +1169,7 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                 && (tool_result_bytes_used >= config.max_tool_total_bytes
                     || tool_byte_limit_reached);
             if tool_call_budget_exhausted
+                || tool_round_budget_exhausted
                 || tool_byte_budget_exhausted
                 || cache_hit_requires_finalization
             {
@@ -1256,6 +1363,16 @@ fn request_finalization(messages: &mut Vec<ChatMessage>, requested: &mut bool) {
     });
 }
 
+fn request_diff_only_finalization(messages: &mut Vec<ChatMessage>, base_message_count: usize) {
+    messages.truncate(base_message_count);
+    messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some(DIFF_ONLY_FINALIZATION_INSTRUCTION.into()),
+        tool_call_id: None,
+        tool_calls: None,
+    });
+}
+
 fn context_tool_result_byte_limit_result(config: &AiReviewConfig) -> String {
     serde_json::json!({
         "ok": false,
@@ -1296,19 +1413,20 @@ fn plan_ai_review_batches(
     max_batches: usize,
 ) -> AiReviewBatchPlan {
     let max_batch_diff_bytes = max_batch_diff_bytes.max(1);
-    let mut all_batches = Vec::new();
-    let mut current = Vec::new();
+    let work_items = build_review_work_items(changes, max_batch_diff_bytes);
+    let mut all_batches = Vec::<Vec<ReviewWorkItem>>::new();
+    let mut current = Vec::<ReviewWorkItem>::new();
     let mut current_bytes = 0_usize;
 
-    for change in changes {
-        let change_bytes = formatted_change_payload(change).total_payload_bytes;
-        if !current.is_empty() && current_bytes + change_bytes > max_batch_diff_bytes {
+    for item in work_items {
+        let item_bytes = item.chunk_diff_bytes;
+        if !current.is_empty() && current_bytes + item_bytes > max_batch_diff_bytes {
             all_batches.push(current);
             current = Vec::new();
             current_bytes = 0;
         }
-        current.push(change.clone());
-        current_bytes += change_bytes;
+        current.push(item);
+        current_bytes += item_bytes;
     }
 
     if !current.is_empty() {
@@ -1320,62 +1438,261 @@ fn plan_ai_review_batches(
     } else {
         required_batches.min(max_batches)
     };
-    let planned_files = all_batches
+    let total_files = changes
+        .iter()
+        .filter(|change| !change.diff.is_empty())
+        .count();
+    let total_diff_bytes = changes.iter().map(|change| change.diff.len()).sum();
+    let planned_items = all_batches
         .iter()
         .take(planned_batches)
-        .map(Vec::len)
-        .sum::<usize>();
-    let total_diff_bytes = changes.iter().map(|change| change.diff.len()).sum();
-    let mut reviewed_diff_bytes = 0;
-    let mut partially_reviewed_files = 0;
-    let mut incomplete_files = Vec::new();
+        .flat_map(|batch| batch.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    let coverage_summary = summarize_planned_work_items(changes, &planned_items);
 
-    for batch in all_batches.iter().take(planned_batches) {
-        let limited = limited_diff_payload_details(batch, max_batch_diff_bytes);
-        for file in limited.files {
-            reviewed_diff_bytes += file.reviewed_diff_bytes;
-            if file.truncated {
-                partially_reviewed_files += 1;
-                incomplete_files.push(ReviewCoverageFile {
-                    path: file.path,
-                    status: "partial",
-                    reason: "single_file_diff_truncated",
-                    total_diff_bytes: file.total_diff_bytes,
-                    reviewed_diff_bytes: file.reviewed_diff_bytes,
-                });
-            }
-        }
-    }
-    for change in changes.iter().skip(planned_files) {
-        incomplete_files.push(ReviewCoverageFile {
-            path: change.new_path.clone(),
-            status: "unreviewed",
-            reason: "max_batches_reached",
-            total_diff_bytes: change.diff.len(),
-            reviewed_diff_bytes: 0,
-        });
-    }
-    let unreviewed_files = changes.len().saturating_sub(planned_files);
-    let fully_reviewed_files = planned_files.saturating_sub(partially_reviewed_files);
     AiReviewBatchPlan {
-        batches: all_batches.into_iter().take(planned_batches).collect(),
+        batches: all_batches
+            .into_iter()
+            .take(planned_batches)
+            .map(|batch| batch.into_iter().map(|item| item.change).collect())
+            .collect(),
         coverage: ReviewCoverage {
-            total_files: changes.len(),
-            fully_reviewed_files,
-            partially_reviewed_files,
-            unreviewed_files,
+            total_files,
+            fully_reviewed_files: coverage_summary.fully_reviewed_files,
+            partially_reviewed_files: coverage_summary.partially_reviewed_files,
+            unreviewed_files: coverage_summary.unreviewed_files,
             total_diff_bytes,
-            reviewed_diff_bytes,
+            reviewed_diff_bytes: coverage_summary.reviewed_diff_bytes,
             required_batches,
             planned_batches,
             completed_batches: 0,
             max_batches,
+            tool_rounds_used: 0,
+            max_tool_rounds: 0,
             tool_calls_used: 0,
             max_tool_calls: 0,
             complete: false,
         },
+        incomplete_files: coverage_summary.incomplete_files,
+    }
+}
+
+#[derive(Debug)]
+struct CoverageSummary {
+    fully_reviewed_files: usize,
+    partially_reviewed_files: usize,
+    unreviewed_files: usize,
+    reviewed_diff_bytes: usize,
+    incomplete_files: Vec<ReviewCoverageFile>,
+}
+
+fn summarize_planned_work_items(
+    changes: &[GitLabChange],
+    planned_items: &[ReviewWorkItem],
+) -> CoverageSummary {
+    let mut reviewed_by_path = std::collections::HashMap::<&str, usize>::new();
+    for item in planned_items {
+        *reviewed_by_path
+            .entry(item.change.new_path.as_str())
+            .or_default() += item.chunk_diff_bytes;
+    }
+
+    let mut fully_reviewed_files = 0;
+    let mut partially_reviewed_files = 0;
+    let mut unreviewed_files = 0;
+    let mut reviewed_diff_bytes = 0;
+    let mut incomplete_files = Vec::new();
+    for change in changes {
+        if change.diff.is_empty() {
+            continue;
+        }
+        let reviewed = reviewed_by_path
+            .get(change.new_path.as_str())
+            .copied()
+            .unwrap_or(0)
+            .min(change.diff.len());
+        reviewed_diff_bytes += reviewed;
+        if reviewed == 0 {
+            unreviewed_files += 1;
+            incomplete_files.push(ReviewCoverageFile {
+                path: change.new_path.clone(),
+                status: "unreviewed",
+                reason: "max_batches_reached",
+                total_diff_bytes: change.diff.len(),
+                reviewed_diff_bytes: 0,
+            });
+        } else if reviewed < change.diff.len() {
+            partially_reviewed_files += 1;
+            incomplete_files.push(ReviewCoverageFile {
+                path: change.new_path.clone(),
+                status: "partial",
+                reason: "max_batches_reached",
+                total_diff_bytes: change.diff.len(),
+                reviewed_diff_bytes: reviewed,
+            });
+        } else {
+            fully_reviewed_files += 1;
+        }
+    }
+
+    CoverageSummary {
+        fully_reviewed_files,
+        partially_reviewed_files,
+        unreviewed_files,
+        reviewed_diff_bytes,
         incomplete_files,
     }
+}
+
+fn build_review_work_items(
+    changes: &[GitLabChange],
+    max_batch_diff_bytes: usize,
+) -> Vec<ReviewWorkItem> {
+    changes
+        .iter()
+        .flat_map(|change| split_change_into_review_work_items(change, max_batch_diff_bytes))
+        .collect()
+}
+
+fn split_change_into_review_work_items(
+    change: &GitLabChange,
+    max_batch_diff_bytes: usize,
+) -> Vec<ReviewWorkItem> {
+    if change.diff.len() <= max_batch_diff_bytes {
+        return vec![ReviewWorkItem {
+            change: change.clone(),
+            chunk_diff_bytes: change.diff.len(),
+        }];
+    }
+
+    let Ok(diff_file) = parse_unified_diff(&change.old_path, &change.new_path, &change.diff) else {
+        return split_change_by_byte_chunks(change, max_batch_diff_bytes);
+    };
+    if diff_file.hunks.is_empty() {
+        return split_change_by_byte_chunks(change, max_batch_diff_bytes);
+    }
+
+    let max_chunk_diff_bytes = max_batch_diff_bytes.max(1);
+    let mut items = Vec::new();
+    let mut current_diff = String::new();
+    let mut current_diff_bytes = 0_usize;
+
+    for hunk in diff_file.hunks {
+        let hunk_diff = format_diff_hunk(&hunk);
+        let hunk_bytes = hunk_diff.len();
+        if hunk_bytes > max_chunk_diff_bytes {
+            if !current_diff.is_empty() {
+                items.push(review_work_item_from_diff(
+                    change,
+                    std::mem::take(&mut current_diff),
+                    current_diff_bytes,
+                ));
+                current_diff_bytes = 0;
+            }
+            items.extend(split_diff_text_into_review_work_items(
+                change,
+                &hunk_diff,
+                max_chunk_diff_bytes,
+            ));
+            continue;
+        }
+        if !current_diff.is_empty() && current_diff_bytes + hunk_bytes > max_chunk_diff_bytes {
+            items.push(review_work_item_from_diff(
+                change,
+                std::mem::take(&mut current_diff),
+                current_diff_bytes,
+            ));
+            current_diff_bytes = 0;
+        }
+        current_diff.push_str(&hunk_diff);
+        current_diff_bytes += hunk_bytes;
+    }
+    if !current_diff.is_empty() {
+        items.push(review_work_item_from_diff(
+            change,
+            current_diff,
+            current_diff_bytes,
+        ));
+    }
+    items
+}
+
+fn split_change_by_byte_chunks(
+    change: &GitLabChange,
+    max_batch_diff_bytes: usize,
+) -> Vec<ReviewWorkItem> {
+    let max_chunk_diff_bytes = max_batch_diff_bytes.max(1);
+    split_diff_text_into_review_work_items(change, &change.diff, max_chunk_diff_bytes)
+}
+
+fn batch_prompt_payload_limit(changes: &[GitLabChange]) -> usize {
+    changes
+        .iter()
+        .map(|change| formatted_change_payload(change).total_payload_bytes)
+        .sum::<usize>()
+        .max(1)
+}
+
+fn split_diff_text_into_review_work_items(
+    change: &GitLabChange,
+    diff: &str,
+    max_chunk_diff_bytes: usize,
+) -> Vec<ReviewWorkItem> {
+    let mut items = Vec::new();
+    let mut start = 0;
+    while start < diff.len() {
+        let mut end = (start + max_chunk_diff_bytes).min(diff.len());
+        while end > start && !diff.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == start {
+            end = diff[start..]
+                .char_indices()
+                .nth(1)
+                .map(|(offset, _)| start + offset)
+                .unwrap_or(diff.len());
+        }
+        let chunk = diff[start..end].to_string();
+        items.push(review_work_item_from_diff(change, chunk, end - start));
+        start = end;
+    }
+    items
+}
+
+fn review_work_item_from_diff(
+    change: &GitLabChange,
+    diff: String,
+    chunk_diff_bytes: usize,
+) -> ReviewWorkItem {
+    ReviewWorkItem {
+        change: GitLabChange {
+            old_path: change.old_path.clone(),
+            new_path: change.new_path.clone(),
+            new_file: change.new_file,
+            renamed_file: change.renamed_file,
+            deleted_file: change.deleted_file,
+            diff,
+        },
+        chunk_diff_bytes,
+    }
+}
+
+fn format_diff_hunk(hunk: &DiffHunk) -> String {
+    let mut output = format!(
+        "@@ -{},{} +{},{} @@\n",
+        hunk.old_start, hunk.old_lines, hunk.new_start, hunk.new_lines
+    );
+    for line in &hunk.lines {
+        match line.kind {
+            DiffLineKind::Added => output.push('+'),
+            DiffLineKind::Removed => output.push('-'),
+            DiffLineKind::Context => output.push(' '),
+        }
+        output.push_str(&line.content);
+        output.push('\n');
+    }
+    output
 }
 
 #[cfg(test)]
@@ -1645,7 +1962,7 @@ mod tests {
     use crate::{
         gitlab::GitLabChange,
         review::{
-            ai_prompt::{build_review_prompt, change_diff_payload, limited_diff_payload},
+            ai_prompt::{build_review_prompt, limited_diff_payload},
             ai_tools::{list_files_tool, read_file_tool, search_code_tool},
         },
         rules::Severity,
@@ -1679,6 +1996,7 @@ mod tests {
             max_batches: 6,
             extra_instructions: String::new(),
             max_tool_calls: 8,
+            max_tool_rounds: 3,
             max_tool_result_bytes: 60_000,
             max_tool_total_bytes: 40_000,
         }
@@ -1898,9 +2216,7 @@ mod tests {
                 diff: "+x\n".into(),
             })
             .collect::<Vec<_>>();
-        let one_payload = change_diff_payload(&changes[0]).len();
-
-        let plan = plan_ai_review_batches(&changes, one_payload, 2);
+        let plan = plan_ai_review_batches(&changes, changes[0].diff.len(), 2);
 
         assert_eq!(plan.coverage.required_batches, 3);
         assert_eq!(plan.coverage.planned_batches, 2);
@@ -1924,14 +2240,45 @@ mod tests {
                 diff: "+x\n".into(),
             })
             .collect::<Vec<_>>();
-        let one_payload = change_diff_payload(&changes[0]).len();
-
-        let plan = plan_ai_review_batches(&changes, one_payload, 0);
+        let plan = plan_ai_review_batches(&changes, changes[0].diff.len(), 0);
 
         assert_eq!(plan.coverage.required_batches, 3);
         assert_eq!(plan.coverage.planned_batches, 3);
         assert_eq!(plan.batches.len(), 3);
         assert_eq!(plan.coverage.unreviewed_files, 0);
+        assert!(plan.incomplete_files.is_empty());
+    }
+
+    #[test]
+    fn batch_plan_ignores_empty_diff_files_for_review_coverage() {
+        let changes = vec![
+            GitLabChange {
+                old_path: "a.rs".into(),
+                new_path: "a.rs".into(),
+                new_file: false,
+                renamed_file: false,
+                deleted_file: false,
+                diff: "+x\n".into(),
+            },
+            GitLabChange {
+                old_path: "empty.rs".into(),
+                new_path: "empty.rs".into(),
+                new_file: false,
+                renamed_file: false,
+                deleted_file: false,
+                diff: String::new(),
+            },
+        ];
+
+        let plan = plan_ai_review_batches(&changes, 10, 0);
+
+        assert_eq!(plan.coverage.total_files, 1);
+        assert_eq!(plan.coverage.fully_reviewed_files, 1);
+        assert_eq!(plan.coverage.unreviewed_files, 0);
+        assert_eq!(plan.coverage.total_diff_bytes, 3);
+        assert_eq!(plan.coverage.reviewed_diff_bytes, 3);
+        assert_eq!(plan.coverage.required_batches, 1);
+        assert_eq!(plan.coverage.planned_batches, 1);
         assert!(plan.incomplete_files.is_empty());
     }
 
@@ -1945,19 +2292,41 @@ mod tests {
             deleted_file: false,
             diff: "+abcdef\n".into(),
         };
-        let formatted = formatted_change_payload(&change);
-        let limit = formatted.diff_start + 3;
-
-        let plan = plan_ai_review_batches(&[change], limit, 1);
+        let plan = plan_ai_review_batches(&[change], 3, 1);
 
         assert_eq!(plan.coverage.total_diff_bytes, 8);
         assert_eq!(plan.coverage.reviewed_diff_bytes, 3);
         assert_eq!(plan.coverage.partially_reviewed_files, 1);
         assert_eq!(plan.incomplete_files[0].reviewed_diff_bytes, 3);
-        assert_eq!(
-            plan.incomplete_files[0].reason,
-            "single_file_diff_truncated"
-        );
+        assert_eq!(plan.incomplete_files[0].reason, "max_batches_reached");
+    }
+
+    #[test]
+    fn batch_plan_splits_large_single_file_by_hunks() {
+        let hunk_one = "@@ -1,1 +1,1 @@\n-old1\n+new1\n";
+        let hunk_two = "@@ -100,1 +100,1 @@\n-old2\n+new2\n";
+        let hunk_three = "@@ -200,1 +200,1 @@\n-old3\n+new3\n";
+        let change = GitLabChange {
+            old_path: "src/large.rs".into(),
+            new_path: "src/large.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: format!("{hunk_one}{hunk_two}{hunk_three}"),
+        };
+        let limit = hunk_one.len().max(hunk_two.len()).max(hunk_three.len());
+
+        let plan = plan_ai_review_batches(std::slice::from_ref(&change), limit, 0);
+
+        assert_eq!(plan.coverage.required_batches, 3);
+        assert_eq!(plan.coverage.planned_batches, 3);
+        assert_eq!(plan.batches.len(), 3);
+        assert!(plan.batches[0][0].diff.contains("+new1"));
+        assert!(plan.batches[1][0].diff.contains("+new2"));
+        assert!(plan.batches[2][0].diff.contains("+new3"));
+        assert_eq!(plan.coverage.reviewed_diff_bytes, change.diff.len());
+        assert_eq!(plan.coverage.fully_reviewed_files, 1);
+        assert!(plan.incomplete_files.is_empty());
     }
 
     #[test]
@@ -1973,7 +2342,7 @@ mod tests {
                 diff: "+x\n".into(),
             })
             .collect::<Vec<_>>();
-        let limit = formatted_change_payload(&changes[0]).total_payload_bytes;
+        let limit = changes[0].diff.len();
         let mut plan = plan_ai_review_batches(&changes, limit, 2);
         plan.coverage.completed_batches = 1;
 
@@ -2488,6 +2857,154 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_round_limit_requests_finalization_after_last_round() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let finalize_only_request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_server = Arc::clone(&request_count);
+        let finalize_only_request_count_for_server = Arc::clone(&finalize_only_request_count);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request_count = Arc::clone(&request_count_for_server);
+                let finalize_only_request_count =
+                    Arc::clone(&finalize_only_request_count_for_server);
+                tokio::spawn(async move {
+                    let request_index = request_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    let request = read_http_json_request(&mut stream).await;
+                    let body = if request_index == 1 {
+                        r#"{"choices":[{"message":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"search_code","arguments":"{\"query\":\"panic\"}"}}]}}]}"#
+                            .as_bytes()
+                            .to_vec()
+                    } else {
+                        let tool_names = request["tools"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .filter_map(|tool| tool["function"]["name"].as_str())
+                            .collect::<Vec<_>>();
+                        let has_finalization_instruction = request["messages"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .filter(|message| message["role"] == "user")
+                            .filter_map(|message| message["content"].as_str())
+                            .any(|content| content.contains("立即提交最终审查结果"));
+                        if tool_names == ["submit_review_findings"] && has_finalization_instruction
+                        {
+                            finalize_only_request_count.fetch_add(1, Ordering::SeqCst);
+                        }
+                        r#"{"choices":[{"message":{"tool_calls":[{"id":"submit_1","type":"function","function":{"name":"submit_review_findings","arguments":"{\"findings\":[]}"}}]}}]}"#
+                            .as_bytes()
+                            .to_vec()
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    stream.write_all(&body).await.unwrap();
+                });
+            }
+        });
+
+        let config = AiReviewConfig {
+            base_url: format!("http://{addr}"),
+            max_tool_rounds: 1,
+            max_tool_calls: 30,
+            ..test_ai_review_config()
+        };
+        let changes = vec![GitLabChange {
+            old_path: "src/lib.rs".into(),
+            new_path: "src/lib.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "@@ -1 +1 @@\n+panic!();\n".into(),
+        }];
+        let source = tempfile::tempdir().unwrap();
+
+        let execution =
+            run_ai_review_execution_with_context(&config, &changes, Some(source.path()), None)
+                .await;
+
+        assert!(execution.result.unwrap().is_empty());
+        let coverage = execution.coverage.unwrap();
+        assert_eq!(coverage.tool_rounds_used, 1);
+        assert_eq!(coverage.max_tool_rounds, 1);
+        assert_eq!(coverage.tool_calls_used, 1);
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        assert_eq!(finalize_only_request_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn context_tool_progress_reports_rounds_and_calls() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_server = Arc::clone(&request_count);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request_count = Arc::clone(&request_count_for_server);
+                tokio::spawn(async move {
+                    let request_index = request_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    let _ = read_http_json_request(&mut stream).await;
+                    let body = if request_index == 1 {
+                        r#"{"choices":[{"message":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"search_code","arguments":"{\"query\":\"panic\"}"}}]}}]}"#
+                    } else {
+                        r#"{"choices":[{"message":{"tool_calls":[{"id":"submit_1","type":"function","function":{"name":"submit_review_findings","arguments":"{\"findings\":[]}"}}]}}]}"#
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    stream.write_all(body.as_bytes()).await.unwrap();
+                });
+            }
+        });
+
+        let config = AiReviewConfig {
+            base_url: format!("http://{addr}"),
+            ..test_ai_review_config()
+        };
+        let changes = vec![GitLabChange {
+            old_path: "src/lib.rs".into(),
+            new_path: "src/lib.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "@@ -1 +1 @@\n+panic!();\n".into(),
+        }];
+        let source = tempfile::tempdir().unwrap();
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+
+        let execution = run_ai_review_execution_with_runtime_instruction_and_progress(
+            &config,
+            &changes,
+            Some(source.path()),
+            None,
+            None,
+            Some(progress_tx),
+        )
+        .await;
+
+        assert!(execution.result.unwrap().is_empty());
+        let mut messages = Vec::new();
+        while let Ok(progress) = progress_rx.try_recv() {
+            messages.push(progress.message);
+        }
+        assert!(messages.iter().any(
+            |message| message.contains("工具轮次 1 / 3") && message.contains("工具调用 0 / 8")
+        ));
+        assert!(messages.iter().any(
+            |message| message.contains("工具轮次 1 / 3") && message.contains("工具调用 1 / 8")
+        ));
+    }
+
+    #[tokio::test]
     async fn cumulative_tool_result_budget_skips_later_unique_calls() {
         let limit_result_count = Arc::new(AtomicUsize::new(0));
         let limit_result_count_for_server = Arc::clone(&limit_result_count);
@@ -2556,19 +3073,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn context_request_after_finalization_fails_without_another_loop() {
+    async fn context_request_after_finalization_falls_back_to_diff_only() {
         let request_count = Arc::new(AtomicUsize::new(0));
+        let fallback_request_clean = Arc::new(AtomicUsize::new(0));
         let request_count_for_server = Arc::clone(&request_count);
+        let fallback_request_clean_for_server = Arc::clone(&fallback_request_clean);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             loop {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let request_count = Arc::clone(&request_count_for_server);
+                let fallback_request_clean = Arc::clone(&fallback_request_clean_for_server);
                 tokio::spawn(async move {
-                    request_count.fetch_add(1, Ordering::SeqCst);
-                    let _ = read_http_json_request(&mut stream).await;
-                    let body = r#"{"choices":[{"message":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"search_code","arguments":"{\"query\":\"panic\"}"}}]}}]}"#;
+                    let request_index = request_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    let request = read_http_json_request(&mut stream).await;
+                    let body = if request_index <= 2 {
+                        r#"{"choices":[{"message":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"search_code","arguments":"{\"query\":\"panic\"}"}}]}}]}"#
+                    } else {
+                        let tool_names = request["tools"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|tool| tool["function"]["name"].as_str().unwrap())
+                            .collect::<Vec<_>>();
+                        assert_eq!(tool_names, vec!["submit_review_findings"]);
+                        let leaked_context_history = request["messages"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|message| {
+                                message["role"] == "tool"
+                                    || message["tool_calls"].as_array().is_some_and(|calls| {
+                                        calls.iter().any(|call| {
+                                            matches!(
+                                                call["function"]["name"].as_str(),
+                                                Some("read_file" | "search_code" | "list_files")
+                                            )
+                                        })
+                                    })
+                            });
+                        fallback_request_clean
+                            .store(usize::from(!leaked_context_history), Ordering::SeqCst);
+                        r#"{"choices":[{"message":{"tool_calls":[{"id":"submit_1","type":"function","function":{"name":"submit_review_findings","arguments":"{\"findings\":[]}"}}]}}]}"#
+                    };
                     let response = format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
                         body.len()
@@ -2594,20 +3142,14 @@ mod tests {
         }];
         let source = tempfile::tempdir().unwrap();
 
-        let error =
+        let execution =
             run_ai_review_execution_with_context(&config, &changes, Some(source.path()), None)
-                .await
-                .result
-                .unwrap_err();
+                .await;
 
-        assert_eq!(request_count.load(Ordering::SeqCst), 2);
-        assert_eq!(
-            error.review_failure().map(|failure| failure.code),
-            Some(ReviewErrorCode::AiRequestFailed)
-        );
-        assert!(error
-            .to_string()
-            .contains("failed to submit findings after context tool finalization"));
+        assert!(execution.result.unwrap().is_empty());
+        assert_eq!(execution.coverage.unwrap().tool_calls_used, 1);
+        assert_eq!(request_count.load(Ordering::SeqCst), 3);
+        assert_eq!(fallback_request_clean.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

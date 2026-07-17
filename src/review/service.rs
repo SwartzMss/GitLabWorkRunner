@@ -101,6 +101,8 @@ impl ReviewService {
             planned_batches: coverage.planned_batches,
             completed_batches: coverage.completed_batches,
             max_batches: coverage.max_batches,
+            tool_rounds_used: coverage.tool_rounds_used,
+            max_tool_rounds: coverage.max_tool_rounds,
             tool_calls_used: coverage.tool_calls_used,
             max_tool_calls: coverage.max_tool_calls,
             complete: coverage.complete,
@@ -750,7 +752,7 @@ fn build_manual_review_summary_body(
         .map(|value| sanitize_comment_detail(value, 300))
         .filter(|value| !value.is_empty());
     let mut body = format!(
-        "## GitLabWorkRunner Review\n\n**状态：** {}\n**Commit：** `{}`\n**结果：** {}\n\n### 检查范围\n\n- 文件：{} / {}\n- Diff：{} / {}\n- 耗时：{} 秒\n",
+        "## GitLabWorkRunner Review\n\n**状态：** {}\n**Commit：** `{}`\n**结果：** {}\n\n### 检查范围\n\n- 文件：{} / {}\n- Diff：{} / {}\n- 耗时：{}\n",
         status,
         sanitize_comment_inline(&event.commit_sha),
         result,
@@ -758,7 +760,7 @@ fn build_manual_review_summary_body(
         changes.changes.len(),
         format_bytes(reviewed_diff_bytes),
         format_bytes(total_diff_bytes),
-        elapsed.as_secs().max(1)
+        format_duration(elapsed)
     );
     if let Some(preference) = preference {
         body.push_str("\n### 用户偏好\n\n");
@@ -1496,6 +1498,11 @@ fn format_duration_ms(elapsed_ms: u64) -> String {
     }
 }
 
+fn format_duration(elapsed: std::time::Duration) -> String {
+    let elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+    format_duration_ms(elapsed_ms.max(1_000))
+}
+
 fn failure_for_error(error: &AppError, fallback: ReviewErrorCode) -> ReviewFailure {
     error
         .review_failure()
@@ -1562,6 +1569,8 @@ mod tests {
                 planned_batches: marker,
                 completed_batches: 0,
                 max_batches: marker,
+                tool_rounds_used: 0,
+                max_tool_rounds: 0,
                 tool_calls_used: 0,
                 max_tool_calls: 0,
                 complete: false,
@@ -1624,6 +1633,7 @@ mod tests {
             max_batches: 3,
             extra_instructions: String::new(),
             max_tool_calls: 4,
+            max_tool_rounds: 3,
             max_tool_result_bytes: 100,
             max_tool_total_bytes: 40_000,
         };
@@ -1781,6 +1791,7 @@ mod tests {
             max_batches: 1,
             extra_instructions: String::new(),
             max_tool_calls: 1,
+            max_tool_rounds: 3,
             max_tool_result_bytes: 1,
             max_tool_total_bytes: 40_000,
         };
@@ -1919,6 +1930,7 @@ mod tests {
             max_batches: 2,
             extra_instructions: String::new(),
             max_tool_calls: 1,
+            max_tool_rounds: 3,
             max_tool_result_bytes: 1_000,
             max_tool_total_bytes: 40_000,
         };
@@ -2188,6 +2200,8 @@ mod tests {
             planned_batches: 1,
             completed_batches: 1,
             max_batches: 10,
+            tool_rounds_used: 1,
+            max_tool_rounds: 3,
             tool_calls_used: 2,
             max_tool_calls: 30,
             complete: true,
@@ -2207,6 +2221,7 @@ mod tests {
         assert!(body.contains("详情: AI review API returned 401 invalid token"));
         assert!(body.contains("重点检查线程安全"));
         assert!(body.contains("- Diff：3 B / 3 B"));
+        assert!(body.contains("- 耗时：42 秒"));
         assert!(!body.contains("- 批次："));
         assert!(!body.contains("- 上下文工具："));
         assert!(body.contains("<!-- gitlab-work-runner:summary run=rr-1 commit=abc123 -->"));
@@ -2261,6 +2276,47 @@ mod tests {
         assert_eq!(format_duration_ms(40_000), "40 秒");
         assert_eq!(format_duration_ms(2_400_000), "40 分 00 秒");
         assert_eq!(format_duration_ms(3_986_000), "1 小时 06 分 26 秒");
+    }
+
+    #[test]
+    fn manual_review_summary_formats_elapsed_as_minutes_and_seconds() {
+        let event = MergeRequestEvent {
+            project_id: 1,
+            project_name: None,
+            project_path_with_namespace: None,
+            mr_iid: 2,
+            commit_sha: "abc123".into(),
+            action: "manual-note-1".into(),
+            source_branch: String::new(),
+            target_branch: String::new(),
+        };
+        let changes = crate::gitlab::MergeRequestChanges {
+            changes: vec![GitLabChange {
+                old_path: "src/lib.rs".into(),
+                new_path: "src/lib.rs".into(),
+                new_file: false,
+                renamed_file: false,
+                deleted_file: false,
+                diff: "+x\n".into(),
+            }],
+            diff_refs: crate::gitlab::DiffRefs {
+                base_sha: Some("base".into()),
+                start_sha: Some("start".into()),
+                head_sha: Some("head".into()),
+            },
+        };
+
+        let body = build_manual_review_summary_body(
+            &event,
+            &changes,
+            "rr-1",
+            &AiReviewRunSummary::default(),
+            None,
+            std::time::Duration::from_secs(582),
+        );
+
+        assert!(body.contains("- 耗时：9 分 42 秒"));
+        assert!(!body.contains("- 耗时：582 秒"));
     }
 
     #[test]

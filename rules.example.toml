@@ -6,8 +6,9 @@
 [ai_review]
 extra_instructions = ""
 # Built-in read-only context tools are enabled by default. The runner controls call count
-# and result size.
-max_tool_calls = 30
+# rounds, call count, and result size.
+max_tool_rounds = 0
+max_tool_calls = 35
 max_tool_result_bytes = 60000
 max_tool_total_bytes = 40000
 
@@ -21,5 +22,5 @@ timeout_seconds = 4800
 request_timeout_seconds = 420
 # AI Review requests Chat Completions tool_calls by default and falls back to JSON content parsing when needed.
 # This does not require MCP; findings are read from submit_review_findings arguments when tool_calls are returned.
-max_batch_diff_bytes = 30000
+max_batch_diff_bytes = 25000
 max_batches = 0
