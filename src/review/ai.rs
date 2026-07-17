@@ -1055,17 +1055,11 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
             let tool_byte_budget_exhausted = config.max_tool_total_bytes != 0
                 && tool_result_bytes_used >= config.max_tool_total_bytes;
             if tool_call_budget_exhausted || tool_byte_budget_exhausted {
-                finalization_requested = true;
-                messages.push(ChatMessage {
-                    role: "user".into(),
-                    content: Some(FINALIZATION_INSTRUCTION.into()),
-                    tool_call_id: None,
-                    tool_calls: None,
-                });
+                request_finalization(messages, &mut finalization_requested);
             }
         }
 
-        let request_body = serialize_review_request_body(
+        let mut request_body = serialize_review_request_body(
             config,
             messages,
             true,
@@ -1117,6 +1111,11 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                                 error = %err,
                                 "AI review context follow-up request failed, retrying"
                             );
+                            if current_response.status == 504 {
+                                request_finalization(messages, &mut finalization_requested);
+                                request_body =
+                                    serialize_review_request_body(config, messages, true, false)?;
+                            }
                             last_error = Some(err);
                             continue;
                         }
@@ -1128,6 +1127,14 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                     let retryable =
                         followup_attempt < AI_HTTP_ATTEMPTS && is_retryable_ai_error(&err);
                     if retryable {
+                        if matches!(
+                            err.review_failure().map(|failure| failure.code),
+                            Some(ReviewErrorCode::AiToolLoopTimeout)
+                        ) {
+                            request_finalization(messages, &mut finalization_requested);
+                            request_body =
+                                serialize_review_request_body(config, messages, true, false)?;
+                        }
                         warn!(
                             ai_review_id = %config.id,
                             model = %config.model,
@@ -1151,6 +1158,9 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                         ),
                     );
                     if followup_attempt < AI_HTTP_ATTEMPTS {
+                        request_finalization(messages, &mut finalization_requested);
+                        request_body =
+                            serialize_review_request_body(config, messages, true, false)?;
                         warn!(
                             ai_review_id = %config.id,
                             model = %config.model,
@@ -1218,6 +1228,19 @@ fn context_tool_call_limit_result(config: &AiReviewConfig) -> String {
         )
     })
     .to_string()
+}
+
+fn request_finalization(messages: &mut Vec<ChatMessage>, requested: &mut bool) {
+    if *requested {
+        return;
+    }
+    *requested = true;
+    messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some(FINALIZATION_INSTRUCTION.into()),
+        tool_call_id: None,
+        tool_calls: None,
+    });
 }
 
 fn context_tool_result_byte_limit_result(config: &AiReviewConfig) -> String {
@@ -2633,8 +2656,10 @@ mod tests {
     async fn retries_retryable_tool_loop_http_response_once_before_succeeding() {
         let request_count = Arc::new(AtomicUsize::new(0));
         let tool_message_count = Arc::new(AtomicUsize::new(0));
+        let finalize_only_retry_count = Arc::new(AtomicUsize::new(0));
         let request_count_for_server = Arc::clone(&request_count);
         let tool_message_count_for_server = Arc::clone(&tool_message_count);
+        let finalize_only_retry_count_for_server = Arc::clone(&finalize_only_retry_count);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -2642,6 +2667,7 @@ mod tests {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let request_count = Arc::clone(&request_count_for_server);
                 let tool_message_count = Arc::clone(&tool_message_count_for_server);
+                let finalize_only_retry_count = Arc::clone(&finalize_only_retry_count_for_server);
                 tokio::spawn(async move {
                     let request_index = request_count.fetch_add(1, Ordering::SeqCst) + 1;
                     let request = read_http_json_request(&mut stream).await;
@@ -2668,6 +2694,22 @@ mod tests {
                                 .filter(|message| message["role"] == "tool")
                                 .count();
                             tool_message_count.store(tool_messages, Ordering::SeqCst);
+                            let tool_names = request["tools"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .filter_map(|tool| tool["function"]["name"].as_str())
+                                .collect::<Vec<_>>();
+                            let has_finalization_instruction = messages
+                                .iter()
+                                .filter(|message| message["role"] == "user")
+                                .filter_map(|message| message["content"].as_str())
+                                .any(|content| content.contains("立即提交最终审查结果"));
+                            if tool_names == ["submit_review_findings"]
+                                && has_finalization_instruction
+                            {
+                                finalize_only_retry_count.fetch_add(1, Ordering::SeqCst);
+                            }
                             (
                                 "200 OK",
                                 r#"{"choices":[{"message":{"tool_calls":[{"id":"submit_1","type":"function","function":{"name":"submit_review_findings","arguments":"{\"findings\":[]}"}}]}}]}"#
@@ -2710,6 +2752,7 @@ mod tests {
         assert!(findings.is_empty());
         assert_eq!(request_count.load(Ordering::SeqCst), 3);
         assert_eq!(tool_message_count.load(Ordering::SeqCst), 1);
+        assert_eq!(finalize_only_retry_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
