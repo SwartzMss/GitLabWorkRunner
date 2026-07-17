@@ -394,9 +394,7 @@ mod tests {
     #[test]
     fn context_policy_requires_a_concrete_candidate_before_tool_lookup() {
         assert!(SYSTEM_PROMPT.contains("先根据当前 diff 形成具体的候选缺陷"));
-        assert!(SYSTEM_PROMPT.contains(
-            "没有具体候选缺陷时，不得为了探索仓库而调用上下文工具"
-        ));
+        assert!(SYSTEM_PROMPT.contains("没有具体候选缺陷时，不得为了探索仓库而调用上下文工具"));
         assert!(SYSTEM_PROMPT.contains("证据仍不足时，放弃该候选缺陷"));
     }
 

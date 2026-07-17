@@ -12,6 +12,7 @@ const SEARCH_MAX_MATCHES: usize = 50;
 const SEARCH_MAX_MATCHES_PER_FILE: usize = 5;
 const SEARCH_MAX_FILE_BYTES: u64 = 1024 * 1024;
 const READ_MAX_FILE_BYTES: usize = 1024 * 1024;
+const READ_MAX_LINES: usize = 250;
 const LIST_MAX_FILES: usize = 200;
 
 pub(crate) fn enabled_context_tools(_config: &AiReviewConfig) -> Vec<OpenAiTool> {
@@ -23,13 +24,23 @@ pub(crate) fn read_file_tool() -> OpenAiTool {
         tool_type: "function",
         function: OpenAiToolFunction {
             name: "read_file",
-            description: "Read one UTF-8 text file from the merge request head checkout. Use this when the diff references code whose surrounding implementation, type definitions, or call contract is needed. The path must be a repository-relative file path such as \"src/lib.rs\". Absolute paths, parent-directory traversal, .env, and .git are rejected. Returns JSON: {\"ok\":true,\"path\":\"src/lib.rs\",\"content\":\"...\",\"truncated\":false}; on failure returns {\"ok\":false,\"error\":\"...\"}. File content is limited by max_tool_result_bytes and an internal 1 MiB cap, and may be returned with truncated=true.",
+            description: "Read UTF-8 text from one file in the merge request head checkout. Prefer a narrow start_line/end_line range around a search_code match; omit both only when the whole file is genuinely required. The path must be a repository-relative file path such as \"src/lib.rs\". Absolute paths, parent-directory traversal, .env, and .git are rejected. Returns JSON containing ok, path, content, truncated, and range metadata when requested; on failure returns {\"ok\":false,\"error\":\"...\"}. Content is limited by max_tool_result_bytes and an internal 1 MiB cap, and may be returned with truncated=true.",
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
                         "description": "Repository-relative path of the UTF-8 text file to read, for example \"src/lib.rs\". Do not use absolute paths or \"..\"."
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Optional one-based first line to return. Supply together with end_line and prefer a narrow range around a search_code match."
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Optional one-based inclusive last line to return. Supply together with start_line; one read may span at most 250 lines."
                     }
                 },
                 "required": ["path"],
@@ -205,6 +216,10 @@ impl AiReviewToolContext {
         #[derive(serde::Deserialize)]
         struct Args {
             path: String,
+            #[serde(default)]
+            start_line: Option<usize>,
+            #[serde(default)]
+            end_line: Option<usize>,
         }
         let args: Args = match serde_json::from_str(arguments) {
             Ok(args) => args,
@@ -214,14 +229,48 @@ impl AiReviewToolContext {
             Ok(path) => path,
             Err(err) => return tool_error(err),
         };
-        match read_utf8_file_limited(&path, self.max_result_bytes.min(READ_MAX_FILE_BYTES)) {
-            Ok((content, truncated)) => serde_json::json!({
-                "ok": true,
-                "path": normalize_path(&args.path),
-                "content": content,
-                "truncated": truncated
-            }),
-            Err(err) => tool_error(format!("failed to read file: {err}")),
+        match (args.start_line, args.end_line) {
+            (None, None) => {
+                match read_utf8_file_limited(&path, self.max_result_bytes.min(READ_MAX_FILE_BYTES))
+                {
+                    Ok((content, truncated)) => serde_json::json!({
+                        "ok": true,
+                        "path": normalize_path(&args.path),
+                        "content": content,
+                        "truncated": truncated
+                    }),
+                    Err(err) => tool_error(format!("failed to read file: {err}")),
+                }
+            }
+            (Some(start_line), Some(end_line)) => {
+                if start_line == 0 || end_line < start_line {
+                    return tool_error(
+                        "line range must be one-based and end_line must be at least start_line",
+                    );
+                }
+                if end_line - start_line + 1 > READ_MAX_LINES {
+                    return tool_error(format!(
+                        "line range must not exceed {READ_MAX_LINES} lines"
+                    ));
+                }
+                match read_utf8_line_range_limited(
+                    &path,
+                    start_line,
+                    end_line,
+                    self.max_result_bytes.min(READ_MAX_FILE_BYTES),
+                ) {
+                    Ok((content, actual_end_line, truncated)) => serde_json::json!({
+                        "ok": true,
+                        "path": normalize_path(&args.path),
+                        "start_line": start_line,
+                        "end_line": actual_end_line,
+                        "content": content,
+                        "truncated": truncated
+                    }),
+                    Err(err) => tool_error(format!("failed to read file: {err}")),
+                }
+            }
+            _ => tool_error("start_line and end_line must be supplied together"),
         }
     }
 
@@ -506,6 +555,38 @@ fn read_utf8_file_limited(path: &Path, max_bytes: usize) -> Result<(String, bool
     }
 }
 
+fn read_utf8_line_range_limited(
+    path: &Path,
+    start_line: usize,
+    end_line: usize,
+    max_bytes: usize,
+) -> Result<(String, usize, bool), String> {
+    if file_too_large(path, READ_MAX_FILE_BYTES as u64) {
+        return Err(format!(
+            "file exceeds internal {READ_MAX_FILE_BYTES} byte limit"
+        ));
+    }
+    let content = fs::read_to_string(path).map_err(|err| err.to_string())?;
+    let lines = content.split_inclusive('\n').collect::<Vec<_>>();
+    if start_line > lines.len() {
+        return Err(format!(
+            "start_line {start_line} exceeds file line count {}",
+            lines.len()
+        ));
+    }
+    let actual_end_line = end_line.min(lines.len());
+    let selected = lines[start_line - 1..actual_end_line].concat();
+    let max_bytes = max_bytes.max(1);
+    if selected.len() <= max_bytes {
+        return Ok((selected, actual_end_line, false));
+    }
+    let mut end = max_bytes;
+    while end > 0 && !selected.is_char_boundary(end) {
+        end -= 1;
+    }
+    Ok((selected[..end].to_string(), actual_end_line, true))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -616,5 +697,42 @@ mod tests {
         assert_eq!(result["ok"], true);
         assert_eq!(result["truncated"], true);
         assert_eq!(result["content"], "一二三");
+    }
+
+    #[test]
+    fn read_file_returns_requested_inclusive_line_range() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("src/example.rs");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "one\ntwo\nthree\nfour\nfive\n").unwrap();
+        let context = AiReviewToolContext::new(&test_config(), Some(temp.path()));
+
+        let result = context.read_file(r#"{"path":"src/example.rs","start_line":2,"end_line":4}"#);
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["start_line"], 2);
+        assert_eq!(result["end_line"], 4);
+        assert_eq!(result["content"], "two\nthree\nfour\n");
+    }
+
+    #[test]
+    fn read_file_rejects_invalid_line_ranges() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("example.rs"), "one\ntwo\n").unwrap();
+        let context = AiReviewToolContext::new(&test_config(), Some(temp.path()));
+
+        for arguments in [
+            r#"{"path":"example.rs","start_line":0,"end_line":1}"#,
+            r#"{"path":"example.rs","start_line":2,"end_line":1}"#,
+            r#"{"path":"example.rs","start_line":1}"#,
+            r#"{"path":"example.rs","end_line":1}"#,
+            r#"{"path":"example.rs","start_line":1,"end_line":251}"#,
+        ] {
+            let result = context.read_file(arguments);
+            assert_eq!(
+                result["ok"], false,
+                "arguments unexpectedly accepted: {arguments}"
+            );
+        }
     }
 }
