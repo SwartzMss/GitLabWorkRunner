@@ -34,6 +34,8 @@ pub struct AiReviewConfig {
     pub max_tool_calls: usize,
     #[serde(default = "default_ai_max_tool_result_bytes")]
     pub max_tool_result_bytes: usize,
+    #[serde(default = "default_ai_max_tool_total_bytes")]
+    pub max_tool_total_bytes: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -44,6 +46,8 @@ pub struct AiReviewPromptConfig {
     pub max_tool_calls: usize,
     #[serde(default = "default_ai_max_tool_result_bytes")]
     pub max_tool_result_bytes: usize,
+    #[serde(default = "default_ai_max_tool_total_bytes")]
+    pub max_tool_total_bytes: usize,
 }
 
 impl Default for AiReviewPromptConfig {
@@ -52,6 +56,7 @@ impl Default for AiReviewPromptConfig {
             extra_instructions: String::new(),
             max_tool_calls: default_ai_max_tool_calls(),
             max_tool_result_bytes: default_ai_max_tool_result_bytes(),
+            max_tool_total_bytes: default_ai_max_tool_total_bytes(),
         }
     }
 }
@@ -97,6 +102,7 @@ impl Ruleset {
             config.extra_instructions = parsed.ai_review.extra_instructions.clone();
             config.max_tool_calls = parsed.ai_review.max_tool_calls;
             config.max_tool_result_bytes = parsed.ai_review.max_tool_result_bytes;
+            config.max_tool_total_bytes = parsed.ai_review.max_tool_total_bytes;
             ai_reviews.push(CompiledAiReview { config });
         }
         let hash = format!("{:x}", Sha256::digest(text.as_bytes()));
@@ -138,6 +144,10 @@ fn default_ai_max_tool_calls() -> usize {
 
 fn default_ai_max_tool_result_bytes() -> usize {
     60_000
+}
+
+fn default_ai_max_tool_total_bytes() -> usize {
+    40_000
 }
 
 #[cfg(test)]
@@ -237,6 +247,7 @@ model = "gpt-4.1-mini"
         assert!(reviews[0].extra_instructions.is_empty());
         assert_eq!(reviews[0].max_tool_calls, 30);
         assert_eq!(reviews[0].max_tool_result_bytes, 60_000);
+        assert_eq!(reviews[0].max_tool_total_bytes, 40_000);
     }
 
     #[test]
@@ -247,6 +258,7 @@ model = "gpt-4.1-mini"
 extra_instructions = "Focus on C++ lifetime bugs."
 max_tool_calls = 4
 max_tool_result_bytes = 12000
+max_tool_total_bytes = 12345
 
 [[ai_reviews]]
 id = "ai-review"
@@ -272,6 +284,7 @@ max_batches = 6
         assert_eq!(reviews[0].extra_instructions, "Focus on C++ lifetime bugs.");
         assert_eq!(reviews[0].max_tool_calls, 4);
         assert_eq!(reviews[0].max_tool_result_bytes, 12_000);
+        assert_eq!(reviews[0].max_tool_total_bytes, 12_345);
     }
 
     #[test]

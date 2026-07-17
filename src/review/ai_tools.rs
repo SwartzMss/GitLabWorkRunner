@@ -526,6 +526,7 @@ mod tests {
             extra_instructions: String::new(),
             max_tool_calls: 8,
             max_tool_result_bytes: 60_000,
+            max_tool_total_bytes: 40_000,
         }
     }
 
