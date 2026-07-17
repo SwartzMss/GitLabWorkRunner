@@ -2,6 +2,7 @@ use crate::rules::AiReviewConfig;
 
 use super::ai_schema::{OpenAiTool, OpenAiToolCall, OpenAiToolFunction};
 use std::{
+    collections::BTreeMap,
     fs::{self, File},
     io::Read,
     path::{Component, Path, PathBuf},
@@ -146,6 +147,46 @@ pub(crate) fn non_empty_tool_call_id(tool_call: &OpenAiToolCall) -> String {
     }
 }
 
+pub(crate) fn context_tool_cache_key(tool_name: &str, arguments: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(arguments) else {
+        return format!("{tool_name}\0{arguments}");
+    };
+    if tool_name == "read_file" {
+        if let Some(path) = value.get_mut("path") {
+            if let Some(raw_path) = path.as_str() {
+                *path = serde_json::Value::String(normalize_path(raw_path));
+            }
+        }
+    }
+    format!("{tool_name}\0{}", canonical_json(&value))
+}
+
+fn canonical_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Object(object) => {
+            let sorted = object
+                .iter()
+                .map(|(key, value)| (key, canonical_json(value)))
+                .collect::<BTreeMap<_, _>>();
+            let fields = sorted
+                .into_iter()
+                .map(|(key, value)| format!("{}:{value}", serde_json::json!(key)))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{fields}}}")
+        }
+        serde_json::Value::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(canonical_json)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        _ => value.to_string(),
+    }
+}
+
 pub(crate) struct AiReviewToolContext {
     source_dir: Option<PathBuf>,
     read_file: bool,
@@ -177,7 +218,11 @@ impl AiReviewToolContext {
         }
     }
 
-    pub(crate) fn call(&self, tool_call: &OpenAiToolCall) -> String {
+    pub(crate) fn call_with_result_limit(
+        &self,
+        tool_call: &OpenAiToolCall,
+        max_result_bytes: usize,
+    ) -> String {
         let result = match tool_call.function.name.as_str() {
             "read_file" if self.read_file => self.read_file(&tool_call.function.arguments),
             "search_code" if self.search_code => self.search_code(&tool_call.function.arguments),
@@ -187,7 +232,7 @@ impl AiReviewToolContext {
                 "error": format!("tool is not enabled: {name}")
             }),
         };
-        truncate_json_result(result, self.max_result_bytes)
+        truncate_json_result(result, self.max_result_bytes.min(max_result_bytes.max(1)))
     }
 
     pub(crate) fn enabled(&self) -> bool {
@@ -734,5 +779,19 @@ mod tests {
                 "arguments unexpectedly accepted: {arguments}"
             );
         }
+    }
+
+    #[test]
+    fn context_tool_cache_key_normalizes_json_keys_and_path_separators() {
+        assert_eq!(
+            context_tool_cache_key(
+                "read_file",
+                r#"{"path":"src\\lib.rs","end_line":20,"start_line":10}"#,
+            ),
+            context_tool_cache_key(
+                "read_file",
+                r#"{"start_line":10,"path":"src/lib.rs","end_line":20}"#,
+            ),
+        );
     }
 }

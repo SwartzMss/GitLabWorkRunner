@@ -5,7 +5,7 @@ use crate::{
     rules::{AiReviewConfig, Finding, Severity},
 };
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     path::Path,
     time::{Duration, Instant},
 };
@@ -26,8 +26,8 @@ use super::{
         OpenAiToolCall, ResponseFormat,
     },
     ai_tools::{
-        enabled_context_tools, is_context_tool_call, non_empty_tool_call_id, review_findings_tool,
-        AiReviewToolContext,
+        context_tool_cache_key, enabled_context_tools, is_context_tool_call,
+        non_empty_tool_call_id, review_findings_tool, AiReviewToolContext,
     },
 };
 
@@ -799,6 +799,8 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
     let mut body = first_body.to_string();
     let mut tool_call_limit_notice_sent = false;
     let mut unavailable_context_tool_notice_sent = false;
+    let mut tool_cache = HashMap::<String, String>::new();
+    let mut tool_result_bytes_used = 0_usize;
     loop {
         let response: OpenAiChatResponse = serde_json::from_str(&body).map_err(|err| {
             AppError::ai_review(ReviewErrorCode::AiResponseParseFailed, err.to_string())
@@ -930,14 +932,45 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                 tool_call_id: None,
                 tool_calls: Some(context_tool_calls.clone()),
             });
-            for (tool_call_index, tool_call) in context_tool_calls.into_iter().enumerate() {
+            let mut real_calls_in_response = 0_usize;
+            for tool_call in context_tool_calls {
                 let tool_call_id = non_empty_tool_call_id(&tool_call);
                 let tool_name = tool_call.function.name.as_str();
                 let arguments_summary =
                     tool_call_argument_summary(tool_name, &tool_call.function.arguments);
-                let result = if tool_call_index < remaining_tool_calls {
-                    let result = tool_context.call(&tool_call);
+                let cache_key = context_tool_cache_key(tool_name, &tool_call.function.arguments);
+                let remaining_tool_bytes = if config.max_tool_total_bytes == 0 {
+                    usize::MAX
+                } else {
+                    config
+                        .max_tool_total_bytes
+                        .saturating_sub(tool_result_bytes_used)
+                };
+                let result = if tool_cache.contains_key(&cache_key) {
+                    let result = cached_context_tool_result();
+                    info!(
+                        ai_review_id = %config.id,
+                        model = %config.model,
+                        tool_name,
+                        tool_call_id = %tool_call_id,
+                        arguments_summary = %arguments_summary,
+                        cache_hit = true,
+                        tool_calls_used = *tool_calls_used,
+                        tool_result_bytes_used,
+                        max_tool_total_bytes = config.max_tool_total_bytes,
+                        batch_index = batch.map(|(index, _)| index),
+                        batch_count = batch.map(|(_, count)| count),
+                        "AI review context tool result reused"
+                    );
+                    result
+                } else if real_calls_in_response < remaining_tool_calls && remaining_tool_bytes > 0
+                {
+                    let result_limit = config.max_tool_result_bytes.min(remaining_tool_bytes);
+                    let result = tool_context.call_with_result_limit(&tool_call, result_limit);
                     *tool_calls_used += 1;
+                    real_calls_in_response += 1;
+                    tool_result_bytes_used = tool_result_bytes_used.saturating_add(result.len());
+                    tool_cache.insert(cache_key, result.clone());
                     info!(
                         ai_review_id = %config.id,
                         model = %config.model,
@@ -951,12 +984,15 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                         tool_calls_used = *tool_calls_used,
                         total_tool_calls_used = *tool_calls_used,
                         max_tool_calls = config.max_tool_calls,
+                        cache_hit = false,
+                        tool_result_bytes_used,
+                        max_tool_total_bytes = config.max_tool_total_bytes,
                         batch_index = batch.map(|(index, _)| index),
                         batch_count = batch.map(|(_, count)| count),
                         "AI review context tool result returned"
                     );
                     result
-                } else {
+                } else if real_calls_in_response >= remaining_tool_calls {
                     tool_call_limit_notice_sent = true;
                     let result = context_tool_call_limit_result(config);
                     warn!(
@@ -975,6 +1011,24 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                         batch_index = batch.map(|(index, _)| index),
                         batch_count = batch.map(|(_, count)| count),
                         "AI review context tool call skipped because limit was reached"
+                    );
+                    result
+                } else {
+                    let result = context_tool_result_byte_limit_result(config);
+                    warn!(
+                        ai_review_id = %config.id,
+                        model = %config.model,
+                        tool_name,
+                        tool_call_id = %tool_call_id,
+                        arguments_summary = %arguments_summary,
+                        result_bytes = tool_result_bytes(&result),
+                        tool_calls_used = *tool_calls_used,
+                        max_tool_calls = config.max_tool_calls,
+                        tool_result_bytes_used,
+                        max_tool_total_bytes = config.max_tool_total_bytes,
+                        batch_index = batch.map(|(index, _)| index),
+                        batch_count = batch.map(|(_, count)| count),
+                        "AI review context tool call skipped because result byte limit was reached"
                     );
                     result
                 };
@@ -1134,6 +1188,26 @@ fn context_tool_call_limit_result(config: &AiReviewConfig) -> String {
             "AI review context tool call limit reached for '{}'. Stop calling context tools and submit final findings with submit_review_findings using the context already available.",
             config.id
         )
+    })
+    .to_string()
+}
+
+fn context_tool_result_byte_limit_result(config: &AiReviewConfig) -> String {
+    serde_json::json!({
+        "ok": false,
+        "error": format!(
+            "AI review context tool result byte limit reached for '{}'. Stop calling context tools and submit final findings with submit_review_findings using the context already available.",
+            config.id
+        )
+    })
+    .to_string()
+}
+
+fn cached_context_tool_result() -> String {
+    serde_json::json!({
+        "ok": true,
+        "cached": true,
+        "message": "Identical context result was already provided earlier in this review batch; reuse that evidence."
     })
     .to_string()
 }
@@ -2231,6 +2305,144 @@ mod tests {
         assert!(findings.is_empty());
         assert_eq!(request_count.load(Ordering::SeqCst), 2);
         assert_eq!(tool_message_count.load(Ordering::SeqCst), 2);
+        assert_eq!(limit_result_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn duplicate_context_tool_call_reuses_compact_cached_result() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let cached_result_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_server = Arc::clone(&request_count);
+        let cached_result_count_for_server = Arc::clone(&cached_result_count);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request_count = Arc::clone(&request_count_for_server);
+                let cached_result_count = Arc::clone(&cached_result_count_for_server);
+                tokio::spawn(async move {
+                    let request_index = request_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    let request = read_http_json_request(&mut stream).await;
+                    let body = match request_index {
+                        1 | 2 => {
+                            r#"{"choices":[{"message":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"search_code","arguments":"{\"query\":\"panic\",\"glob\":\"src/**/*.rs\"}"}}]}}]}"#
+                        }
+                        3 => {
+                            let cached = request["messages"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .filter(|message| message["role"] == "tool")
+                                .filter(|message| {
+                                    message["content"]
+                                        .as_str()
+                                        .is_some_and(|content| content.contains("\"cached\":true"))
+                                })
+                                .count();
+                            cached_result_count.store(cached, Ordering::SeqCst);
+                            r#"{"choices":[{"message":{"tool_calls":[{"id":"submit_1","type":"function","function":{"name":"submit_review_findings","arguments":"{\"findings\":[]}"}}]}}]}"#
+                        }
+                        other => panic!("unexpected request {other}"),
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    stream.write_all(body.as_bytes()).await.unwrap();
+                });
+            }
+        });
+
+        let config = AiReviewConfig {
+            base_url: format!("http://{addr}"),
+            ..test_ai_review_config()
+        };
+        let changes = vec![GitLabChange {
+            old_path: "src/lib.rs".into(),
+            new_path: "src/lib.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "@@ -1 +1 @@\n+panic!();\n".into(),
+        }];
+        let source = tempfile::tempdir().unwrap();
+
+        let execution =
+            run_ai_review_execution_with_context(&config, &changes, Some(source.path()), None)
+                .await;
+
+        assert!(execution.result.unwrap().is_empty());
+        assert_eq!(execution.coverage.unwrap().tool_calls_used, 1);
+        assert_eq!(cached_result_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cumulative_tool_result_budget_skips_later_unique_calls() {
+        let limit_result_count = Arc::new(AtomicUsize::new(0));
+        let limit_result_count_for_server = Arc::clone(&limit_result_count);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let limit_result_count = Arc::clone(&limit_result_count_for_server);
+                tokio::spawn(async move {
+                    let request = read_http_json_request(&mut stream).await;
+                    let has_tool_results = request["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|message| message["role"] == "tool");
+                    let body = if has_tool_results {
+                        let limit_results = request["messages"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .filter(|message| message["role"] == "tool")
+                            .filter(|message| {
+                                message["content"].as_str().is_some_and(|content| {
+                                    content.contains("context tool result byte limit reached")
+                                })
+                            })
+                            .count();
+                        limit_result_count.store(limit_results, Ordering::SeqCst);
+                        r#"{"choices":[{"message":{"tool_calls":[{"id":"submit_1","type":"function","function":{"name":"submit_review_findings","arguments":"{\"findings\":[]}"}}]}}]}"#
+                    } else {
+                        r#"{"choices":[{"message":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"search_code","arguments":"{\"query\":\"panic\"}"}},{"id":"call_2","type":"function","function":{"name":"search_code","arguments":"{\"query\":\"unwrap\"}"}}]}}]}"#
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    stream.write_all(body.as_bytes()).await.unwrap();
+                });
+            }
+        });
+
+        let config = AiReviewConfig {
+            base_url: format!("http://{addr}"),
+            max_tool_total_bytes: 20,
+            ..test_ai_review_config()
+        };
+        let changes = vec![GitLabChange {
+            old_path: "src/lib.rs".into(),
+            new_path: "src/lib.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "@@ -1 +1 @@\n+panic!();\n".into(),
+        }];
+        let source = tempfile::tempdir().unwrap();
+
+        let execution =
+            run_ai_review_execution_with_context(&config, &changes, Some(source.path()), None)
+                .await;
+
+        assert!(execution.result.unwrap().is_empty());
+        assert_eq!(execution.coverage.unwrap().tool_calls_used, 1);
         assert_eq!(limit_result_count.load(Ordering::SeqCst), 1);
     }
 
