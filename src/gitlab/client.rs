@@ -98,6 +98,8 @@ struct LegacyMergeRequestChanges {
 #[derive(Deserialize)]
 struct MergeRequestMetadataResponse {
     diff_refs: DiffRefs,
+    #[serde(default)]
+    changes_count: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -279,10 +281,13 @@ impl GitLabClient {
             }
         }
 
+        let overflow = detect_diff_overflow(metadata.changes_count.as_deref(), changes.len());
         info!(
             project_id,
             mr_iid,
             changed_files = changes.len(),
+            changes_count = ?metadata.changes_count,
+            overflow,
             incomplete_files = diff_metadata
                 .iter()
                 .filter(|metadata| metadata.collapsed || metadata.too_large)
@@ -296,7 +301,7 @@ impl GitLabClient {
         Ok(MergeRequestChanges {
             changes,
             diff_refs: metadata.diff_refs,
-            overflow: false,
+            overflow,
             diff_metadata,
         })
     }
@@ -866,6 +871,24 @@ fn preview_log_text(value: &str, max_chars: usize) -> String {
     preview
 }
 
+fn detect_diff_overflow(changes_count: Option<&str>, returned_files: usize) -> bool {
+    let Some(changes_count) = changes_count
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    let Some(count) = changes_count
+        .strip_suffix('+')
+        .unwrap_or(changes_count)
+        .parse::<usize>()
+        .ok()
+    else {
+        return false;
+    };
+    changes_count.ends_with('+') || count > returned_files
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1013,6 +1036,53 @@ mod tests {
         assert!(changes.diff_metadata[1].collapsed);
         assert!(changes.diff_metadata[1].generated_file);
         assert!(!changes.overflow);
+    }
+
+    #[tokio::test]
+    async fn marks_paginated_merge_request_diffs_overflow_from_changes_count() {
+        let app = Router::new()
+            .route(
+                "/api/v4/projects/1/merge_requests/2",
+                get(|| async {
+                    Json(json!({
+                        "changes_count": "3",
+                        "diff_refs": {
+                            "base_sha": "base",
+                            "start_sha": "start",
+                            "head_sha": "head"
+                        }
+                    }))
+                }),
+            )
+            .route(
+                "/api/v4/projects/1/merge_requests/2/diffs",
+                get(|| async {
+                    Json(json!([{
+                        "old_path": "src/lib.rs",
+                        "new_path": "src/lib.rs",
+                        "new_file": false,
+                        "renamed_file": false,
+                        "deleted_file": false,
+                        "diff": "@@ -1 +1 @@\n-old\n+new\n"
+                    }]))
+                }),
+            );
+        let base_url = spawn_server(app).await;
+
+        let client = GitLabClient::new(base_url, "token".into());
+        let changes = client.merge_request_changes(1, 2).await.unwrap();
+
+        assert_eq!(changes.changes.len(), 1);
+        assert!(changes.overflow);
+    }
+
+    #[test]
+    fn detects_plus_suffixed_diff_overflow_count() {
+        assert!(detect_diff_overflow(Some("1000+"), 1000));
+        assert!(detect_diff_overflow(Some("3"), 2));
+        assert!(!detect_diff_overflow(Some("2"), 2));
+        assert!(!detect_diff_overflow(Some("unknown"), 2));
+        assert!(!detect_diff_overflow(None, 2));
     }
 
     #[tokio::test]

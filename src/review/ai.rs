@@ -137,7 +137,7 @@ pub struct AiReviewProgress {
 
 #[derive(Clone, Debug)]
 struct AiReviewBatchPlan {
-    batches: Vec<Vec<GitLabChange>>,
+    batches: Vec<Vec<ReviewWorkItem>>,
     coverage: ReviewCoverage,
     incomplete_files: Vec<ReviewCoverageFile>,
 }
@@ -147,6 +147,8 @@ struct ReviewWorkItem {
     change: GitLabChange,
     chunk_diff_bytes: usize,
     payload_diff_bytes: usize,
+    reviewable: bool,
+    incomplete_reason: Option<&'static str>,
 }
 
 #[derive(Debug)]
@@ -554,7 +556,6 @@ async fn run_batched_ai_review(
     );
     plan.coverage.max_tool_calls = config.max_tool_calls;
     plan.coverage.max_tool_rounds = config.max_tool_rounds;
-    let batches = &plan.batches;
     info!(
         ai_review_id = %config.id,
         model = %config.model,
@@ -573,7 +574,7 @@ async fn run_batched_ai_review(
     let mut all_findings = Vec::new();
     let mut max_tool_rounds_used_in_batch = 0_usize;
     let mut max_tool_calls_used_in_batch = 0_usize;
-    let batch_count = batches.len();
+    let batch_count = plan.batches.len();
     send_ai_progress(
         &progress,
         AiReviewProgress {
@@ -584,7 +585,11 @@ async fn run_batched_ai_review(
             unit: Some("batch"),
         },
     );
-    for (index, batch) in batches.iter().enumerate() {
+    for index in 0..plan.batches.len() {
+        let batch_changes = plan.batches[index]
+            .iter()
+            .map(|item| item.change.clone())
+            .collect::<Vec<_>>();
         let batch_index = index + 1;
         send_ai_progress(
             &progress,
@@ -600,8 +605,8 @@ async fn run_batched_ai_review(
             ai_review_id = %config.id,
             batch_index,
             batch_count,
-            file_count = batch.len(),
-            diff_bytes = batch.iter().map(|change| change.diff.len()).sum::<usize>(),
+            file_count = batch_changes.len(),
+            diff_bytes = batch_changes.iter().map(|change| change.diff.len()).sum::<usize>(),
             "AI review batch started"
         );
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -609,8 +614,8 @@ async fn run_batched_ai_review(
             remaining,
             run_ai_review_single(
                 config,
-                batch,
-                batch_prompt_payload_limit(batch),
+                &batch_changes,
+                batch_prompt_payload_limit(&batch_changes),
                 AiReviewSingleOptions {
                     batch: Some((batch_index, batch_count)),
                     source_dir,
@@ -751,18 +756,14 @@ fn apply_batch_failure_coverage(
         .iter()
         .take(failed_batch_index)
         .flat_map(|batch| batch.iter())
-        .map(|change| ReviewWorkItem {
-            change: change.clone(),
-            chunk_diff_bytes: change.diff.len(),
-            payload_diff_bytes: change.diff.len(),
-        })
+        .cloned()
         .collect::<Vec<_>>();
     let failed_paths = plan
         .batches
         .iter()
         .skip(failed_batch_index)
         .flat_map(|batch| batch.iter())
-        .map(|change| change.new_path.as_str())
+        .map(|item| item.change.new_path.as_str())
         .collect::<HashSet<_>>();
     let mut summary = summarize_planned_work_items(changes, &successful_items);
     for file in &mut summary.incomplete_files {
@@ -1484,11 +1485,16 @@ fn plan_ai_review_batches(
 ) -> AiReviewBatchPlan {
     let max_batch_diff_bytes = max_batch_diff_bytes.max(1);
     let work_items = build_review_work_items(changes, max_batch_diff_bytes);
+    let non_reviewable_items = work_items
+        .iter()
+        .filter(|item| !item.reviewable)
+        .cloned()
+        .collect::<Vec<_>>();
     let mut all_batches = Vec::<Vec<ReviewWorkItem>>::new();
     let mut current = Vec::<ReviewWorkItem>::new();
     let mut current_bytes = 0_usize;
 
-    for item in work_items {
+    for item in work_items.into_iter().filter(|item| item.reviewable) {
         let item_bytes = item.payload_diff_bytes;
         if !current.is_empty() && current_bytes + item_bytes > max_batch_diff_bytes {
             all_batches.push(current);
@@ -1515,15 +1521,12 @@ fn plan_ai_review_batches(
         .take(planned_batches)
         .flat_map(|batch| batch.iter())
         .cloned()
+        .chain(non_reviewable_items)
         .collect::<Vec<_>>();
     let coverage_summary = summarize_planned_work_items(changes, &planned_items);
 
     AiReviewBatchPlan {
-        batches: all_batches
-            .into_iter()
-            .take(planned_batches)
-            .map(|batch| batch.into_iter().map(|item| item.change).collect())
-            .collect(),
+        batches: all_batches.into_iter().take(planned_batches).collect(),
         coverage: ReviewCoverage {
             total_files,
             fully_reviewed_files: coverage_summary.fully_reviewed_files,
@@ -1559,10 +1562,16 @@ fn summarize_planned_work_items(
     planned_items: &[ReviewWorkItem],
 ) -> CoverageSummary {
     let mut reviewed_by_path = std::collections::HashMap::<&str, usize>::new();
+    let mut reason_by_path = std::collections::HashMap::<&str, &'static str>::new();
     for item in planned_items {
         *reviewed_by_path
             .entry(item.change.new_path.as_str())
             .or_default() += item.chunk_diff_bytes;
+        if let Some(reason) = item.incomplete_reason {
+            reason_by_path
+                .entry(item.change.new_path.as_str())
+                .or_insert(reason);
+        }
     }
 
     let mut fully_reviewed_files = 0;
@@ -1582,11 +1591,14 @@ fn summarize_planned_work_items(
             incomplete_files.push(ReviewCoverageFile {
                 path: change.new_path.clone(),
                 status: "unreviewed",
-                reason: if change.diff.is_empty() {
-                    "gitlab_diff_unavailable"
-                } else {
-                    "max_batches_reached"
-                },
+                reason: reason_by_path
+                    .get(change.new_path.as_str())
+                    .copied()
+                    .unwrap_or(if change.diff.is_empty() {
+                        "gitlab_diff_unavailable"
+                    } else {
+                        "max_batches_reached"
+                    }),
                 total_diff_bytes: change.diff.len(),
                 reviewed_diff_bytes: 0,
             });
@@ -1595,7 +1607,10 @@ fn summarize_planned_work_items(
             incomplete_files.push(ReviewCoverageFile {
                 path: change.new_path.clone(),
                 status: "partial",
-                reason: "max_batches_reached",
+                reason: reason_by_path
+                    .get(change.new_path.as_str())
+                    .copied()
+                    .unwrap_or("max_batches_reached"),
                 total_diff_bytes: change.diff.len(),
                 reviewed_diff_bytes: reviewed,
             });
@@ -1632,6 +1647,8 @@ fn split_change_into_review_work_items(
             change: change.clone(),
             chunk_diff_bytes: change.diff.len(),
             payload_diff_bytes: change.diff.len(),
+            reviewable: true,
+            incomplete_reason: None,
         }];
     }
 
@@ -1717,7 +1734,31 @@ fn split_hunk_into_review_work_items(
         let line_source_bytes = formatted_diff_line_bytes(&line);
         chunk_lines.push(line);
         let candidate = diff_hunk_from_lines(chunk_old_start, chunk_new_start, &chunk_lines);
-        if chunk_lines.len() > 1 && format_diff_hunk(&candidate).len() > max_chunk_diff_bytes {
+        let candidate_diff = format_diff_hunk(&candidate);
+        if chunk_lines.len() == 1 && candidate_diff.len() > max_chunk_diff_bytes {
+            let oversized_line = chunk_lines
+                .pop()
+                .expect("candidate contains an oversized line");
+            items.push(non_reviewable_work_item(
+                change,
+                "single_diff_line_too_large",
+            ));
+            chunk_old_start =
+                chunk_old_start.saturating_add(if oversized_line.kind != DiffLineKind::Added {
+                    1
+                } else {
+                    0
+                });
+            chunk_new_start =
+                chunk_new_start.saturating_add(if oversized_line.kind != DiffLineKind::Removed {
+                    1
+                } else {
+                    0
+                });
+            chunk_source_bytes = 0;
+            continue;
+        }
+        if chunk_lines.len() > 1 && candidate_diff.len() > max_chunk_diff_bytes {
             let overflow_line = chunk_lines
                 .pop()
                 .expect("candidate contains an overflow line");
@@ -1820,6 +1861,25 @@ fn review_work_item_from_diff(
         },
         chunk_diff_bytes,
         payload_diff_bytes,
+        reviewable: true,
+        incomplete_reason: None,
+    }
+}
+
+fn non_reviewable_work_item(change: &GitLabChange, reason: &'static str) -> ReviewWorkItem {
+    ReviewWorkItem {
+        change: GitLabChange {
+            old_path: change.old_path.clone(),
+            new_path: change.new_path.clone(),
+            new_file: change.new_file,
+            renamed_file: change.renamed_file,
+            deleted_file: change.deleted_file,
+            diff: String::new(),
+        },
+        chunk_diff_bytes: 0,
+        payload_diff_bytes: 0,
+        reviewable: false,
+        incomplete_reason: Some(reason),
     }
 }
 
@@ -2479,9 +2539,9 @@ mod tests {
         assert_eq!(plan.coverage.required_batches, 3);
         assert_eq!(plan.coverage.planned_batches, 3);
         assert_eq!(plan.batches.len(), 3);
-        assert!(plan.batches[0][0].diff.contains("+new1"));
-        assert!(plan.batches[1][0].diff.contains("+new2"));
-        assert!(plan.batches[2][0].diff.contains("+new3"));
+        assert!(plan.batches[0][0].change.diff.contains("+new1"));
+        assert!(plan.batches[1][0].change.diff.contains("+new2"));
+        assert!(plan.batches[2][0].change.diff.contains("+new3"));
         assert_eq!(plan.coverage.reviewed_diff_bytes, change.diff.len());
         assert_eq!(plan.coverage.fully_reviewed_files, 1);
         assert!(plan.incomplete_files.is_empty());
@@ -2506,9 +2566,14 @@ mod tests {
         assert!(plan.batches.len() > 1);
         let mut parsed_added_lines = Vec::new();
         for chunk in plan.batches.iter().flatten() {
-            assert!(chunk.diff.starts_with("@@ "));
-            assert!(chunk.diff.len() <= 55);
-            let parsed = parse_unified_diff(&chunk.old_path, &chunk.new_path, &chunk.diff).unwrap();
+            assert!(chunk.change.diff.starts_with("@@ "));
+            assert!(chunk.change.diff.len() <= 55);
+            let parsed = parse_unified_diff(
+                &chunk.change.old_path,
+                &chunk.change.new_path,
+                &chunk.change.diff,
+            )
+            .unwrap();
             assert_eq!(parsed.hunks.len(), 1);
             parsed_added_lines.extend(
                 parsed.hunks[0]
@@ -2525,7 +2590,7 @@ mod tests {
             .batches
             .iter()
             .flatten()
-            .find(|chunk| chunk.diff.contains("+line_119"))
+            .find(|chunk| chunk.change.diff.contains("+line_119"))
             .unwrap();
         let findings = vec![crate::rules::Finding {
             rule_id: "ai:ai-review".into(),
@@ -2536,8 +2601,76 @@ mod tests {
             message: "The finding belongs to the oversized hunk's last chunk.".into(),
         }];
         let filtered =
-            filter_findings_to_added_lines(std::slice::from_ref(last_chunk), findings).unwrap();
+            filter_findings_to_added_lines(std::slice::from_ref(&last_chunk.change), findings)
+                .unwrap();
         assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn batch_plan_marks_oversized_single_diff_line_incomplete_without_prompting_it() {
+        let oversized_line = format!("+{}\n", "x".repeat(200));
+        let change = GitLabChange {
+            old_path: "src/generated.js".into(),
+            new_path: "src/generated.js".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: format!("@@ -1,0 +1,1 @@\n{oversized_line}"),
+        };
+
+        let plan = plan_ai_review_batches(std::slice::from_ref(&change), 40, 0);
+
+        assert_eq!(plan.coverage.total_files, 1);
+        assert_eq!(plan.coverage.unreviewed_files, 1);
+        assert_eq!(plan.coverage.reviewed_diff_bytes, 0);
+        assert!(!plan.coverage.complete);
+        assert!(plan.batches.is_empty());
+        assert_eq!(plan.incomplete_files.len(), 1);
+        assert_eq!(plan.incomplete_files[0].path, "src/generated.js");
+        assert_eq!(
+            plan.incomplete_files[0].reason,
+            "single_diff_line_too_large"
+        );
+    }
+
+    #[test]
+    fn failed_later_chunk_does_not_count_synthetic_headers_as_reviewed_bytes() {
+        let added = (100..112)
+            .map(|line| format!("+line_{line}\n"))
+            .collect::<String>();
+        let change = GitLabChange {
+            old_path: "src/large.rs".into(),
+            new_path: "src/large.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: format!("@@ -100,0 +100,12 @@\n{added}"),
+        };
+        let mut plan = plan_ai_review_batches(std::slice::from_ref(&change), 55, 0);
+        assert!(plan.batches.len() > 2);
+        let first_chunk_bytes = plan.batches[0][0].chunk_diff_bytes;
+        let second_chunk_bytes = plan.batches[1][0].chunk_diff_bytes;
+        let first_payload_bytes = plan.batches[0][0].payload_diff_bytes;
+        let second_payload_bytes = plan.batches[1][0].payload_diff_bytes;
+        assert!(
+            first_payload_bytes + second_payload_bytes > first_chunk_bytes + second_chunk_bytes
+        );
+        plan.coverage.completed_batches = 2;
+
+        apply_batch_failure_coverage(&mut plan, std::slice::from_ref(&change), 2, 55);
+
+        assert_eq!(plan.coverage.completed_batches, 2);
+        assert_eq!(
+            plan.coverage.reviewed_diff_bytes,
+            first_chunk_bytes + second_chunk_bytes
+        );
+        assert_eq!(plan.coverage.partially_reviewed_files, 1);
+        assert_eq!(plan.coverage.fully_reviewed_files, 0);
+        assert!(plan.incomplete_files.iter().any(|file| {
+            file.path == "src/large.rs"
+                && file.reason == "batch_execution_failed"
+                && file.reviewed_diff_bytes == first_chunk_bytes + second_chunk_bytes
+        }));
     }
 
     #[test]

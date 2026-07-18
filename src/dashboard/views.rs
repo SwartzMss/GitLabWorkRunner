@@ -224,6 +224,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     const coverageReason = (reason) => ({
       max_batches_reached: "达到批次上限",
       single_file_diff_truncated: "单文件 Diff 超过批次限制",
+      single_diff_line_too_large: "单行 Diff 超过批次限制",
       batch_execution_failed: "批次执行失败",
       gitlab_diff_unavailable: "GitLab 未提供 Diff 内容",
       gitlab_diff_collapsed: "GitLab 已折叠 Diff",
