@@ -1739,22 +1739,13 @@ fn split_hunk_into_review_work_items(
             let oversized_line = chunk_lines
                 .pop()
                 .expect("candidate contains an oversized line");
-            items.push(non_reviewable_work_item(
+            push_oversized_diff_line_item(
                 change,
-                "single_diff_line_too_large",
-            ));
-            chunk_old_start =
-                chunk_old_start.saturating_add(if oversized_line.kind != DiffLineKind::Added {
-                    1
-                } else {
-                    0
-                });
-            chunk_new_start =
-                chunk_new_start.saturating_add(if oversized_line.kind != DiffLineKind::Removed {
-                    1
-                } else {
-                    0
-                });
+                &mut items,
+                oversized_line,
+                &mut chunk_old_start,
+                &mut chunk_new_start,
+            );
             chunk_source_bytes = 0;
             continue;
         }
@@ -1771,8 +1762,23 @@ fn split_hunk_into_review_work_items(
                 chunk_source_bytes,
             ));
             chunk_lines.clear();
-            chunk_lines.push(overflow_line);
             chunk_source_bytes = 0;
+            let single_line_hunk = diff_hunk_from_lines(
+                chunk_old_start,
+                chunk_new_start,
+                std::slice::from_ref(&overflow_line),
+            );
+            if format_diff_hunk(&single_line_hunk).len() > max_chunk_diff_bytes {
+                push_oversized_diff_line_item(
+                    change,
+                    &mut items,
+                    overflow_line,
+                    &mut chunk_old_start,
+                    &mut chunk_new_start,
+                );
+                continue;
+            }
+            chunk_lines.push(overflow_line);
         }
         chunk_source_bytes = chunk_source_bytes.saturating_add(line_source_bytes);
     }
@@ -1808,6 +1814,31 @@ fn diff_hunk_from_lines(old_start: u32, new_start: u32, lines: &[DiffLine]) -> D
 
 fn formatted_diff_line_bytes(line: &DiffLine) -> usize {
     1 + line.content.len() + 1
+}
+
+fn push_oversized_diff_line_item(
+    change: &GitLabChange,
+    items: &mut Vec<ReviewWorkItem>,
+    oversized_line: DiffLine,
+    chunk_old_start: &mut u32,
+    chunk_new_start: &mut u32,
+) {
+    items.push(non_reviewable_work_item(
+        change,
+        "single_diff_line_too_large",
+    ));
+    *chunk_old_start =
+        chunk_old_start.saturating_add(if oversized_line.kind != DiffLineKind::Added {
+            1
+        } else {
+            0
+        });
+    *chunk_new_start =
+        chunk_new_start.saturating_add(if oversized_line.kind != DiffLineKind::Removed {
+            1
+        } else {
+            0
+        });
 }
 
 fn batch_prompt_payload_limit(changes: &[GitLabChange]) -> usize {
@@ -2627,6 +2658,40 @@ mod tests {
         assert!(plan.batches.is_empty());
         assert_eq!(plan.incomplete_files.len(), 1);
         assert_eq!(plan.incomplete_files[0].path, "src/generated.js");
+        assert_eq!(
+            plan.incomplete_files[0].reason,
+            "single_diff_line_too_large"
+        );
+    }
+
+    #[test]
+    fn oversized_diff_line_after_normal_line_is_not_prompted() {
+        let oversized_line = format!("+{}\n", "x".repeat(200));
+        let change = GitLabChange {
+            old_path: "src/generated.js".into(),
+            new_path: "src/generated.js".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: format!("@@ -10,1 +10,2 @@\n context\n{oversized_line}"),
+        };
+        let limit = 40;
+
+        let plan = plan_ai_review_batches(std::slice::from_ref(&change), limit, 0);
+
+        assert!(!plan.batches.is_empty());
+        assert!(plan
+            .batches
+            .iter()
+            .flatten()
+            .all(|item| item.payload_diff_bytes <= limit));
+        assert!(plan
+            .batches
+            .iter()
+            .flatten()
+            .all(|item| !item.change.diff.contains(&oversized_line)));
+        assert_eq!(plan.coverage.partially_reviewed_files, 1);
+        assert_eq!(plan.incomplete_files.len(), 1);
         assert_eq!(
             plan.incomplete_files[0].reason,
             "single_diff_line_too_large"
