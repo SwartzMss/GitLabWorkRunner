@@ -27,10 +27,13 @@ Webhook 页面里的 `Secret token` 只用于校验收到的请求是否来自 G
 当前服务会用这个 token 调用：
 
 ```text
-GET /projects/:id/merge_requests/:merge_request_iid/changes
+GET /projects/:id/merge_requests/:merge_request_iid
+GET /projects/:id/merge_requests/:merge_request_iid/diffs?page=:page&per_page=100
 GET /projects/:id/repository/archive.zip
 POST /projects/:id/merge_requests/:merge_request_iid/discussions
 ```
+
+服务会完整读取 `/diffs` 的分页，并记录 `collapsed`、`too_large`、`generated_file` 状态。无法取得完整 diff 时，Dashboard 会显示不完整覆盖率。只有旧 GitLab 不支持 `/diffs` 时才兼容回退到已弃用的 `/changes`，并检查其 `overflow` 标志。
 
 因此 token 需要能读取 MR diff、读取仓库 archive，并发布 MR discussion。
 

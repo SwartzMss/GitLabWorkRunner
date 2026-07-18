@@ -21,6 +21,10 @@ pub struct GitLabClient {
 pub struct MergeRequestChanges {
     pub changes: Vec<GitLabChange>,
     pub diff_refs: DiffRefs,
+    #[serde(default)]
+    pub overflow: bool,
+    #[serde(default)]
+    pub diff_metadata: Vec<GitLabDiffMetadata>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -31,6 +35,69 @@ pub struct GitLabChange {
     pub renamed_file: bool,
     pub deleted_file: bool,
     pub diff: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct GitLabDiffMetadata {
+    pub old_path: String,
+    pub new_path: String,
+    #[serde(default)]
+    pub collapsed: bool,
+    #[serde(default)]
+    pub too_large: bool,
+    #[serde(default)]
+    pub generated_file: bool,
+}
+
+#[derive(Deserialize)]
+struct GitLabDiffResponse {
+    old_path: String,
+    new_path: String,
+    new_file: bool,
+    renamed_file: bool,
+    deleted_file: bool,
+    #[serde(default)]
+    diff: String,
+    #[serde(default)]
+    collapsed: bool,
+    #[serde(default)]
+    too_large: bool,
+    #[serde(default)]
+    generated_file: bool,
+}
+
+impl GitLabDiffResponse {
+    fn into_change_and_metadata(self) -> (GitLabChange, GitLabDiffMetadata) {
+        let metadata = GitLabDiffMetadata {
+            old_path: self.old_path.clone(),
+            new_path: self.new_path.clone(),
+            collapsed: self.collapsed,
+            too_large: self.too_large,
+            generated_file: self.generated_file,
+        };
+        let change = GitLabChange {
+            old_path: self.old_path,
+            new_path: self.new_path,
+            new_file: self.new_file,
+            renamed_file: self.renamed_file,
+            deleted_file: self.deleted_file,
+            diff: self.diff,
+        };
+        (change, metadata)
+    }
+}
+
+#[derive(Deserialize)]
+struct LegacyMergeRequestChanges {
+    changes: Vec<GitLabDiffResponse>,
+    diff_refs: DiffRefs,
+    #[serde(default)]
+    overflow: bool,
+}
+
+#[derive(Deserialize)]
+struct MergeRequestMetadataResponse {
+    diff_refs: DiffRefs,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -133,15 +200,127 @@ impl GitLabClient {
         project_id: i64,
         mr_iid: i64,
     ) -> AppResult<MergeRequestChanges> {
+        match self.merge_request_diffs(project_id, mr_iid).await {
+            Ok(changes) => Ok(changes),
+            Err(err) if err.to_string().contains("HTTP status 404") => {
+                warn!(
+                    project_id,
+                    mr_iid,
+                    error = %err,
+                    "merge request diffs API is unavailable; falling back to deprecated changes API"
+                );
+                let limited = self
+                    .legacy_merge_request_changes(project_id, mr_iid, false)
+                    .await?;
+                if !limited.overflow {
+                    return Ok(limited);
+                }
+                warn!(
+                    project_id,
+                    mr_iid,
+                    "deprecated changes API reported overflow; retrying with access_raw_diffs"
+                );
+                match self
+                    .legacy_merge_request_changes(project_id, mr_iid, true)
+                    .await
+                {
+                    Ok(raw) => Ok(raw),
+                    Err(raw_error) => {
+                        warn!(
+                            project_id,
+                            mr_iid,
+                            error = %raw_error,
+                            "raw merge request diff fallback failed; preserving incomplete limited response"
+                        );
+                        Ok(limited)
+                    }
+                }
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn merge_request_diffs(
+        &self,
+        project_id: i64,
+        mr_iid: i64,
+    ) -> AppResult<MergeRequestChanges> {
+        let metadata_url = format!(
+            "{}/api/v4/projects/{}/merge_requests/{}",
+            self.base_url, project_id, mr_iid
+        );
+        let (_, metadata_body, _) = self
+            .get_api_text(metadata_url, "fetch merge request metadata from gitlab")
+            .await?;
+        let metadata: MergeRequestMetadataResponse = serde_json::from_str(&metadata_body)?;
+
+        let mut page = 1_usize;
+        let mut changes = Vec::new();
+        let mut diff_metadata = Vec::new();
+        loop {
+            let url = format!(
+                "{}/api/v4/projects/{}/merge_requests/{}/diffs?per_page=100&page={}",
+                self.base_url, project_id, mr_iid, page
+            );
+            let (_, body, next_page) = self
+                .get_api_text(url, "fetch merge request diffs from gitlab")
+                .await?;
+            let page_diffs: Vec<GitLabDiffResponse> = serde_json::from_str(&body)?;
+            let page_len = page_diffs.len();
+            for diff in page_diffs {
+                let (change, metadata) = diff.into_change_and_metadata();
+                changes.push(change);
+                diff_metadata.push(metadata);
+            }
+            match next_page.and_then(|value| value.parse::<usize>().ok()) {
+                Some(next) if next > page => page = next,
+                _ if page_len == 100 => page += 1,
+                _ => break,
+            }
+        }
+
+        info!(
+            project_id,
+            mr_iid,
+            changed_files = changes.len(),
+            incomplete_files = diff_metadata
+                .iter()
+                .filter(|metadata| metadata.collapsed || metadata.too_large)
+                .count(),
+            generated_files = diff_metadata
+                .iter()
+                .filter(|metadata| metadata.generated_file)
+                .count(),
+            "merge request diffs fetched from gitlab"
+        );
+        Ok(MergeRequestChanges {
+            changes,
+            diff_refs: metadata.diff_refs,
+            overflow: false,
+            diff_metadata,
+        })
+    }
+
+    async fn legacy_merge_request_changes(
+        &self,
+        project_id: i64,
+        mr_iid: i64,
+        access_raw_diffs: bool,
+    ) -> AppResult<MergeRequestChanges> {
         info!(
             project_id,
             mr_iid,
             gitlab_base_url = %self.base_url,
             "preparing to fetch merge request changes from gitlab"
         );
+        let raw_query = if access_raw_diffs {
+            "?access_raw_diffs=true"
+        } else {
+            ""
+        };
         let url = format!(
-            "{}/api/v4/projects/{}/merge_requests/{}/changes",
-            self.base_url, project_id, mr_iid
+            "{}/api/v4/projects/{}/merge_requests/{}/changes{}",
+            self.base_url, project_id, mr_iid, raw_query
         );
         info!(
             project_id,
@@ -176,12 +355,12 @@ impl GitLabClient {
                     )?;
                     let status = response.status();
                     let body = read_ureq_text(response)?;
-                    let changes = serde_json::from_str(&body)?;
+                    let changes: LegacyMergeRequestChanges = serde_json::from_str(&body)?;
                     Ok((status, changes))
                 },
             )
             .await?;
-        let (status, changes): (u16, MergeRequestChanges) = response;
+        let (status, changes): (u16, LegacyMergeRequestChanges) = response;
         info!(
             project_id,
             mr_iid,
@@ -193,13 +372,26 @@ impl GitLabClient {
             project_id,
             mr_iid,
             changed_files = changes.changes.len(),
+            overflow = changes.overflow,
             diff_refs_complete = changes.diff_refs.is_complete(),
             base_sha = ?changes.diff_refs.base_sha,
             start_sha = ?changes.diff_refs.start_sha,
             head_sha = ?changes.diff_refs.head_sha,
             "merge request changes fetched from gitlab"
         );
-        Ok(changes)
+        let mut parsed_changes = Vec::with_capacity(changes.changes.len());
+        let mut diff_metadata = Vec::with_capacity(changes.changes.len());
+        for diff in changes.changes {
+            let (change, metadata) = diff.into_change_and_metadata();
+            parsed_changes.push(change);
+            diff_metadata.push(metadata);
+        }
+        Ok(MergeRequestChanges {
+            changes: parsed_changes,
+            diff_refs: changes.diff_refs,
+            overflow: changes.overflow,
+            diff_metadata,
+        })
     }
 
     pub async fn repository_archive(
@@ -480,6 +672,42 @@ impl GitLabClient {
         Ok(())
     }
 
+    async fn get_api_text(
+        &self,
+        url: String,
+        operation: &'static str,
+    ) -> AppResult<(u16, String, Option<String>)> {
+        let http = self.http.clone();
+        let token = self.token.clone();
+        let timeout = self.api_timeout;
+        self.with_timeout_guard(
+            operation,
+            timeout,
+            ReviewErrorCode::GitLabApiTimeout,
+            ReviewErrorCode::GitLabApiFailed,
+            move || {
+                let response = http
+                    .get(&url)
+                    .timeout(timeout)
+                    .set("PRIVATE-TOKEN", &token)
+                    .call();
+                let response = ensure_gitlab_success_response(
+                    response_from_ureq_result(
+                        response,
+                        ReviewErrorCode::GitLabApiTimeout,
+                        ReviewErrorCode::GitLabApiFailed,
+                    )?,
+                    operation,
+                )?;
+                let status = response.status();
+                let next_page = response.header("X-Next-Page").map(str::to_owned);
+                let body = read_ureq_text(response)?;
+                Ok((status, body, next_page))
+            },
+        )
+        .await
+    }
+
     async fn with_timeout_guard<T, F>(
         &self,
         operation: &'static str,
@@ -641,8 +869,9 @@ fn preview_log_text(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{routing::get, Json, Router};
+    use axum::{extract::Query, routing::get, Json, Router};
     use serde_json::json;
+    use std::collections::HashMap;
     use tokio::{
         io::AsyncReadExt,
         net::TcpListener,
@@ -688,6 +917,102 @@ mod tests {
 
         assert_eq!(changes.changes.len(), 1);
         assert_eq!(changes.diff_refs.head_sha.as_deref(), Some("head"));
+    }
+
+    #[tokio::test]
+    async fn legacy_overflow_retries_with_raw_diffs() {
+        let app = Router::new().route(
+            "/api/v4/projects/1/merge_requests/2/changes",
+            get(|Query(query): Query<HashMap<String, String>>| async move {
+                let raw = query.get("access_raw_diffs").map(String::as_str) == Some("true");
+                Json(json!({
+                    "changes": [{
+                        "old_path": "src/lib.rs",
+                        "new_path": "src/lib.rs",
+                        "new_file": false,
+                        "renamed_file": false,
+                        "deleted_file": false,
+                        "diff": if raw { "@@ -1 +1 @@\n-old\n+new\n" } else { "" }
+                    }],
+                    "diff_refs": {
+                        "base_sha": "base",
+                        "start_sha": "start",
+                        "head_sha": "head"
+                    },
+                    "overflow": !raw
+                }))
+            }),
+        );
+        let base_url = spawn_server(app).await;
+
+        let client = GitLabClient::new(base_url, "token".into());
+        let changes = client.merge_request_changes(1, 2).await.unwrap();
+
+        assert!(!changes.overflow);
+        assert!(changes.changes[0].diff.contains("+new"));
+    }
+
+    #[tokio::test]
+    async fn fetches_paginated_merge_request_diffs_and_preserves_status() {
+        let app = Router::new()
+            .route(
+                "/api/v4/projects/1/merge_requests/2",
+                get(|| async {
+                    Json(json!({
+                        "diff_refs": {
+                            "base_sha": "base",
+                            "start_sha": "start",
+                            "head_sha": "head"
+                        }
+                    }))
+                }),
+            )
+            .route(
+                "/api/v4/projects/1/merge_requests/2/diffs",
+                get(|Query(query): Query<HashMap<String, String>>| async move {
+                    if query.get("page").map(String::as_str) == Some("1") {
+                        (
+                            [("x-next-page", "2")],
+                            Json(json!([{
+                                "old_path": "src/first.rs",
+                                "new_path": "src/first.rs",
+                                "new_file": false,
+                                "renamed_file": false,
+                                "deleted_file": false,
+                                "diff": "@@ -1 +1 @@\n-old\n+new\n",
+                                "collapsed": false,
+                                "too_large": false,
+                                "generated_file": false
+                            }])),
+                        )
+                    } else {
+                        (
+                            [("x-next-page", "")],
+                            Json(json!([{
+                                "old_path": "src/large.rs",
+                                "new_path": "src/large.rs",
+                                "new_file": false,
+                                "renamed_file": false,
+                                "deleted_file": false,
+                                "diff": "",
+                                "collapsed": true,
+                                "too_large": false,
+                                "generated_file": true
+                            }])),
+                        )
+                    }
+                }),
+            );
+        let base_url = spawn_server(app).await;
+
+        let client = GitLabClient::new(base_url, "token".into());
+        let changes = client.merge_request_changes(1, 2).await.unwrap();
+
+        assert_eq!(changes.changes.len(), 2);
+        assert_eq!(changes.diff_metadata.len(), 2);
+        assert!(changes.diff_metadata[1].collapsed);
+        assert!(changes.diff_metadata[1].generated_file);
+        assert!(!changes.overflow);
     }
 
     #[tokio::test]
