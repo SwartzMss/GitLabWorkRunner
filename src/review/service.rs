@@ -32,6 +32,59 @@ struct AiReviewExecutionWithMetadata {
     metadata: AiReviewExecutionMetadata,
 }
 
+fn apply_gitlab_diff_incompleteness(
+    execution: &mut AiReviewExecution,
+    changes: &crate::gitlab::MergeRequestChanges,
+) {
+    for metadata in changes
+        .diff_metadata
+        .iter()
+        .filter(|metadata| metadata.collapsed || metadata.too_large)
+    {
+        let reason = if metadata.too_large {
+            "gitlab_diff_too_large"
+        } else {
+            "gitlab_diff_collapsed"
+        };
+        if let Some(file) = execution
+            .incomplete_files
+            .iter_mut()
+            .find(|file| file.path == metadata.new_path)
+        {
+            file.reason = reason;
+        } else {
+            execution.incomplete_files.push(ReviewCoverageFile {
+                path: metadata.new_path.clone(),
+                status: "unreviewed",
+                reason,
+                total_diff_bytes: 0,
+                reviewed_diff_bytes: 0,
+            });
+            if let Some(coverage) = execution.coverage.as_mut() {
+                coverage.total_files += 1;
+                coverage.unreviewed_files += 1;
+            }
+        }
+        if let Some(coverage) = execution.coverage.as_mut() {
+            coverage.complete = false;
+        }
+    }
+    if changes.overflow {
+        execution.incomplete_files.push(ReviewCoverageFile {
+            path: "(merge request diff)".into(),
+            status: "unreviewed",
+            reason: "gitlab_diff_overflow",
+            total_diff_bytes: 0,
+            reviewed_diff_bytes: 0,
+        });
+        if let Some(coverage) = execution.coverage.as_mut() {
+            coverage.total_files += 1;
+            coverage.unreviewed_files += 1;
+            coverage.complete = false;
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum AiReviewContextPass {
     Initial,
@@ -402,9 +455,10 @@ impl ReviewService {
             );
             self.update_ai_task_progress(&review, "started", "AI Review 已开始", None, None, None)
                 .await;
-            let execution_with_metadata = self
+            let mut execution_with_metadata = self
                 .run_ai_review_with_timeout_fallback(&review, changes, event, review_request)
                 .await;
+            apply_gitlab_diff_incompleteness(&mut execution_with_metadata.execution, changes);
             let execution = execution_with_metadata.execution;
             let metadata = execution_with_metadata.metadata;
             let coverage = execution.coverage;
@@ -1648,6 +1702,8 @@ mod tests {
             target_branch: String::new(),
         };
         let changes = crate::gitlab::MergeRequestChanges {
+            overflow: false,
+            diff_metadata: Vec::new(),
             changes: Vec::new(),
             diff_refs: crate::gitlab::DiffRefs {
                 base_sha: Some("base".into()),
@@ -1806,6 +1862,8 @@ mod tests {
             target_branch: String::new(),
         };
         let changes = crate::gitlab::MergeRequestChanges {
+            overflow: false,
+            diff_metadata: Vec::new(),
             changes: Vec::new(),
             diff_refs: crate::gitlab::DiffRefs {
                 base_sha: Some("base".into()),
@@ -1945,6 +2003,8 @@ mod tests {
             target_branch: String::new(),
         };
         let changes = crate::gitlab::MergeRequestChanges {
+            overflow: false,
+            diff_metadata: Vec::new(),
             changes: vec![
                 GitLabChange {
                     old_path: "first.rs".into(),
@@ -2165,6 +2225,8 @@ mod tests {
             target_branch: String::new(),
         };
         let changes = crate::gitlab::MergeRequestChanges {
+            overflow: false,
+            diff_metadata: Vec::new(),
             changes: vec![GitLabChange {
                 old_path: "src/lib.rs".into(),
                 new_path: "src/lib.rs".into(),
@@ -2240,6 +2302,8 @@ mod tests {
             target_branch: String::new(),
         };
         let changes = crate::gitlab::MergeRequestChanges {
+            overflow: false,
+            diff_metadata: Vec::new(),
             changes: vec![GitLabChange {
                 old_path: "src/lib.rs".into(),
                 new_path: "src/lib.rs".into(),
@@ -2279,6 +2343,45 @@ mod tests {
     }
 
     #[test]
+    fn gitlab_diff_limits_force_incomplete_coverage() {
+        let mut execution = scripted_execution(Ok(Vec::new()), 1);
+        execution.coverage.as_mut().unwrap().complete = true;
+        execution.incomplete_files.clear();
+        let changes = crate::gitlab::MergeRequestChanges {
+            changes: vec![GitLabChange {
+                old_path: "src/large.rs".into(),
+                new_path: "src/large.rs".into(),
+                new_file: false,
+                renamed_file: false,
+                deleted_file: false,
+                diff: String::new(),
+            }],
+            diff_refs: crate::gitlab::DiffRefs {
+                base_sha: Some("base".into()),
+                start_sha: Some("start".into()),
+                head_sha: Some("head".into()),
+            },
+            overflow: false,
+            diff_metadata: vec![crate::gitlab::GitLabDiffMetadata {
+                old_path: "src/large.rs".into(),
+                new_path: "src/large.rs".into(),
+                collapsed: false,
+                too_large: true,
+                generated_file: false,
+            }],
+        };
+
+        apply_gitlab_diff_incompleteness(&mut execution, &changes);
+
+        assert!(!execution.coverage.unwrap().complete);
+        assert_eq!(execution.incomplete_files.len(), 1);
+        assert_eq!(
+            execution.incomplete_files[0].reason,
+            "gitlab_diff_too_large"
+        );
+    }
+
+    #[test]
     fn manual_review_summary_formats_elapsed_as_minutes_and_seconds() {
         let event = MergeRequestEvent {
             project_id: 1,
@@ -2291,6 +2394,8 @@ mod tests {
             target_branch: String::new(),
         };
         let changes = crate::gitlab::MergeRequestChanges {
+            overflow: false,
+            diff_metadata: Vec::new(),
             changes: vec![GitLabChange {
                 old_path: "src/lib.rs".into(),
                 new_path: "src/lib.rs".into(),
@@ -2332,6 +2437,8 @@ mod tests {
             target_branch: String::new(),
         };
         let changes = crate::gitlab::MergeRequestChanges {
+            overflow: false,
+            diff_metadata: Vec::new(),
             changes: Vec::new(),
             diff_refs: crate::gitlab::DiffRefs {
                 base_sha: None,
@@ -2368,6 +2475,8 @@ mod tests {
     #[test]
     fn discussion_position_uses_rename_old_and_new_paths() {
         let changes = crate::gitlab::MergeRequestChanges {
+            overflow: false,
+            diff_metadata: Vec::new(),
             changes: vec![GitLabChange {
                 old_path: "src/old.rs".into(),
                 new_path: "src/new.rs".into(),

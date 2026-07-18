@@ -99,10 +99,13 @@ The guard is process-local. Multi-instance deployments need a shared lock in SQL
 Required GitLab REST API calls:
 
 ```text
-GET /projects/:id/merge_requests/:merge_request_iid/changes
+GET /projects/:id/merge_requests/:merge_request_iid
+GET /projects/:id/merge_requests/:merge_request_iid/diffs?page=:page&per_page=100
 GET /projects/:id/repository/archive.zip
 POST /projects/:id/merge_requests/:merge_request_iid/discussions
 ```
+
+Diff pages are fetched until pagination is complete. File-level `collapsed`, `too_large`, and `generated_file` metadata is preserved; unavailable diffs make review coverage incomplete. The deprecated `/changes` endpoint is used only as a compatibility fallback when `/diffs` is unavailable, and its `overflow` flag is also treated as incomplete coverage.
 
 The service uses `[gitlab].token`, not the webhook secret, for API calls. The token needs `api` scope and permission to read MR diffs, download repository archives, and publish MR discussions.
 
