@@ -3265,6 +3265,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stops_after_one_malformed_findings_retry() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let request_count_for_server = Arc::clone(&request_count);
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request_count = Arc::clone(&request_count_for_server);
+                tokio::spawn(async move {
+                    request_count.fetch_add(1, Ordering::SeqCst);
+                    let _request = read_http_json_request(&mut stream).await;
+                    let body = r#"{"choices":[{"finish_reason":"length","message":{"tool_calls":[{"id":"submit_bad","type":"function","function":{"name":"submit_review_findings","arguments":"{\"findings\":["}}]}}]}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    stream.write_all(body.as_bytes()).await.unwrap();
+                });
+            }
+        });
+
+        let config = AiReviewConfig {
+            base_url: format!("http://{addr}"),
+            ..test_ai_review_config()
+        };
+        let changes = vec![GitLabChange {
+            old_path: "src/lib.rs".into(),
+            new_path: "src/lib.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "@@ -1,0 +1,1 @@\n+panic!();\n".into(),
+        }];
+
+        let execution = run_ai_review_execution_with_context(&config, &changes, None, None).await;
+
+        assert_eq!(
+            execution
+                .result
+                .unwrap_err()
+                .review_failure()
+                .map(|failure| failure.code),
+            Some(ReviewErrorCode::AiResponseParseFailed)
+        );
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn retries_malformed_json_content_in_json_mode() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let json_retry_count = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let request_count_for_server = Arc::clone(&request_count);
+        let json_retry_count_for_server = Arc::clone(&json_retry_count);
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request_count = Arc::clone(&request_count_for_server);
+                let json_retry_count = Arc::clone(&json_retry_count_for_server);
+                tokio::spawn(async move {
+                    let request_index = request_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    let request = read_http_json_request(&mut stream).await;
+                    let (status, body) = match request_index {
+                        1 => ("400 Bad Request", r#"{"error":"tools unsupported"}"#),
+                        2 => (
+                            "200 OK",
+                            r#"{"choices":[{"finish_reason":"length","message":{"content":"{\"findings\":["}}]}"#,
+                        ),
+                        3 => {
+                            assert_eq!(request["response_format"]["type"], "json_object");
+                            assert!(request.get("tools").is_none());
+                            assert!(request["messages"].as_array().unwrap().iter().any(
+                                |message| {
+                                    message["content"].as_str().is_some_and(|content| {
+                                        content.contains("JSON") && content.contains("完整")
+                                    })
+                                }
+                            ));
+                            json_retry_count.fetch_add(1, Ordering::SeqCst);
+                            (
+                                "200 OK",
+                                r#"{"choices":[{"finish_reason":"stop","message":{"content":"{\"findings\":[]}"}}]}"#,
+                            )
+                        }
+                        other => panic!("unexpected request {other}"),
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    stream.write_all(body.as_bytes()).await.unwrap();
+                });
+            }
+        });
+
+        let config = AiReviewConfig {
+            base_url: format!("http://{addr}"),
+            ..test_ai_review_config()
+        };
+        let changes = vec![GitLabChange {
+            old_path: "src/lib.rs".into(),
+            new_path: "src/lib.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "@@ -1,0 +1,1 @@\n+panic!();\n".into(),
+        }];
+
+        let findings = run_ai_review_execution_with_context(&config, &changes, None, None)
+            .await
+            .result
+            .unwrap();
+
+        assert!(findings.is_empty());
+        assert_eq!(request_count.load(Ordering::SeqCst), 3);
+        assert_eq!(json_retry_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn returns_tool_limit_result_before_requiring_final_findings() {
         let request_count = Arc::new(AtomicUsize::new(0));
         let tool_message_count = Arc::new(AtomicUsize::new(0));
