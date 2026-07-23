@@ -420,7 +420,7 @@ async fn run_ai_review_single(
                             continue 'request_mode;
                         }
                         if attempt < AI_HTTP_ATTEMPTS
-                            && is_retryable_ai_http_response(status, &response_body_preview)
+                            && is_retryable_ai_http_response(status, &body)
                         {
                             let err = AppError::ai_review(
                                 ReviewErrorCode::AiRequestFailed,
@@ -842,6 +842,19 @@ fn is_timeout_ai_http_response(status: u16, body: &str) -> bool {
         || normalized.contains("request timed out")
         || normalized.contains("timed out")
         || normalized.contains("timeout")
+}
+
+fn should_enter_timeout_finalization(status: u16, body: &str) -> bool {
+    if matches!(status, 408 | 504) {
+        return true;
+    }
+    if status != 500 {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("error")?.get("code")?.as_str().map(str::to_owned))
+        .is_some_and(|code| matches!(code.as_str(), "request_timeout" | "RequestTimeout"))
 }
 
 struct AiReviewCompletion<'a> {
@@ -1269,7 +1282,7 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                         if followup_attempt < AI_HTTP_ATTEMPTS
                             && is_retryable_ai_http_response(
                                 current_response.status,
-                                &response_body_preview,
+                                &current_response.body,
                             )
                         {
                             let err = AppError::ai_review(
@@ -1288,9 +1301,9 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                                 error = %err,
                                 "AI review context follow-up request failed, retrying"
                             );
-                            if is_timeout_ai_http_response(
+                            if should_enter_timeout_finalization(
                                 current_response.status,
-                                &response_body_preview,
+                                &current_response.body,
                             ) {
                                 request_timeout_finalization(
                                     messages,
@@ -1458,7 +1471,7 @@ fn request_timeout_finalization(
     use_tool_calls: bool,
     malformed_retry: bool,
 ) {
-    let evidence_summary = compact_tool_evidence(messages, base_message_count);
+    let evidence_summary = compact_or_preserve_tool_evidence(messages, base_message_count);
     messages.truncate(base_message_count);
     if let Some(evidence_summary) = evidence_summary {
         messages.push(ChatMessage {
@@ -1482,6 +1495,20 @@ fn request_timeout_finalization(
         tool_call_id: None,
         tool_calls: None,
     });
+}
+
+fn compact_or_preserve_tool_evidence(
+    messages: &[ChatMessage],
+    base_message_count: usize,
+) -> Option<String> {
+    compact_tool_evidence(messages, base_message_count).or_else(|| {
+        messages
+            .iter()
+            .skip(base_message_count)
+            .filter_map(|message| message.content.as_deref())
+            .find(|content| content.contains("<tool_evidence_summary>"))
+            .map(str::to_owned)
+    })
 }
 
 fn compact_tool_evidence(messages: &[ChatMessage], base_message_count: usize) -> Option<String> {
@@ -2550,18 +2577,29 @@ mod tests {
     }
 
     #[test]
-    fn classifies_timeout_http_responses_for_finalization() {
-        assert!(is_timeout_ai_http_response(408, ""));
-        assert!(is_timeout_ai_http_response(504, ""));
-        assert!(is_timeout_ai_http_response(
+    fn enters_timeout_finalization_only_for_explicit_timeouts() {
+        assert!(should_enter_timeout_finalization(408, ""));
+        assert!(should_enter_timeout_finalization(504, ""));
+        assert!(should_enter_timeout_finalization(
             500,
-            r#"{"error":"request timed out"}"#
+            r#"{"error":{"code":"request_timeout"}}"#
         ));
-        assert!(!is_timeout_ai_http_response(
+        assert!(should_enter_timeout_finalization(
             500,
-            r#"{"error":"internal failure"}"#
+            r#"{"error":{"code":"RequestTimeout"}}"#
         ));
-        assert!(!is_timeout_ai_http_response(503, "temporarily unavailable"));
+        for body in [
+            r#"{"error":"this was not a timeout"}"#,
+            r#"{"error":"upstream timeout configuration is invalid"}"#,
+            r#"{"error":"timeout parameter is unsupported"}"#,
+            r#"{"error":{"code":"internal_error","message":"request timed out"}}"#,
+        ] {
+            assert!(!should_enter_timeout_finalization(500, body));
+        }
+        assert!(!should_enter_timeout_finalization(
+            503,
+            r#"{"error":{"code":"request_timeout"}}"#
+        ));
     }
 
     #[test]
@@ -3634,6 +3672,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_timeout_after_malformed_recovery_preserves_tool_evidence() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let first_timeout_finalized = Arc::new(AtomicUsize::new(0));
+        let evidence_preserved = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let request_count_for_server = Arc::clone(&request_count);
+        let first_timeout_finalized_for_server = Arc::clone(&first_timeout_finalized);
+        let evidence_preserved_for_server = Arc::clone(&evidence_preserved);
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request_count = Arc::clone(&request_count_for_server);
+                let first_timeout_finalized = Arc::clone(&first_timeout_finalized_for_server);
+                let evidence_preserved = Arc::clone(&evidence_preserved_for_server);
+                tokio::spawn(async move {
+                    let request_index = request_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    let request = read_http_json_request(&mut stream).await;
+                    let (status, body) = match request_index {
+                        1 => (
+                            "200 OK",
+                            r#"{"choices":[{"finish_reason":"tool_calls","message":{"tool_calls":[{"id":"read_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"src/lib.rs\"}"}}]}}]}"#
+                                .to_owned(),
+                        ),
+                        2 => (
+                            "500 Internal Server Error",
+                            format!(
+                                "{{\n  \"error\": {{\"message\": \"{}\", \"code\": \"request_timeout\"}}\n}}",
+                                "x".repeat(AI_RESPONSE_PREVIEW_CHARS + 100)
+                            ),
+                        ),
+                        3 => {
+                            let messages = request["messages"].as_array().unwrap();
+                            let has_summary = messages.iter().any(|message| {
+                                message["content"].as_str().is_some_and(|content| {
+                                    content.contains("<tool_evidence_summary>")
+                                })
+                            });
+                            let has_tool_message =
+                                messages.iter().any(|message| message["role"] == "tool");
+                            if has_summary && !has_tool_message {
+                                first_timeout_finalized.fetch_add(1, Ordering::SeqCst);
+                            }
+                            (
+                                "200 OK",
+                                r#"{"choices":[{"finish_reason":"length","message":{"tool_calls":[{"id":"submit_bad","type":"function","function":{"name":"submit_review_findings","arguments":"{\"findings\":["}}]}}]}"#
+                                    .to_owned(),
+                            )
+                        }
+                        4 => (
+                            "408 Request Timeout",
+                            r#"{"error":{"code":"request_timeout"}}"#.to_owned(),
+                        ),
+                        5 => {
+                            let messages = request["messages"].as_array().unwrap();
+                            if messages.iter().any(|message| {
+                                message["content"].as_str().is_some_and(|content| {
+                                    content.contains("<tool_evidence_summary>")
+                                        && content.contains("panic!();")
+                                })
+                            }) {
+                                evidence_preserved.fetch_add(1, Ordering::SeqCst);
+                            }
+                            let tool_names = request["tools"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .filter_map(|tool| tool["function"]["name"].as_str())
+                                .collect::<Vec<_>>();
+                            assert_eq!(tool_names, ["submit_review_findings"]);
+                            (
+                                "200 OK",
+                                r#"{"choices":[{"finish_reason":"tool_calls","message":{"tool_calls":[{"id":"submit_ok","type":"function","function":{"name":"submit_review_findings","arguments":"{\"findings\":[]}"}}]}}]}"#
+                                    .to_owned(),
+                            )
+                        }
+                        other => panic!("unexpected request {other}"),
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    stream.write_all(body.as_bytes()).await.unwrap();
+                });
+            }
+        });
+
+        let source = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(source.path().join("src")).unwrap();
+        std::fs::write(source.path().join("src/lib.rs"), "panic!();\n").unwrap();
+        let config = AiReviewConfig {
+            base_url: format!("http://{addr}"),
+            ..test_ai_review_config()
+        };
+        let changes = vec![GitLabChange {
+            old_path: "src/lib.rs".into(),
+            new_path: "src/lib.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "@@ -1,0 +1,1 @@\n+panic!();\n".into(),
+        }];
+
+        let findings =
+            run_ai_review_execution_with_context(&config, &changes, Some(source.path()), None)
+                .await
+                .result
+                .unwrap();
+
+        assert!(findings.is_empty());
+        assert_eq!(request_count.load(Ordering::SeqCst), 5);
+        assert_eq!(first_timeout_finalized.load(Ordering::SeqCst), 1);
+        assert_eq!(evidence_preserved.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn retries_malformed_json_content_when_tools_are_accepted() {
         let request_count = Arc::new(AtomicUsize::new(0));
         let finalization_only_count = Arc::new(AtomicUsize::new(0));
@@ -4693,6 +4848,61 @@ mod tests {
         );
         assert!(messages.iter().all(|message| message.role != "tool"));
         assert!(messages.iter().all(|message| message.tool_calls.is_none()));
+    }
+
+    #[test]
+    fn timeout_finalization_preserves_existing_evidence_summary() {
+        let mut messages = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: Some("system".into()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("current diff".into()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![OpenAiToolCall {
+                    id: "call_1".into(),
+                    call_type: "function".into(),
+                    function: super::super::ai_schema::OpenAiToolCallFunction {
+                        name: "read_file".into(),
+                        arguments: r#"{"path":"src/lib.rs"}"#.into(),
+                    },
+                }]),
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: Some(r#"{"content":"panic!();"}"#.into()),
+                tool_call_id: Some("call_1".into()),
+                tool_calls: None,
+            },
+        ];
+        let mut requested = false;
+
+        request_timeout_finalization(&mut messages, 2, &mut requested, true, false);
+        request_timeout_finalization(&mut messages, 2, &mut requested, true, true);
+
+        let summaries = messages
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .filter(|content| content.contains("<tool_evidence_summary>"))
+            .collect::<Vec<_>>();
+        assert_eq!(summaries.len(), 1);
+        assert!(summaries[0].contains("panic!();"));
+        assert_eq!(
+            messages
+                .last()
+                .and_then(|message| message.content.as_deref()),
+            Some(MALFORMED_FINALIZATION_INSTRUCTION)
+        );
     }
 
     #[test]
