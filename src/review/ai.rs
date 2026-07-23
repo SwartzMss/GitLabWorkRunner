@@ -886,16 +886,27 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
         let response: OpenAiChatResponse = serde_json::from_str(&body).map_err(|err| {
             AppError::ai_review(ReviewErrorCode::AiResponseParseFailed, err.to_string())
         })?;
-        let message = response
-            .choices
-            .first()
-            .map(|choice| &choice.message)
-            .ok_or_else(|| {
-                AppError::ai_review(
-                    ReviewErrorCode::AiResponseParseFailed,
-                    "AI review API returned no choices",
-                )
-            })?;
+        let choice = response.choices.first().ok_or_else(|| {
+            AppError::ai_review(
+                ReviewErrorCode::AiResponseParseFailed,
+                "AI review API returned no choices",
+            )
+        })?;
+        let message = &choice.message;
+        info!(
+            ai_review_id = %config.id,
+            model = %config.model,
+            attempt,
+            batch_index = batch.map(|(index, _)| index),
+            batch_count = batch.map(|(_, count)| count),
+            finish_reason = ?choice.finish_reason,
+            prompt_tokens = ?response.usage.as_ref().and_then(|usage| usage.prompt_tokens),
+            completion_tokens = ?response.usage.as_ref().and_then(|usage| usage.completion_tokens),
+            total_tokens = ?response.usage.as_ref().and_then(|usage| usage.total_tokens),
+            assistant_output_bytes = assistant_output_bytes(message),
+            assistant_tool_calls = message.tool_calls.len(),
+            "AI review completion metadata received"
+        );
         if has_submit_review_findings(message) || !use_tool_calls {
             if *tool_calls_used > 0 {
                 info!(
@@ -2070,6 +2081,20 @@ fn tool_call_arguments(message: &OpenAiMessage) -> AppResult<&str> {
         })
 }
 
+fn assistant_output_bytes(message: &OpenAiMessage) -> usize {
+    message
+        .content
+        .as_deref()
+        .map_or(0, str::len)
+        .saturating_add(
+            message
+                .tool_calls
+                .iter()
+                .map(|tool_call| tool_call.function.arguments.len())
+                .sum::<usize>(),
+        )
+}
+
 fn parse_severity(value: &str) -> Severity {
     match value.trim().to_ascii_lowercase().as_str() {
         "error" => Severity::Error,
@@ -2351,6 +2376,40 @@ mod tests {
         assert_eq!(findings[0].new_line, Some(12));
         assert_eq!(findings[0].title, "Possible panic");
         assert_eq!(findings[0].message, "Avoid unwrap here.");
+    }
+
+    #[test]
+    fn parses_openai_completion_metadata_when_present() {
+        let response: OpenAiChatResponse = serde_json::from_str(
+            r#"{
+              "choices":[{
+                "finish_reason":"length",
+                "message":{"content":"{\"findings\":[]}"}
+              }],
+              "usage":{
+                "prompt_tokens":120,
+                "completion_tokens":80,
+                "total_tokens":200
+              }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(response.choices[0].finish_reason.as_deref(), Some("length"));
+        let usage = response.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, Some(120));
+        assert_eq!(usage.completion_tokens, Some(80));
+        assert_eq!(usage.total_tokens, Some(200));
+    }
+
+    #[test]
+    fn parses_openai_response_without_completion_metadata() {
+        let response: OpenAiChatResponse =
+            serde_json::from_str(r#"{"choices":[{"message":{"content":"{\"findings\":[]}"}}]}"#)
+                .unwrap();
+
+        assert_eq!(response.choices[0].finish_reason, None);
+        assert!(response.usage.is_none());
     }
 
     #[test]

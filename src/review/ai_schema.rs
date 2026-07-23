@@ -59,11 +59,25 @@ pub(crate) struct ChatMessage {
 #[derive(Deserialize)]
 pub(crate) struct OpenAiChatResponse {
     pub(crate) choices: Vec<OpenAiChoice>,
+    #[serde(default)]
+    pub(crate) usage: Option<OpenAiUsage>,
 }
 
 #[derive(Deserialize)]
 pub(crate) struct OpenAiChoice {
     pub(crate) message: OpenAiMessage,
+    #[serde(default)]
+    pub(crate) finish_reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct OpenAiUsage {
+    #[serde(default)]
+    pub(crate) prompt_tokens: Option<u64>,
+    #[serde(default)]
+    pub(crate) completion_tokens: Option<u64>,
+    #[serde(default)]
+    pub(crate) total_tokens: Option<u64>,
 }
 
 #[derive(Deserialize)]
