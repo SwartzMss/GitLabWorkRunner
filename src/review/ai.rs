@@ -909,7 +909,15 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
             assistant_tool_calls = message.tool_calls.len(),
             "AI review completion metadata received"
         );
-        if has_submit_review_findings(message) || !use_tool_calls {
+        let context_tool_calls: Vec<OpenAiToolCall> = message
+            .tool_calls
+            .iter()
+            .filter(|tool_call| is_context_tool_call(tool_call))
+            .cloned()
+            .collect();
+        let is_final_response =
+            has_submit_review_findings(message) || !use_tool_calls || context_tool_calls.is_empty();
+        if is_final_response {
             if *tool_calls_used > 0 {
                 info!(
                     ai_review_id = %config.id,
@@ -951,15 +959,6 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                 Err(err) => return Err(err),
             }
         } else {
-            let context_tool_calls: Vec<OpenAiToolCall> = message
-                .tool_calls
-                .iter()
-                .filter(|tool_call| is_context_tool_call(tool_call))
-                .cloned()
-                .collect();
-            if context_tool_calls.is_empty() {
-                return parse_openai_message(&config.id, &config.title, message);
-            }
             if finalization_requested {
                 if diff_only_fallback_requested {
                     return Err(AppError::ai_review(
@@ -2009,6 +2008,7 @@ fn parse_openai_response(review_id: &str, title: &str, text: &str) -> AppResult<
     parse_openai_message(review_id, title, message)
 }
 
+#[cfg(test)]
 fn parse_openai_message(
     review_id: &str,
     title: &str,
@@ -3385,6 +3385,80 @@ mod tests {
         assert!(findings.is_empty());
         assert_eq!(request_count.load(Ordering::SeqCst), 3);
         assert_eq!(json_retry_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn retries_malformed_json_content_when_tools_are_accepted() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let finalization_only_count = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let request_count_for_server = Arc::clone(&request_count);
+        let finalization_only_count_for_server = Arc::clone(&finalization_only_count);
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request_count = Arc::clone(&request_count_for_server);
+                let finalization_only_count = Arc::clone(&finalization_only_count_for_server);
+                tokio::spawn(async move {
+                    let request_index = request_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    let request = read_http_json_request(&mut stream).await;
+                    let body = match request_index {
+                        1 => {
+                            assert!(request.get("tools").is_some());
+                            r#"{"choices":[{"finish_reason":"length","message":{"content":"{\"findings\":["}}]}"#
+                        }
+                        2 => {
+                            let tool_names = request["tools"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .filter_map(|tool| tool["function"]["name"].as_str())
+                                .collect::<Vec<_>>();
+                            assert_eq!(tool_names, ["submit_review_findings"]);
+                            assert!(request["messages"].as_array().unwrap().iter().any(
+                                |message| {
+                                    message["content"].as_str().is_some_and(|content| {
+                                        content.contains("JSON") && content.contains("完整")
+                                    })
+                                }
+                            ));
+                            finalization_only_count.fetch_add(1, Ordering::SeqCst);
+                            r#"{"choices":[{"finish_reason":"tool_calls","message":{"tool_calls":[{"id":"submit_ok","type":"function","function":{"name":"submit_review_findings","arguments":"{\"findings\":[]}"}}]}}]}"#
+                        }
+                        other => panic!("unexpected request {other}"),
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    stream.write_all(body.as_bytes()).await.unwrap();
+                });
+            }
+        });
+
+        let config = AiReviewConfig {
+            base_url: format!("http://{addr}"),
+            ..test_ai_review_config()
+        };
+        let changes = vec![GitLabChange {
+            old_path: "src/lib.rs".into(),
+            new_path: "src/lib.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "@@ -1,0 +1,1 @@\n+panic!();\n".into(),
+        }];
+
+        let findings = run_ai_review_execution_with_context(&config, &changes, None, None)
+            .await
+            .result
+            .unwrap();
+
+        assert!(findings.is_empty());
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        assert_eq!(finalization_only_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

@@ -740,7 +740,7 @@ timeout_seconds = 10
     assert_eq!(summary.findings, 0);
     assert_eq!(summary.comments, 1);
     assert!(!summary.skipped);
-    assert_eq!(ai_request_count.load(Ordering::SeqCst), 2);
+    assert_eq!(ai_request_count.load(Ordering::SeqCst), 3);
     assert_eq!(discussion_count.load(Ordering::SeqCst), 1);
 }
 
@@ -2206,7 +2206,7 @@ timeout_seconds = 10
     assert_eq!(summary.findings, 0);
     assert_eq!(summary.comments, 1);
     assert!(!summary.skipped);
-    assert_eq!(ai_request_count.load(Ordering::SeqCst), 2);
+    assert_eq!(ai_request_count.load(Ordering::SeqCst), 3);
     assert_eq!(discussion_count.load(Ordering::SeqCst), 1);
     assert_eq!(emoji_count.load(Ordering::SeqCst), 1);
 }
