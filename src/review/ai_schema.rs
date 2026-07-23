@@ -60,24 +60,14 @@ pub(crate) struct ChatMessage {
 pub(crate) struct OpenAiChatResponse {
     pub(crate) choices: Vec<OpenAiChoice>,
     #[serde(default)]
-    pub(crate) usage: Option<OpenAiUsage>,
+    pub(crate) usage: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
 pub(crate) struct OpenAiChoice {
     pub(crate) message: OpenAiMessage,
     #[serde(default)]
-    pub(crate) finish_reason: Option<String>,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct OpenAiUsage {
-    #[serde(default)]
-    pub(crate) prompt_tokens: Option<u64>,
-    #[serde(default)]
-    pub(crate) completion_tokens: Option<u64>,
-    #[serde(default)]
-    pub(crate) total_tokens: Option<u64>,
+    pub(crate) finish_reason: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]

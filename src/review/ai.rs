@@ -40,6 +40,7 @@ const MIN_CONTEXT_TOOL_RESULT_BYTES: usize = 28;
 const FINALIZATION_INSTRUCTION: &str = "上下文工具预算已用尽。放弃任何仍缺少证据的候选问题，不得继续请求 read_file、search_code 或 list_files。请立即提交最终审查结果并调用 submit_review_findings；没有已确认问题时提交空 findings。";
 const DIFF_ONLY_FINALIZATION_INSTRUCTION: &str = "上下文工具已关闭。请只基于原始 diff 和已明确提供的信息完成审查，不得继续请求 read_file、search_code 或 list_files。放弃任何仍缺少证据的候选问题，并立即调用 submit_review_findings；没有已确认问题时提交空 findings。";
 const MALFORMED_FINALIZATION_INSTRUCTION: &str = "上一次最终审查结果不是完整 JSON。不得继续请求 read_file、search_code 或 list_files。请压缩每条问题描述，放弃证据不足的问题，并立即重新提交一次完整 JSON；可用 submit_review_findings 时必须调用它，没有已确认问题时提交空 findings。";
+const JSON_FINALIZATION_INSTRUCTION: &str = "请立即返回一个完整且精简的 JSON 对象，格式必须为 {\"findings\":[...]}。不得调用任何工具；没有已确认问题时返回 {\"findings\":[]}。";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AiReviewExecutionMode {
@@ -826,7 +827,11 @@ fn is_tool_call_rejection(status: u16, body: &str) -> bool {
 }
 
 fn is_retryable_ai_http_response(status: u16, body: &str) -> bool {
-    if matches!(status, 408 | 429 | 502 | 503 | 504) {
+    is_timeout_ai_http_response(status, body) || matches!(status, 429 | 502 | 503)
+}
+
+fn is_timeout_ai_http_response(status: u16, body: &str) -> bool {
+    if matches!(status, 408 | 504) {
         return true;
     }
     if status < 500 {
@@ -901,10 +906,10 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
             attempt,
             batch_index = batch.map(|(index, _)| index),
             batch_count = batch.map(|(_, count)| count),
-            finish_reason = ?choice.finish_reason,
-            prompt_tokens = ?response.usage.as_ref().and_then(|usage| usage.prompt_tokens),
-            completion_tokens = ?response.usage.as_ref().and_then(|usage| usage.completion_tokens),
-            total_tokens = ?response.usage.as_ref().and_then(|usage| usage.total_tokens),
+            finish_reason = ?choice.finish_reason.as_ref().and_then(serde_json::Value::as_str),
+            prompt_tokens = ?telemetry_usage_token(response.usage.as_ref(), "prompt_tokens"),
+            completion_tokens = ?telemetry_usage_token(response.usage.as_ref(), "completion_tokens"),
+            total_tokens = ?telemetry_usage_token(response.usage.as_ref(), "total_tokens"),
             assistant_output_bytes = assistant_output_bytes(message),
             assistant_tool_calls = message.tool_calls.len(),
             "AI review completion metadata received"
@@ -944,7 +949,7 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                         attempt,
                         batch_index = batch.map(|(index, _)| index),
                         batch_count = batch.map(|(_, count)| count),
-                        finish_reason = ?choice.finish_reason,
+                        finish_reason = ?choice.finish_reason.as_ref().and_then(serde_json::Value::as_str),
                         assistant_output_bytes = assistant_output_bytes(message),
                         error = %err,
                         "AI review final findings payload was malformed; retrying finalization once"
@@ -960,6 +965,15 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
             }
         } else {
             if finalization_requested {
+                if malformed_finalization_retry_requested {
+                    return Err(AppError::ai_review(
+                        ReviewErrorCode::AiResponseParseFailed,
+                        format!(
+                            "AI review {} requested context tools during malformed findings recovery",
+                            config.id
+                        ),
+                    ));
+                }
                 if diff_only_fallback_requested {
                     return Err(AppError::ai_review(
                         ReviewErrorCode::AiRequestFailed,
@@ -1274,11 +1288,16 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                                 error = %err,
                                 "AI review context follow-up request failed, retrying"
                             );
-                            if current_response.status == 504 {
+                            if is_timeout_ai_http_response(
+                                current_response.status,
+                                &response_body_preview,
+                            ) {
                                 request_timeout_finalization(
                                     messages,
                                     base_message_count,
                                     &mut finalization_requested,
+                                    use_tool_calls,
+                                    malformed_finalization_retry_requested,
                                 );
                                 request_body = serialize_review_request_body(
                                     config,
@@ -1306,6 +1325,8 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                                 messages,
                                 base_message_count,
                                 &mut finalization_requested,
+                                use_tool_calls,
+                                malformed_finalization_retry_requested,
                             );
                             request_body = serialize_review_request_body(
                                 config,
@@ -1341,6 +1362,8 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                             messages,
                             base_message_count,
                             &mut finalization_requested,
+                            use_tool_calls,
+                            malformed_finalization_retry_requested,
                         );
                         request_body =
                             serialize_review_request_body(config, messages, use_tool_calls, false)?;
@@ -1432,6 +1455,8 @@ fn request_timeout_finalization(
     messages: &mut Vec<ChatMessage>,
     base_message_count: usize,
     requested: &mut bool,
+    use_tool_calls: bool,
+    malformed_retry: bool,
 ) {
     let evidence_summary = compact_tool_evidence(messages, base_message_count);
     messages.truncate(base_message_count);
@@ -1446,7 +1471,14 @@ fn request_timeout_finalization(
     *requested = true;
     messages.push(ChatMessage {
         role: "user".into(),
-        content: Some(FINALIZATION_INSTRUCTION.into()),
+        content: Some(
+            match (use_tool_calls, malformed_retry) {
+                (false, _) => JSON_FINALIZATION_INSTRUCTION,
+                (true, true) => MALFORMED_FINALIZATION_INSTRUCTION,
+                (true, false) => FINALIZATION_INSTRUCTION,
+            }
+            .into(),
+        ),
         tool_call_id: None,
         tool_calls: None,
     });
@@ -2145,6 +2177,12 @@ fn assistant_output_bytes(message: &OpenAiMessage) -> usize {
         )
 }
 
+fn telemetry_usage_token(usage: Option<&serde_json::Value>, field: &str) -> Option<u64> {
+    usage
+        .and_then(|usage| usage.get(field))
+        .and_then(serde_json::Value::as_u64)
+}
+
 fn parse_severity(value: &str) -> Severity {
     match value.trim().to_ascii_lowercase().as_str() {
         "error" => Severity::Error,
@@ -2445,11 +2483,26 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(response.choices[0].finish_reason.as_deref(), Some("length"));
+        assert_eq!(
+            response.choices[0]
+                .finish_reason
+                .as_ref()
+                .and_then(Value::as_str),
+            Some("length")
+        );
         let usage = response.usage.unwrap();
-        assert_eq!(usage.prompt_tokens, Some(120));
-        assert_eq!(usage.completion_tokens, Some(80));
-        assert_eq!(usage.total_tokens, Some(200));
+        assert_eq!(
+            telemetry_usage_token(Some(&usage), "prompt_tokens"),
+            Some(120)
+        );
+        assert_eq!(
+            telemetry_usage_token(Some(&usage), "completion_tokens"),
+            Some(80)
+        );
+        assert_eq!(
+            telemetry_usage_token(Some(&usage), "total_tokens"),
+            Some(200)
+        );
     }
 
     #[test]
@@ -2460,6 +2513,55 @@ mod tests {
 
         assert_eq!(response.choices[0].finish_reason, None);
         assert!(response.usage.is_none());
+    }
+
+    #[test]
+    fn ignores_nonstandard_finish_reason_and_usage_shape() {
+        let response = r#"{
+          "choices":[{
+            "finish_reason":123,
+            "message":{"content":"{\"findings\":[]}"}
+          }],
+          "usage":[]
+        }"#;
+
+        let findings = parse_openai_response("ai-review", "AI Review", response).unwrap();
+
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn ignores_nonstandard_usage_token_types() {
+        let response = r#"{
+          "choices":[{
+            "finish_reason":"stop",
+            "message":{"content":"{\"findings\":[]}"}
+          }],
+          "usage":{
+            "prompt_tokens":"120",
+            "completion_tokens":"80",
+            "total_tokens":-1
+          }
+        }"#;
+
+        let findings = parse_openai_response("ai-review", "AI Review", response).unwrap();
+
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn classifies_timeout_http_responses_for_finalization() {
+        assert!(is_timeout_ai_http_response(408, ""));
+        assert!(is_timeout_ai_http_response(504, ""));
+        assert!(is_timeout_ai_http_response(
+            500,
+            r#"{"error":"request timed out"}"#
+        ));
+        assert!(!is_timeout_ai_http_response(
+            500,
+            r#"{"error":"internal failure"}"#
+        ));
+        assert!(!is_timeout_ai_http_response(503, "temporarily unavailable"));
     }
 
     #[test]
@@ -3315,6 +3417,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_findings_recovery_rejects_context_tools_without_third_request() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let request_count_for_server = Arc::clone(&request_count);
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request_count = Arc::clone(&request_count_for_server);
+                tokio::spawn(async move {
+                    let request_index = request_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    let _request = read_http_json_request(&mut stream).await;
+                    let body = match request_index {
+                        1 => {
+                            r#"{"choices":[{"finish_reason":"length","message":{"tool_calls":[{"id":"submit_bad","type":"function","function":{"name":"submit_review_findings","arguments":"{\"findings\":["}}]}}]}"#
+                        }
+                        2 => {
+                            r#"{"choices":[{"finish_reason":"tool_calls","message":{"tool_calls":[{"id":"read_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"src/lib.rs\"}"}}]}}]}"#
+                        }
+                        3 => {
+                            r#"{"choices":[{"finish_reason":"tool_calls","message":{"tool_calls":[{"id":"submit_unexpected","type":"function","function":{"name":"submit_review_findings","arguments":"{\"findings\":[]}"}}]}}]}"#
+                        }
+                        other => panic!("unexpected request {other}"),
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    stream.write_all(body.as_bytes()).await.unwrap();
+                });
+            }
+        });
+
+        let config = AiReviewConfig {
+            base_url: format!("http://{addr}"),
+            ..test_ai_review_config()
+        };
+        let changes = vec![GitLabChange {
+            old_path: "src/lib.rs".into(),
+            new_path: "src/lib.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "@@ -1,0 +1,1 @@\n+panic!();\n".into(),
+        }];
+
+        let execution = run_ai_review_execution_with_context(&config, &changes, None, None).await;
+
+        assert_eq!(
+            execution
+                .result
+                .unwrap_err()
+                .review_failure()
+                .map(|failure| failure.code),
+            Some(ReviewErrorCode::AiResponseParseFailed)
+        );
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn retries_malformed_json_content_in_json_mode() {
         let request_count = Arc::new(AtomicUsize::new(0));
         let json_retry_count = Arc::new(AtomicUsize::new(0));
@@ -3385,6 +3548,89 @@ mod tests {
         assert!(findings.is_empty());
         assert_eq!(request_count.load(Ordering::SeqCst), 3);
         assert_eq!(json_retry_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn json_malformed_recovery_timeout_keeps_json_only_instruction() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let contradictory_instruction_count = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let request_count_for_server = Arc::clone(&request_count);
+        let contradictory_instruction_count_for_server =
+            Arc::clone(&contradictory_instruction_count);
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request_count = Arc::clone(&request_count_for_server);
+                let contradictory_instruction_count =
+                    Arc::clone(&contradictory_instruction_count_for_server);
+                tokio::spawn(async move {
+                    let request_index = request_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    let request = read_http_json_request(&mut stream).await;
+                    let (status, body) = match request_index {
+                        1 => ("400 Bad Request", r#"{"error":"tools unsupported"}"#),
+                        2 => (
+                            "200 OK",
+                            r#"{"choices":[{"finish_reason":"length","message":{"content":"{\"findings\":["}}]}"#,
+                        ),
+                        3 => ("408 Request Timeout", r#"{"error":"timeout"}"#),
+                        4 => {
+                            assert_eq!(request["response_format"]["type"], "json_object");
+                            assert!(request.get("tools").is_none());
+                            let messages = request["messages"].as_array().unwrap();
+                            if messages.iter().any(|message| {
+                                message["content"].as_str().is_some_and(|content| {
+                                    content.contains("调用 submit_review_findings")
+                                })
+                            }) {
+                                contradictory_instruction_count.fetch_add(1, Ordering::SeqCst);
+                            }
+                            assert!(messages.iter().any(|message| {
+                                message["content"].as_str().is_some_and(|content| {
+                                    content.contains("完整")
+                                        && content.contains("JSON")
+                                        && content.contains("不得调用任何工具")
+                                })
+                            }));
+                            (
+                                "200 OK",
+                                r#"{"choices":[{"finish_reason":"stop","message":{"content":"{\"findings\":[]}"}}]}"#,
+                            )
+                        }
+                        other => panic!("unexpected request {other}"),
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    stream.write_all(body.as_bytes()).await.unwrap();
+                });
+            }
+        });
+
+        let config = AiReviewConfig {
+            base_url: format!("http://{addr}"),
+            ..test_ai_review_config()
+        };
+        let changes = vec![GitLabChange {
+            old_path: "src/lib.rs".into(),
+            new_path: "src/lib.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "@@ -1,0 +1,1 @@\n+panic!();\n".into(),
+        }];
+
+        let findings = run_ai_review_execution_with_context(&config, &changes, None, None)
+            .await
+            .result
+            .unwrap();
+
+        assert!(findings.is_empty());
+        assert_eq!(request_count.load(Ordering::SeqCst), 4);
+        assert_eq!(contradictory_instruction_count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -4430,7 +4676,7 @@ mod tests {
         ];
         let mut requested = false;
 
-        request_timeout_finalization(&mut messages, 2, &mut requested);
+        request_timeout_finalization(&mut messages, 2, &mut requested, true, false);
 
         assert!(requested);
         assert_eq!(messages.len(), 4);
