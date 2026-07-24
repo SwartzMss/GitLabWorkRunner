@@ -443,6 +443,8 @@ async fn run_ai_review_single(
                         }
                         let code = if matches!(status, 401 | 403) {
                             ReviewErrorCode::PermissionDenied
+                        } else if should_enter_timeout_finalization(status, &body) {
+                            ReviewErrorCode::AiRequestTimeout
                         } else {
                             ReviewErrorCode::AiRequestFailed
                         };
@@ -1311,6 +1313,7 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                                     &mut finalization_requested,
                                     use_tool_calls,
                                     malformed_finalization_retry_requested,
+                                    diff_only_fallback_requested,
                                 );
                                 request_body = serialize_review_request_body(
                                     config,
@@ -1340,6 +1343,7 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                                 &mut finalization_requested,
                                 use_tool_calls,
                                 malformed_finalization_retry_requested,
+                                diff_only_fallback_requested,
                             );
                             request_body = serialize_review_request_body(
                                 config,
@@ -1377,6 +1381,7 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                             &mut finalization_requested,
                             use_tool_calls,
                             malformed_finalization_retry_requested,
+                            diff_only_fallback_requested,
                         );
                         request_body =
                             serialize_review_request_body(config, messages, use_tool_calls, false)?;
@@ -1407,10 +1412,10 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
             })
         })?;
         if !(200..300).contains(&response.status) {
-            let code = if response.status == 504 && finalization_requested {
-                ReviewErrorCode::AiToolLoopTimeout
-            } else if matches!(response.status, 401 | 403) {
+            let code = if matches!(response.status, 401 | 403) {
                 ReviewErrorCode::PermissionDenied
+            } else if should_enter_timeout_finalization(response.status, &response.body) {
+                ReviewErrorCode::AiToolLoopTimeout
             } else {
                 ReviewErrorCode::AiRequestFailed
             };
@@ -1470,6 +1475,7 @@ fn request_timeout_finalization(
     requested: &mut bool,
     use_tool_calls: bool,
     malformed_retry: bool,
+    diff_only_fallback_requested: bool,
 ) {
     let evidence_summary = compact_or_preserve_tool_evidence(messages, base_message_count);
     messages.truncate(base_message_count);
@@ -1485,10 +1491,15 @@ fn request_timeout_finalization(
     messages.push(ChatMessage {
         role: "user".into(),
         content: Some(
-            match (use_tool_calls, malformed_retry) {
-                (false, _) => JSON_FINALIZATION_INSTRUCTION,
-                (true, true) => MALFORMED_FINALIZATION_INSTRUCTION,
-                (true, false) => FINALIZATION_INSTRUCTION,
+            match (
+                use_tool_calls,
+                malformed_retry,
+                diff_only_fallback_requested,
+            ) {
+                (false, _, _) => JSON_FINALIZATION_INSTRUCTION,
+                (true, true, _) => MALFORMED_FINALIZATION_INSTRUCTION,
+                (true, false, true) => DIFF_ONLY_FINALIZATION_INSTRUCTION,
+                (true, false, false) => FINALIZATION_INSTRUCTION,
             }
             .into(),
         ),
@@ -2468,6 +2479,149 @@ mod tests {
             data.extend_from_slice(&chunk[..read]);
         }
         serde_json::from_slice(&data[body_start..expected_len]).unwrap()
+    }
+
+    async fn run_initial_http_error(status: &str, body: &str) -> AppError {
+        let status = status.to_owned();
+        let body = body.to_owned();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let status = status.clone();
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let _ = read_http_json_request(&mut stream).await;
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    stream.write_all(body.as_bytes()).await.unwrap();
+                });
+            }
+        });
+        let config = AiReviewConfig {
+            base_url: format!("http://{addr}"),
+            ..test_ai_review_config()
+        };
+        let changes = vec![GitLabChange {
+            old_path: "src/lib.rs".into(),
+            new_path: "src/lib.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "@@ -1 +1 @@\n+panic!();\n".into(),
+        }];
+        run_ai_review(&config, &changes).await.unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn final_initial_timeout_http_response_is_ai_request_timeout() {
+        for (status, body) in [
+            ("408 Request Timeout", ""),
+            ("504 Gateway Timeout", ""),
+            (
+                "500 Internal Server Error",
+                r#"{"error":{"code":"request_timeout"}}"#,
+            ),
+            (
+                "500 Internal Server Error",
+                r#"{"error":{"code":"RequestTimeout"}}"#,
+            ),
+        ] {
+            let error = run_initial_http_error(status, body).await;
+            assert_eq!(
+                error.review_failure().map(|failure| failure.code),
+                Some(ReviewErrorCode::AiRequestTimeout),
+                "status={status}, body={body}"
+            );
+        }
+    }
+
+    async fn run_followup_http_errors(
+        first_followup: (&str, &str),
+        final_followup: (&str, &str),
+    ) -> (AppError, usize) {
+        let first_followup = (first_followup.0.to_owned(), first_followup.1.to_owned());
+        let final_followup = (final_followup.0.to_owned(), final_followup.1.to_owned());
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_server = Arc::clone(&request_count);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request_count = Arc::clone(&request_count_for_server);
+                let first_followup = first_followup.clone();
+                let final_followup = final_followup.clone();
+                tokio::spawn(async move {
+                    let request_index = request_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    let _ = read_http_json_request(&mut stream).await;
+                    let (status, body) = match request_index {
+                        1 => (
+                            "200 OK".to_owned(),
+                            r#"{"choices":[{"message":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"search_code","arguments":"{\"query\":\"panic\"}"}}]}}]}"#.to_owned(),
+                        ),
+                        2 => first_followup,
+                        _ => final_followup,
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    stream.write_all(body.as_bytes()).await.unwrap();
+                });
+            }
+        });
+        let config = AiReviewConfig {
+            base_url: format!("http://{addr}"),
+            ..test_ai_review_config()
+        };
+        let changes = vec![GitLabChange {
+            old_path: "src/lib.rs".into(),
+            new_path: "src/lib.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "@@ -1 +1 @@\n+panic!();\n".into(),
+        }];
+        let source = tempfile::tempdir().unwrap();
+        let error =
+            run_ai_review_execution_with_context(&config, &changes, Some(source.path()), None)
+                .await
+                .result
+                .unwrap_err();
+        (error, request_count.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn final_followup_timeout_http_response_is_tool_loop_timeout() {
+        for (first, final_response) in [
+            (("408 Request Timeout", ""), ("408 Request Timeout", "")),
+            (("504 Gateway Timeout", ""), ("504 Gateway Timeout", "")),
+            (
+                (
+                    "500 Internal Server Error",
+                    r#"{"error":{"code":"request_timeout"}}"#,
+                ),
+                (
+                    "500 Internal Server Error",
+                    r#"{"error":{"code":"request_timeout"}}"#,
+                ),
+            ),
+            (("503 Service Unavailable", ""), ("504 Gateway Timeout", "")),
+        ] {
+            let (error, request_count) = run_followup_http_errors(first, final_response).await;
+            assert_eq!(request_count, 3);
+            assert_eq!(
+                error.review_failure().map(|failure| failure.code),
+                Some(ReviewErrorCode::AiToolLoopTimeout),
+                "first={first:?}, final={final_response:?}"
+            );
+        }
     }
 
     #[test]
@@ -4277,8 +4431,10 @@ mod tests {
     async fn context_request_after_finalization_falls_back_to_diff_only() {
         let request_count = Arc::new(AtomicUsize::new(0));
         let fallback_request_clean = Arc::new(AtomicUsize::new(0));
+        let diff_only_instruction_count = Arc::new(AtomicUsize::new(0));
         let request_count_for_server = Arc::clone(&request_count);
         let fallback_request_clean_for_server = Arc::clone(&fallback_request_clean);
+        let diff_only_instruction_count_for_server = Arc::clone(&diff_only_instruction_count);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -4286,11 +4442,16 @@ mod tests {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let request_count = Arc::clone(&request_count_for_server);
                 let fallback_request_clean = Arc::clone(&fallback_request_clean_for_server);
+                let diff_only_instruction_count =
+                    Arc::clone(&diff_only_instruction_count_for_server);
                 tokio::spawn(async move {
                     let request_index = request_count.fetch_add(1, Ordering::SeqCst) + 1;
                     let request = read_http_json_request(&mut stream).await;
-                    let body = if request_index <= 2 {
-                        r#"{"choices":[{"message":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"search_code","arguments":"{\"query\":\"panic\"}"}}]}}]}"#
+                    let (status, body) = if request_index <= 2 {
+                        (
+                            "200 OK",
+                            r#"{"choices":[{"message":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"search_code","arguments":"{\"query\":\"panic\"}"}}]}}]}"#,
+                        )
                     } else {
                         let tool_names = request["tools"]
                             .as_array()
@@ -4316,10 +4477,28 @@ mod tests {
                             });
                         fallback_request_clean
                             .store(usize::from(!leaked_context_history), Ordering::SeqCst);
-                        r#"{"choices":[{"message":{"tool_calls":[{"id":"submit_1","type":"function","function":{"name":"submit_review_findings","arguments":"{\"findings\":[]}"}}]}}]}"#
+                        if request["messages"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|message| {
+                                message["content"].as_str()
+                                    == Some(DIFF_ONLY_FINALIZATION_INSTRUCTION)
+                            })
+                        {
+                            diff_only_instruction_count.fetch_add(1, Ordering::SeqCst);
+                        }
+                        if request_index == 3 {
+                            ("408 Request Timeout", "")
+                        } else {
+                            (
+                                "200 OK",
+                                r#"{"choices":[{"message":{"tool_calls":[{"id":"submit_1","type":"function","function":{"name":"submit_review_findings","arguments":"{\"findings\":[]}"}}]}}]}"#,
+                            )
+                        }
                     };
                     let response = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
                         body.len()
                     );
                     stream.write_all(response.as_bytes()).await.unwrap();
@@ -4349,8 +4528,9 @@ mod tests {
 
         assert!(execution.result.unwrap().is_empty());
         assert_eq!(execution.coverage.unwrap().tool_calls_used, 1);
-        assert_eq!(request_count.load(Ordering::SeqCst), 3);
+        assert_eq!(request_count.load(Ordering::SeqCst), 4);
         assert_eq!(fallback_request_clean.load(Ordering::SeqCst), 1);
+        assert_eq!(diff_only_instruction_count.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -4831,7 +5011,7 @@ mod tests {
         ];
         let mut requested = false;
 
-        request_timeout_finalization(&mut messages, 2, &mut requested, true, false);
+        request_timeout_finalization(&mut messages, 2, &mut requested, true, false, false);
 
         assert!(requested);
         assert_eq!(messages.len(), 4);
@@ -4887,8 +5067,8 @@ mod tests {
         ];
         let mut requested = false;
 
-        request_timeout_finalization(&mut messages, 2, &mut requested, true, false);
-        request_timeout_finalization(&mut messages, 2, &mut requested, true, true);
+        request_timeout_finalization(&mut messages, 2, &mut requested, true, false, false);
+        request_timeout_finalization(&mut messages, 2, &mut requested, true, true, false);
 
         let summaries = messages
             .iter()
