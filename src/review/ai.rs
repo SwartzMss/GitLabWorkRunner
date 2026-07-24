@@ -973,7 +973,7 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                         "AI review final findings payload was malformed; retrying finalization once"
                     );
                     messages.push(ChatMessage {
-                        role: "user".into(),
+                        role: "system".into(),
                         content: Some(MALFORMED_FINALIZATION_INSTRUCTION.into()),
                         tool_call_id: None,
                         tool_calls: None,
@@ -1491,8 +1491,9 @@ fn request_timeout_finalization(
         });
     }
     *requested = true;
+    let role = if malformed_retry { "system" } else { "user" };
     messages.push(ChatMessage {
-        role: "user".into(),
+        role: role.into(),
         content: Some(
             match (
                 use_tool_calls,
@@ -3769,9 +3770,10 @@ mod tests {
                                 .count();
                             malformed_call_leaked.store(leaked, Ordering::SeqCst);
                             assert!(messages.iter().any(|message| {
-                                message["content"].as_str().is_some_and(|content| {
-                                    content.contains("JSON") && content.contains("完整")
-                                })
+                                message["role"] == "system"
+                                    && message["content"].as_str().is_some_and(|content| {
+                                        content.contains("JSON") && content.contains("完整")
+                                    })
                             }));
                             r#"{"choices":[{"finish_reason":"tool_calls","message":{"tool_calls":[{"id":"submit_ok","type":"function","function":{"name":"submit_review_findings","arguments":"{\"findings\":[{\"path\":\"src/lib.rs\",\"line\":1,\"severity\":\"error\",\"title\":\"Possible panic\",\"message\":\"Avoid panic here.\"}]}"}}]}}]}"#
                         }
@@ -5453,6 +5455,10 @@ mod tests {
                 .and_then(|message| message.content.as_deref()),
             Some(MALFORMED_FINALIZATION_INSTRUCTION)
         );
+        assert_eq!(
+            messages.last().map(|message| message.role.as_str()),
+            Some("system")
+        );
     }
 
     #[test]
@@ -5482,6 +5488,10 @@ mod tests {
         assert!(instruction.contains("上一次最终审查结果不是完整 JSON"));
         assert!(instruction.contains("只基于原始 diff 和已明确提供的信息"));
         assert!(instruction.contains("不得请求或依赖 read_file、search_code 或 list_files"));
+        assert_eq!(
+            messages.last().map(|message| message.role.as_str()),
+            Some("system")
+        );
     }
 
     #[test]
