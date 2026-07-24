@@ -3721,6 +3721,28 @@ mod tests {
     }
 
     #[test]
+    fn tool_and_content_candidates_share_one_limit() {
+        let tool_calls = (0..MAX_FINAL_FINDINGS_CANDIDATES)
+            .map(|index| OpenAiToolCall {
+                id: format!("submit_{index}"),
+                call_type: "function".into(),
+                function: super::super::ai_schema::OpenAiToolCallFunction {
+                    name: "submit_review_findings".into(),
+                    arguments: r#"{"findings":[]}"#.into(),
+                },
+            })
+            .collect();
+        let message = OpenAiMessage {
+            content: Some(r#"{"findings":[]}"#.into()),
+            tool_calls,
+        };
+
+        let error = parse_openai_message("ai-review", "AI Review", &message).unwrap_err();
+
+        assert!(error.to_string().contains("more than 8"));
+    }
+
+    #[test]
     fn reuses_shared_ai_http_client() {
         let client_one = shared_ai_http_client().unwrap() as *const ureq::Agent;
         let client_two = shared_ai_http_client().unwrap() as *const ureq::Agent;
