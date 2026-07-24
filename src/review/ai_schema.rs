@@ -95,7 +95,6 @@ pub(crate) struct OpenAiToolCallFunction {
 
 #[derive(Deserialize)]
 pub(crate) struct AiFindingsResponse {
-    #[serde(default)]
     pub(crate) findings: Vec<AiFinding>,
 }
 

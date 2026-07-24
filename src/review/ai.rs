@@ -40,6 +40,7 @@ const MIN_CONTEXT_TOOL_RESULT_BYTES: usize = 28;
 const FINALIZATION_INSTRUCTION: &str = "上下文工具预算已用尽。放弃任何仍缺少证据的候选问题，不得继续请求 read_file、search_code 或 list_files。请立即提交最终审查结果并调用 submit_review_findings；没有已确认问题时提交空 findings。";
 const DIFF_ONLY_FINALIZATION_INSTRUCTION: &str = "上下文工具已关闭。请只基于原始 diff 和已明确提供的信息完成审查，不得继续请求 read_file、search_code 或 list_files。放弃任何仍缺少证据的候选问题，并立即调用 submit_review_findings；没有已确认问题时提交空 findings。";
 const MALFORMED_FINALIZATION_INSTRUCTION: &str = "上一次最终审查结果不是完整 JSON。不得继续请求 read_file、search_code 或 list_files。请压缩每条问题描述，放弃证据不足的问题，并立即重新提交一次完整 JSON；可用 submit_review_findings 时必须调用它，没有已确认问题时提交空 findings。";
+const MALFORMED_DIFF_ONLY_FINALIZATION_INSTRUCTION: &str = "上一次最终审查结果不是完整 JSON。上下文工具已关闭。请只基于原始 diff 和已明确提供的信息重新提交完整 JSON；不得请求或依赖 read_file、search_code 或 list_files。请压缩每条问题描述，放弃证据不足的问题，并立即调用 submit_review_findings；没有已确认问题时提交空 findings。";
 const JSON_FINALIZATION_INSTRUCTION: &str = "请立即返回一个完整且精简的 JSON 对象，格式必须为 {\"findings\":[...]}。不得调用任何工具；没有已确认问题时返回 {\"findings\":[]}。";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -952,8 +953,7 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                     "AI review context tool calls completed"
                 );
             }
-            let payload = final_findings_payload(message)?;
-            match parse_openai_findings_payload(&config.id, &config.title, payload) {
+            match parse_final_findings_candidates(&config.id, &config.title, message) {
                 Ok(findings) => return Ok(findings),
                 Err(err) if !malformed_finalization_retry_requested => {
                     malformed_finalization_retry_requested = true;
@@ -1497,7 +1497,8 @@ fn request_timeout_finalization(
                 diff_only_fallback_requested,
             ) {
                 (false, _, _) => JSON_FINALIZATION_INSTRUCTION,
-                (true, true, _) => MALFORMED_FINALIZATION_INSTRUCTION,
+                (true, true, true) => MALFORMED_DIFF_ONLY_FINALIZATION_INSTRUCTION,
+                (true, true, false) => MALFORMED_FINALIZATION_INSTRUCTION,
                 (true, false, true) => DIFF_ONLY_FINALIZATION_INSTRUCTION,
                 (true, false, false) => FINALIZATION_INSTRUCTION,
             }
@@ -2084,24 +2085,42 @@ fn parse_openai_message(
     title: &str,
     message: &OpenAiMessage,
 ) -> AppResult<Vec<Finding>> {
-    let content = final_findings_payload(message)?;
-    parse_openai_findings_payload(review_id, title, content)
+    parse_final_findings_candidates(review_id, title, message)
 }
 
-fn final_findings_payload(message: &OpenAiMessage) -> AppResult<&str> {
-    tool_call_arguments(message).or_else(|_| {
-        message
-            .content
-            .as_deref()
-            .map(str::trim)
-            .filter(|content| !content.is_empty())
-            .ok_or_else(|| {
-                AppError::ai_review(
-                    ReviewErrorCode::AiResponseParseFailed,
-                    "AI review API returned no content",
-                )
-            })
-    })
+fn parse_final_findings_candidates(
+    review_id: &str,
+    title: &str,
+    message: &OpenAiMessage,
+) -> AppResult<Vec<Finding>> {
+    let mut last_error = None;
+    for tool_call in message
+        .tool_calls
+        .iter()
+        .filter(|tool_call| tool_call.function.name == "submit_review_findings")
+    {
+        match parse_openai_findings_payload(review_id, title, &tool_call.function.arguments) {
+            Ok(findings) => return Ok(findings),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    if let Some(content) = message
+        .content
+        .as_deref()
+        .map(str::trim)
+        .filter(|content| !content.is_empty())
+    {
+        match parse_openai_findings_payload(review_id, title, content) {
+            Ok(findings) => return Ok(findings),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        AppError::ai_review(
+            ReviewErrorCode::AiResponseParseFailed,
+            "AI review API returned no valid findings payload",
+        )
+    }))
 }
 
 fn parse_openai_findings_payload(
@@ -2185,20 +2204,6 @@ fn extract_first_json_object(content: &str) -> Option<&str> {
         }
     }
     None
-}
-
-fn tool_call_arguments(message: &OpenAiMessage) -> AppResult<&str> {
-    message
-        .tool_calls
-        .iter()
-        .find(|tool_call| tool_call.function.name == "submit_review_findings")
-        .map(|tool_call| tool_call.function.arguments.as_str())
-        .ok_or_else(|| {
-            AppError::ai_review(
-                ReviewErrorCode::AiResponseParseFailed,
-                "AI review API returned no submit_review_findings tool call",
-            )
-        })
 }
 
 fn assistant_output_bytes(message: &OpenAiMessage) -> usize {
@@ -2781,6 +2786,21 @@ mod tests {
 
         assert_eq!(parsed.findings.len(), 1);
         assert_eq!(parsed.findings[0].message, "contains } brace");
+    }
+
+    #[test]
+    fn rejects_findings_payload_without_required_findings_field() {
+        for content in [r#"{}"#, r#"{"finding":[]}"#, r#"{"unexpected":"value"}"#] {
+            let error = match parse_ai_findings_response(content) {
+                Ok(_) => panic!("missing findings field was accepted: {content}"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.review_failure().map(|failure| failure.code),
+                Some(ReviewErrorCode::AiResponseParseFailed),
+                "content={content}"
+            );
+        }
     }
 
     #[test]
@@ -3466,6 +3486,58 @@ mod tests {
     }
 
     #[test]
+    fn uses_valid_content_when_submit_tool_arguments_are_malformed() {
+        let response = r#"{
+          "choices":[{
+            "message":{
+              "content":"{\"findings\":[]}",
+              "tool_calls":[{
+                "type":"function",
+                "function":{
+                  "name":"submit_review_findings",
+                  "arguments":"{\"findings\":["
+                }
+              }]
+            }
+          }]
+        }"#;
+
+        let findings = parse_openai_response("ai-review", "AI Review", response).unwrap();
+
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn uses_later_valid_submit_tool_arguments() {
+        let response = r#"{
+          "choices":[{
+            "message":{
+              "tool_calls":[
+                {
+                  "type":"function",
+                  "function":{
+                    "name":"submit_review_findings",
+                    "arguments":"{\"findings\":["
+                  }
+                },
+                {
+                  "type":"function",
+                  "function":{
+                    "name":"submit_review_findings",
+                    "arguments":"{\"findings\":[]}"
+                  }
+                }
+              ]
+            }
+          }]
+        }"#;
+
+        let findings = parse_openai_response("ai-review", "AI Review", response).unwrap();
+
+        assert!(findings.is_empty());
+    }
+
+    #[test]
     fn reuses_shared_ai_http_client() {
         let client_one = shared_ai_http_client().unwrap() as *const ureq::Agent;
         let client_two = shared_ai_http_client().unwrap() as *const ureq::Agent;
@@ -3571,7 +3643,7 @@ mod tests {
                 tokio::spawn(async move {
                     request_count.fetch_add(1, Ordering::SeqCst);
                     let _request = read_http_json_request(&mut stream).await;
-                    let body = r#"{"choices":[{"finish_reason":"length","message":{"tool_calls":[{"id":"submit_bad","type":"function","function":{"name":"submit_review_findings","arguments":"{\"findings\":["}}]}}]}"#;
+                    let body = r#"{"choices":[{"finish_reason":"stop","message":{"tool_calls":[{"id":"submit_bad","type":"function","function":{"name":"submit_review_findings","arguments":"{}"}}]}}]}"#;
                     let response = format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
                         body.len()
@@ -3689,7 +3761,7 @@ mod tests {
                         1 => ("400 Bad Request", r#"{"error":"tools unsupported"}"#),
                         2 => (
                             "200 OK",
-                            r#"{"choices":[{"finish_reason":"length","message":{"content":"{\"findings\":["}}]}"#,
+                            r#"{"choices":[{"finish_reason":"stop","message":{"content":"{}"}}]}"#,
                         ),
                         3 => {
                             assert_eq!(request["response_format"]["type"], "json_object");
@@ -5083,6 +5155,35 @@ mod tests {
                 .and_then(|message| message.content.as_deref()),
             Some(MALFORMED_FINALIZATION_INSTRUCTION)
         );
+    }
+
+    #[test]
+    fn malformed_diff_only_timeout_finalization_preserves_both_constraints() {
+        let mut messages = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: Some("system".into()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("current diff".into()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ];
+        let mut requested = true;
+
+        request_timeout_finalization(&mut messages, 2, &mut requested, true, true, true);
+
+        let instruction = messages
+            .last()
+            .and_then(|message| message.content.as_deref())
+            .unwrap();
+        assert!(instruction.contains("上一次最终审查结果不是完整 JSON"));
+        assert!(instruction.contains("只基于原始 diff 和已明确提供的信息"));
+        assert!(instruction.contains("不得请求或依赖 read_file、search_code 或 list_files"));
     }
 
     #[test]
