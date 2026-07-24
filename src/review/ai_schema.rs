@@ -102,7 +102,6 @@ pub(crate) struct AiFindingsResponse {
 pub(crate) struct AiFinding {
     pub(crate) path: String,
     pub(crate) line: u32,
-    #[serde(default)]
     pub(crate) severity: String,
     #[serde(default)]
     pub(crate) title: String,

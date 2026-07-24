@@ -2157,7 +2157,7 @@ fn has_final_findings_candidate(message: &OpenAiMessage) -> bool {
 
 fn parse_openai_findings_payload(
     review_id: &str,
-    title: &str,
+    _title: &str,
     content: &str,
 ) -> AppResult<Vec<Finding>> {
     info!(
@@ -2178,6 +2178,7 @@ fn parse_openai_findings_payload(
             || finding.message.trim().is_empty()
             || finding.title.trim().is_empty()
             || finding.line == 0
+            || !finding.severity.trim().eq_ignore_ascii_case("error")
         {
             return Err(AppError::ai_review(
                 ReviewErrorCode::AiResponseParseFailed,
@@ -2186,10 +2187,10 @@ fn parse_openai_findings_payload(
         }
         findings.push(Finding {
             rule_id: format!("ai:{review_id}"),
-            severity: parse_severity(&finding.severity),
+            severity: Severity::Error,
             path: finding.path.trim().replace('\\', "/"),
             new_line: Some(finding.line),
-            title: non_empty_or(finding.title, title),
+            title: finding.title.trim().to_string(),
             message: finding.message.trim().to_string(),
         });
     }
@@ -2280,22 +2281,6 @@ fn telemetry_usage_token(usage: Option<&serde_json::Value>, field: &str) -> Opti
     usage
         .and_then(|usage| usage.get(field))
         .and_then(serde_json::Value::as_u64)
-}
-
-fn parse_severity(value: &str) -> Severity {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "error" => Severity::Error,
-        _ => Severity::Error,
-    }
-}
-
-fn non_empty_or(value: String, fallback: &str) -> String {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        fallback.to_string()
-    } else {
-        trimmed.to_string()
-    }
 }
 
 fn preview_log_text(value: &str, max_chars: usize) -> String {
@@ -2886,21 +2871,21 @@ mod tests {
     }
 
     #[test]
-    fn treats_unknown_ai_severity_as_error() {
-        let response = r#"
-{
-  "choices": [{
-    "message": {
-      "content": "{\"findings\":[{\"path\":\"src/lib.rs\",\"line\":12,\"severity\":\"warning\",\"title\":\"Bug\",\"message\":\"This is a bug.\"}]}"
-    }
-  }]
-}
-"#;
-
-        let findings = parse_openai_response("ai-review", "AI Review", response).unwrap();
-
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].severity, Severity::Error);
+    fn rejects_missing_or_unsupported_ai_severity() {
+        for payload in [
+            r#"{"findings":[{"path":"src/lib.rs","line":10,"title":"Bug","message":"Issue"}]}"#,
+            r#"{"findings":[{"path":"src/lib.rs","line":10,"severity":"","title":"Bug","message":"Issue"}]}"#,
+            r#"{"findings":[{"path":"src/lib.rs","line":10,"severity":"warning","title":"Bug","message":"Issue"}]}"#,
+            r#"{"findings":[{"path":"src/lib.rs","line":10,"severity":"garbage","title":"Bug","message":"Issue"}]}"#,
+        ] {
+            let error =
+                parse_openai_findings_payload("ai-review", "AI Review", payload).unwrap_err();
+            assert_eq!(
+                error.review_failure().map(|failure| failure.code),
+                Some(ReviewErrorCode::AiResponseParseFailed),
+                "payload={payload}"
+            );
+        }
     }
 
     #[test]
