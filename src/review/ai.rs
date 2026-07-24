@@ -36,7 +36,7 @@ const AI_HTTP_ATTEMPTS: usize = 2;
 const TOOL_ARGUMENT_SUMMARY_CHARS: usize = 160;
 const TIMEOUT_EVIDENCE_SUMMARY_CHARS: usize = 6000;
 const TIMEOUT_EVIDENCE_ITEM_CHARS: usize = 1500;
-const MAX_FINDINGS_JSON_CANDIDATES: usize = 8;
+const MAX_FINAL_FINDINGS_CANDIDATES: usize = 8;
 const MIN_CONTEXT_TOOL_RESULT_BYTES: usize = 28;
 const FINALIZATION_INSTRUCTION: &str = "上下文工具预算已用尽。放弃任何仍缺少证据的候选问题，不得继续请求 read_file、search_code 或 list_files。请立即提交最终审查结果并调用 submit_review_findings；没有已确认问题时提交空 findings。";
 const DIFF_ONLY_FINALIZATION_INSTRUCTION: &str = "上下文工具已关闭。请只基于原始 diff 和已明确提供的信息完成审查，不得继续请求 read_file、search_code 或 list_files。放弃任何仍缺少证据的候选问题，并立即调用 submit_review_findings；没有已确认问题时提交空 findings。";
@@ -2102,12 +2102,17 @@ fn parse_final_findings_candidates(
 ) -> AppResult<Vec<Finding>> {
     let mut last_error = None;
     let mut valid_candidates = Vec::new();
+    let mut candidate_count = 0_usize;
     for tool_call in message
         .tool_calls
         .iter()
         .filter(|tool_call| tool_call.function.name == "submit_review_findings")
     {
-        match parse_openai_findings_payload(review_id, title, &tool_call.function.arguments) {
+        candidate_count += 1;
+        if candidate_count > MAX_FINAL_FINDINGS_CANDIDATES {
+            return Err(too_many_final_findings_candidates_error());
+        }
+        match parse_single_findings_candidate(review_id, title, &tool_call.function.arguments) {
             Ok(findings) => valid_candidates.push(findings),
             Err(error) => last_error = Some(error),
         }
@@ -2118,16 +2123,30 @@ fn parse_final_findings_candidates(
         .map(str::trim)
         .filter(|content| !content.is_empty())
     {
-        match parse_openai_findings_payload(review_id, title, content) {
-            Ok(findings) => valid_candidates.push(findings),
-            Err(error) => last_error = Some(error),
+        let content_candidates = extract_json_objects(content);
+        if content_candidates.is_empty() {
+            last_error = Some(AppError::ai_review(
+                ReviewErrorCode::AiResponseParseFailed,
+                "AI review assistant content contained no complete JSON object",
+            ));
+        }
+        for content_candidate in content_candidates {
+            candidate_count += 1;
+            if candidate_count > MAX_FINAL_FINDINGS_CANDIDATES {
+                return Err(too_many_final_findings_candidates_error());
+            }
+            match parse_single_findings_candidate(review_id, title, content_candidate) {
+                Ok(findings) => valid_candidates.push(findings),
+                Err(error) => last_error = Some(error),
+            }
         }
     }
     if let Some(first) = valid_candidates.first() {
+        let canonical_first = canonical_findings(first);
         if valid_candidates
             .iter()
             .skip(1)
-            .all(|candidate| candidate == first)
+            .all(|candidate| canonical_findings(candidate) == canonical_first)
         {
             return Ok(first.clone());
         }
@@ -2144,6 +2163,37 @@ fn parse_final_findings_candidates(
     }))
 }
 
+fn too_many_final_findings_candidates_error() -> AppError {
+    AppError::ai_review(
+        ReviewErrorCode::AiResponseParseFailed,
+        format!(
+            "AI review returned more than {MAX_FINAL_FINDINGS_CANDIDATES} final findings candidates"
+        ),
+    )
+}
+
+fn canonical_findings(findings: &[Finding]) -> Vec<Finding> {
+    let mut canonical = findings.to_vec();
+    canonical.sort_by(|left, right| {
+        (
+            &left.path,
+            left.new_line,
+            &left.title,
+            &left.message,
+            &left.rule_id,
+        )
+            .cmp(&(
+                &right.path,
+                right.new_line,
+                &right.title,
+                &right.message,
+                &right.rule_id,
+            ))
+    });
+    canonical.dedup();
+    canonical
+}
+
 fn has_final_findings_candidate(message: &OpenAiMessage) -> bool {
     message
         .tool_calls
@@ -2155,9 +2205,10 @@ fn has_final_findings_candidate(message: &OpenAiMessage) -> bool {
             .is_some_and(|content| !content.trim().is_empty())
 }
 
+#[cfg(test)]
 fn parse_openai_findings_payload(
     review_id: &str,
-    _title: &str,
+    title: &str,
     content: &str,
 ) -> AppResult<Vec<Finding>> {
     info!(
@@ -2167,6 +2218,25 @@ fn parse_openai_findings_payload(
         "AI review assistant content received"
     );
     let parsed = parse_ai_findings_response(content)?;
+    normalize_ai_findings(review_id, title, parsed)
+}
+
+fn parse_single_findings_candidate(
+    review_id: &str,
+    title: &str,
+    content: &str,
+) -> AppResult<Vec<Finding>> {
+    let parsed = serde_json::from_str(content).map_err(|error| {
+        AppError::ai_review(ReviewErrorCode::AiResponseParseFailed, error.to_string())
+    })?;
+    normalize_ai_findings(review_id, title, parsed)
+}
+
+fn normalize_ai_findings(
+    review_id: &str,
+    _title: &str,
+    parsed: AiFindingsResponse,
+) -> AppResult<Vec<Finding>> {
     info!(
         ai_review_id = %review_id,
         parsed_findings = parsed.findings.len(),
@@ -2197,67 +2267,37 @@ fn parse_openai_findings_payload(
     Ok(findings)
 }
 
+#[cfg(test)]
 fn parse_ai_findings_response(content: &str) -> AppResult<AiFindingsResponse> {
-    match serde_json::from_str(content) {
-        Ok(parsed) => Ok(parsed),
-        Err(strict_error) => {
-            let mut last_error = strict_error;
-            for json_content in extract_json_objects(content, MAX_FINDINGS_JSON_CANDIDATES) {
-                match serde_json::from_str(json_content) {
-                    Ok(parsed) => return Ok(parsed),
-                    Err(error) => last_error = error,
-                }
-            }
-            Err(AppError::ai_review(
-                ReviewErrorCode::AiResponseParseFailed,
-                last_error.to_string(),
-            ))
+    let mut last_error = None;
+    for json_content in extract_json_objects(content) {
+        match serde_json::from_str(json_content) {
+            Ok(parsed) => return Ok(parsed),
+            Err(error) => last_error = Some(error),
         }
     }
+    Err(AppError::ai_review(
+        ReviewErrorCode::AiResponseParseFailed,
+        last_error.map_or_else(
+            || "AI review assistant content contained no complete JSON object".into(),
+            |error| error.to_string(),
+        ),
+    ))
 }
 
-fn extract_json_objects(content: &str, limit: usize) -> Vec<&str> {
+fn extract_json_objects(content: &str) -> Vec<&str> {
     let mut objects = Vec::new();
-    let mut start = None;
-    let mut depth = 0_usize;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (offset, ch) in content.char_indices() {
-        if in_string {
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            match ch {
-                '\\' => escaped = true,
-                '"' => in_string = false,
-                _ => {}
-            }
+    let mut skip_until = 0_usize;
+    for (start, ch) in content.char_indices() {
+        if ch != '{' || start < skip_until {
             continue;
         }
-        match ch {
-            '"' => in_string = true,
-            '{' => {
-                if depth == 0 {
-                    start = Some(offset);
-                }
-                depth += 1;
-            }
-            '}' => {
-                let Some(next_depth) = depth.checked_sub(1) else {
-                    continue;
-                };
-                depth = next_depth;
-                if depth == 0 {
-                    if let Some(start) = start.take() {
-                        objects.push(&content[start..offset + ch.len_utf8()]);
-                        if objects.len() == limit {
-                            break;
-                        }
-                    }
-                }
-            }
-            _ => {}
+        let mut stream =
+            serde_json::Deserializer::from_str(&content[start..]).into_iter::<serde_json::Value>();
+        if matches!(stream.next(), Some(Ok(_))) {
+            let end = start + stream.byte_offset();
+            objects.push(&content[start..end]);
+            skip_until = end;
         }
     }
     objects
@@ -3605,6 +3645,74 @@ mod tests {
             Some(ReviewErrorCode::AiResponseParseFailed)
         );
         assert!(error.to_string().contains("conflicting findings payloads"));
+    }
+
+    #[test]
+    fn content_candidates_detect_conflicts_and_skip_invalid_objects() {
+        let conflicting = r#"{
+          "choices":[{"message":{"content":
+            "{\"findings\":[]}\n{\"findings\":[{\"path\":\"src/lib.rs\",\"line\":10,\"severity\":\"error\",\"title\":\"Bug\",\"message\":\"Real issue\"}]}"
+          }}]
+        }"#;
+        let error = parse_openai_response("ai-review", "AI Review", conflicting).unwrap_err();
+        assert!(error.to_string().contains("conflicting findings payloads"));
+
+        let invalid_then_valid = r#"{
+          "choices":[{"message":{"content":
+            "{\"findings\":[{\"path\":\"\",\"line\":10,\"severity\":\"error\",\"title\":\"Invalid\",\"message\":\"\"}]}\n{\"findings\":[{\"path\":\"src/lib.rs\",\"line\":10,\"severity\":\"error\",\"title\":\"Valid\",\"message\":\"Real issue\"}]}"
+          }}]
+        }"#;
+        let findings = parse_openai_response("ai-review", "AI Review", invalid_then_valid).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].path, "src/lib.rs");
+
+        let identical = r#"{
+          "choices":[{"message":{"content":
+            "{\"findings\":[]}\n{\"findings\":[]}"
+          }}]
+        }"#;
+        assert!(parse_openai_response("ai-review", "AI Review", identical)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn content_candidates_recover_after_malformed_prefixes() {
+        for content in [
+            "Draft: {\"findings\":[\nFinal:\n{\"findings\":[]}",
+            "Provider message: \"unfinished quote\n{\"findings\":[]}",
+        ] {
+            let message = OpenAiMessage {
+                content: Some(content.into()),
+                tool_calls: Vec::new(),
+            };
+            assert!(
+                parse_openai_message("ai-review", "AI Review", &message)
+                    .unwrap()
+                    .is_empty(),
+                "content={content}"
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_order_is_ignored_but_first_output_order_is_preserved() {
+        let response = r#"{
+          "choices":[{"message":{"tool_calls":[
+            {"type":"function","function":{"name":"submit_review_findings","arguments":"{\"findings\":[{\"path\":\"b.rs\",\"line\":2,\"severity\":\"error\",\"title\":\"B\",\"message\":\"Issue B\"},{\"path\":\"a.rs\",\"line\":1,\"severity\":\"error\",\"title\":\"A\",\"message\":\"Issue A\"}]}"}},
+            {"type":"function","function":{"name":"submit_review_findings","arguments":"{\"findings\":[{\"path\":\"a.rs\",\"line\":1,\"severity\":\"error\",\"title\":\"A\",\"message\":\"Issue A\"},{\"path\":\"b.rs\",\"line\":2,\"severity\":\"error\",\"title\":\"B\",\"message\":\"Issue B\"}]}"}}
+          ]}}]
+        }"#;
+
+        let findings = parse_openai_response("ai-review", "AI Review", response).unwrap();
+
+        assert_eq!(
+            findings
+                .iter()
+                .map(|finding| finding.path.as_str())
+                .collect::<Vec<_>>(),
+            ["b.rs", "a.rs"]
+        );
     }
 
     #[test]
