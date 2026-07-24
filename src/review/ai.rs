@@ -954,15 +954,11 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                     "AI review context tool calls completed"
                 );
             }
-            if !has_final_findings_candidate(message) {
-                return Err(AppError::ai_review(
-                    ReviewErrorCode::AiResponseParseFailed,
-                    "AI review API returned no findings payload",
-                ));
-            }
             match parse_final_findings_candidates(&config.id, &config.title, message) {
                 Ok(findings) => return Ok(findings),
-                Err(err) if !malformed_finalization_retry_requested => {
+                Err(FinalFindingsParseFailure::Malformed(err))
+                    if !malformed_finalization_retry_requested =>
+                {
                     malformed_finalization_retry_requested = true;
                     finalization_requested = true;
                     warn!(
@@ -983,7 +979,7 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
                         tool_calls: None,
                     });
                 }
-                Err(err) => return Err(err),
+                Err(err) => return Err(err.into_error()),
             }
         } else {
             if finalization_requested {
@@ -2093,13 +2089,27 @@ fn parse_openai_message(
     message: &OpenAiMessage,
 ) -> AppResult<Vec<Finding>> {
     parse_final_findings_candidates(review_id, title, message)
+        .map_err(FinalFindingsParseFailure::into_error)
+}
+
+enum FinalFindingsParseFailure {
+    Malformed(AppError),
+    Protocol(AppError),
+}
+
+impl FinalFindingsParseFailure {
+    fn into_error(self) -> AppError {
+        match self {
+            Self::Malformed(error) | Self::Protocol(error) => error,
+        }
+    }
 }
 
 fn parse_final_findings_candidates(
     review_id: &str,
     title: &str,
     message: &OpenAiMessage,
-) -> AppResult<Vec<Finding>> {
+) -> Result<Vec<Finding>, FinalFindingsParseFailure> {
     let mut last_error = None;
     let mut valid_candidates = Vec::new();
     let mut candidate_count = 0_usize;
@@ -2110,7 +2120,9 @@ fn parse_final_findings_candidates(
     {
         candidate_count += 1;
         if candidate_count > MAX_FINAL_FINDINGS_CANDIDATES {
-            return Err(too_many_final_findings_candidates_error());
+            return Err(FinalFindingsParseFailure::Protocol(
+                too_many_final_findings_candidates_error(),
+            ));
         }
         match parse_single_findings_candidate(review_id, title, &tool_call.function.arguments) {
             Ok(findings) => valid_candidates.push(findings),
@@ -2133,7 +2145,9 @@ fn parse_final_findings_candidates(
         for content_candidate in content_candidates {
             candidate_count += 1;
             if candidate_count > MAX_FINAL_FINDINGS_CANDIDATES {
-                return Err(too_many_final_findings_candidates_error());
+                return Err(FinalFindingsParseFailure::Protocol(
+                    too_many_final_findings_candidates_error(),
+                ));
             }
             match parse_single_findings_candidate(review_id, title, content_candidate) {
                 Ok(findings) => valid_candidates.push(findings),
@@ -2150,17 +2164,18 @@ fn parse_final_findings_candidates(
         {
             return Ok(first.clone());
         }
-        return Err(AppError::ai_review(
+        return Err(FinalFindingsParseFailure::Malformed(AppError::ai_review(
             ReviewErrorCode::AiResponseParseFailed,
             "AI review returned conflicting findings payloads",
-        ));
+        )));
     }
-    Err(last_error.unwrap_or_else(|| {
-        AppError::ai_review(
+    match last_error {
+        Some(error) => Err(FinalFindingsParseFailure::Malformed(error)),
+        None => Err(FinalFindingsParseFailure::Protocol(AppError::ai_review(
             ReviewErrorCode::AiResponseParseFailed,
-            "AI review API returned no valid findings payload",
-        )
-    }))
+            "AI review API returned no findings payload",
+        ))),
+    }
 }
 
 fn too_many_final_findings_candidates_error() -> AppError {
@@ -2192,17 +2207,6 @@ fn canonical_findings(findings: &[Finding]) -> Vec<Finding> {
     });
     canonical.dedup();
     canonical
-}
-
-fn has_final_findings_candidate(message: &OpenAiMessage) -> bool {
-    message
-        .tool_calls
-        .iter()
-        .any(|tool_call| tool_call.function.name == "submit_review_findings")
-        || message
-            .content
-            .as_deref()
-            .is_some_and(|content| !content.trim().is_empty())
 }
 
 #[cfg(test)]
@@ -3905,6 +3909,72 @@ mod tests {
                 .map(|failure| failure.code),
             Some(ReviewErrorCode::AiResponseParseFailed)
         );
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn excess_final_findings_candidates_do_not_retry() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let request_count_for_server = Arc::clone(&request_count);
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request_count = Arc::clone(&request_count_for_server);
+                tokio::spawn(async move {
+                    request_count.fetch_add(1, Ordering::SeqCst);
+                    let _request = read_http_json_request(&mut stream).await;
+                    let tool_calls = (0..=MAX_FINAL_FINDINGS_CANDIDATES)
+                        .map(|index| {
+                            serde_json::json!({
+                                "id": format!("submit_{index}"),
+                                "type": "function",
+                                "function": {
+                                    "name": "submit_review_findings",
+                                    "arguments": "{\"findings\":[]}"
+                                }
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let body = serde_json::json!({
+                        "choices": [{
+                            "finish_reason": "tool_calls",
+                            "message": {"tool_calls": tool_calls}
+                        }]
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    stream.write_all(body.as_bytes()).await.unwrap();
+                });
+            }
+        });
+
+        let config = AiReviewConfig {
+            base_url: format!("http://{addr}"),
+            ..test_ai_review_config()
+        };
+        let changes = vec![GitLabChange {
+            old_path: "src/lib.rs".into(),
+            new_path: "src/lib.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "@@ -1,0 +1,1 @@\n+panic!();\n".into(),
+        }];
+
+        let execution = run_ai_review_execution_with_context(&config, &changes, None, None).await;
+        let error = execution.result.unwrap_err();
+
+        assert_eq!(
+            error.review_failure().map(|failure| failure.code),
+            Some(ReviewErrorCode::AiResponseParseFailed)
+        );
+        assert!(error.to_string().contains("more than 8"));
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
     }
 
