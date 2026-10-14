@@ -535,6 +535,7 @@ max_batches = 6
         let rules = Ruleset::from_toml(include_str!("../../rules.example.toml")).unwrap();
 
         assert_eq!(rules.ai_review_count(), 1);
+        assert_eq!(rules.script_task_count(), 0);
         assert_eq!(rules.max_concurrent_reviews(), 4);
         let reviews = rules.ai_reviews_by_ids(&["ai-review".into()]);
         assert_eq!(reviews.len(), 1);

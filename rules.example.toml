@@ -14,6 +14,16 @@ max_tool_calls = 35
 max_tool_result_bytes = 60000
 max_tool_total_bytes = 40000
 
+# Optional script task example. Add the check to the runner host and set
+# enabled = true when it is ready to run.
+[[script_tasks]]
+enabled = false
+id = "example-check"
+title = "Example check"
+command = "python scripts/check.py"
+timeout_seconds = 60
+max_concurrent = 1
+
 [[ai_reviews]]
 enabled = true
 id = "ai-review"
