@@ -785,6 +785,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn script_logs_are_capped_without_failing_the_check() {
         let temp = tempfile::tempdir().unwrap();
@@ -819,6 +820,7 @@ mod tests {
         assert!(fs::metadata(result.run_log_path).unwrap().len() <= 10 * 1024 * 1024);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn oversized_result_file_terminates_a_still_running_check() {
         let temp = tempfile::tempdir().unwrap();
@@ -862,6 +864,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn oversized_result_from_failed_check_is_removed() {
         let temp = tempfile::tempdir().unwrap();
