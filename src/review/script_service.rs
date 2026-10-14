@@ -46,7 +46,7 @@ impl ScriptTaskService {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn with_work_root(mut self, work_root: std::path::PathBuf) -> Self {
         self.work_root = Some(work_root);
         self
