@@ -22,6 +22,28 @@ pub(crate) fn accepted(review_run_id: String) -> axum::response::Response {
         .into_response()
 }
 
+pub(crate) fn accepted_runs(
+    review_run_id: String,
+    results: Vec<serde_json::Value>,
+) -> axum::response::Response {
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({ "accepted": true, "review_run_id": review_run_id, "results": results })),
+    )
+        .into_response()
+}
+
+pub(crate) fn dispatch_rejected(
+    review_run_id: String,
+    results: Vec<serde_json::Value>,
+    reason: &str,
+) -> axum::response::Response {
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({ "accepted": false, "skipped": true, "reason": reason, "review_run_id": review_run_id, "results": results })),
+    ).into_response()
+}
+
 pub(crate) fn ignored(review_run_id: String, reason: &str) -> axum::response::Response {
     (
         StatusCode::ACCEPTED,

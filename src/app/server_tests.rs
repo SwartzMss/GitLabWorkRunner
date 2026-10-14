@@ -20,6 +20,20 @@ async fn test_state(
     rules_file: &NamedTempFile,
     max_concurrent_reviews: usize,
 ) -> Arc<AppState> {
+    let rules_text = std::fs::read_to_string(rules_file.path()).unwrap_or_default();
+    if rules_text.contains("[ai_review]") {
+        let insertion = format!("[ai_review]\nmax_concurrent_reviews = {max_concurrent_reviews}\n");
+        let adjusted = rules_text.replacen("[ai_review]", &insertion, 1);
+        std::fs::write(rules_file.path(), adjusted).unwrap();
+    } else {
+        std::fs::write(
+            rules_file.path(),
+            format!(
+                "[ai_review]\nmax_concurrent_reviews = {max_concurrent_reviews}\n\n{rules_text}"
+            ),
+        )
+        .unwrap();
+    }
     let store = StateStore::connect("sqlite::memory:").await.unwrap();
     store.migrate().await.unwrap();
     Arc::new(AppState {
@@ -27,7 +41,6 @@ async fn test_state(
             server: ServerConfig {
                 bind: "127.0.0.1:0".into(),
                 webhook_secret: "secret".into(),
-                max_concurrent_reviews,
             },
             gitlab: GitLabConfig {
                 base_url: gitlab_base_url,
@@ -47,6 +60,7 @@ async fn test_state(
         },
         store,
         active_reviews: Arc::new(ActiveReviews::default()),
+        script_tasks: Arc::new(ScriptTaskScheduler::default()),
     })
 }
 
@@ -91,6 +105,7 @@ timeout_seconds = 10
             ai_base_url
         ),
     )
+    .ok()
     .unwrap();
 
     let state = test_state("http://127.0.0.1:1".into(), &rules_file, 4).await;
@@ -128,7 +143,7 @@ timeout_seconds = 10
 }
 
 #[tokio::test]
-async fn legacy_script_only_create_note_is_not_queued() {
+async fn script_only_create_note_is_queued_independently() {
     let rules_file = NamedTempFile::new().unwrap();
     std::fs::write(
         rules_file.path(),
@@ -139,6 +154,11 @@ title = "AI Review"
 base_url = "http://127.0.0.1:1/v1"
 api_key = "test"
 model = "test"
+
+[[script_tasks]]
+id = "legacy-script"
+title = "Legacy script"
+command = "echo check"
 "#,
     )
     .unwrap();
@@ -172,8 +192,157 @@ model = "test"
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["accepted"], true);
+    assert_eq!(body["results"][0]["type"], "script_task");
+    assert_eq!(body["results"][0]["id"], "legacy-script");
+    assert_eq!(body["results"][0]["status"], "started");
+}
+
+#[tokio::test]
+async fn script_tasks_still_start_when_ai_review_is_already_running() {
+    let rules_file = NamedTempFile::new().unwrap();
+    std::fs::write(
+        rules_file.path(),
+        r#"
+[[ai_reviews]]
+id = "ai-check"
+title = "AI check"
+base_url = "http://127.0.0.1:1/v1"
+api_key = "test"
+model = "test"
+
+[[script_tasks]]
+id = "script-check"
+title = "Script check"
+command = "echo check"
+"#,
+    )
+    .unwrap();
+    let state = test_state("http://127.0.0.1:1".into(), &rules_file, 1).await;
+    let active = state
+        .active_reviews
+        .try_start(
+            ActiveReviewKey {
+                project_id: 123,
+                mr_iid: 45,
+                commit_sha: "abc123".into(),
+            },
+            "rr-existing".into(),
+            1,
+        )
+        .ok()
+        .unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert("X-Gitlab-Token", HeaderValue::from_static("secret"));
+    let response = gitlab_webhook(
+        State(state), headers,
+        Bytes::from_static(br#"{
+            "object_kind":"note","project_id":123,
+            "object_attributes":{"id":987,"note":"@ai-check @script-check","noteable_type":"MergeRequest","action":"create"},
+            "merge_request":{"iid":45,"last_commit":{"id":"abc123"}}
+        }"#),
+    ).await.into_response();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["accepted"], true);
+    assert!(body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|result| result["type"] == "script_task" && result["status"] == "started"));
+    drop(active.guard);
+}
+
+#[tokio::test]
+async fn script_task_at_its_limit_is_rejected_without_waiting() {
+    let rules_file = NamedTempFile::new().unwrap();
+    std::fs::write(
+        rules_file.path(),
+        r#"
+[[script_tasks]]
+id = "script-check"
+title = "Script check"
+command = "echo check"
+max_concurrent = 1
+"#,
+    )
+    .unwrap();
+    let state = test_state("http://127.0.0.1:1".into(), &rules_file, 1).await;
+    let permit = state.script_tasks.try_acquire("script-check", 1).unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert("X-Gitlab-Token", HeaderValue::from_static("secret"));
+    let response = gitlab_webhook(
+        State(state),
+        headers,
+        Bytes::from_static(br#"{
+            "object_kind":"note","project_id":123,
+            "object_attributes":{"id":987,"note":"@script-check","noteable_type":"MergeRequest","action":"create"},
+            "merge_request":{"iid":45,"last_commit":{"id":"abc123"}}
+        }"#),
+    )
+    .await
+    .into_response();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
     assert_eq!(body["accepted"], false);
-    assert_eq!(body["reason"], "no_matching_manual_review");
+    assert_eq!(body["reason"], "script_task_busy");
+    assert_eq!(body["results"][0]["status"], "busy");
+    assert_eq!(body["results"][0]["active_count"], 1);
+    drop(permit);
+}
+
+#[tokio::test]
+async fn script_task_at_its_limit_does_not_block_ai_review() {
+    let rules_file = NamedTempFile::new().unwrap();
+    std::fs::write(
+        rules_file.path(),
+        r#"
+[[ai_reviews]]
+id = "ai-check"
+title = "AI check"
+base_url = "http://127.0.0.1:1/v1"
+api_key = "test"
+model = "test"
+
+[[script_tasks]]
+id = "script-check"
+title = "Script check"
+command = "echo check"
+max_concurrent = 1
+"#,
+    )
+    .unwrap();
+    let state = test_state("http://127.0.0.1:1".into(), &rules_file, 1).await;
+    let permit = state.script_tasks.try_acquire("script-check", 1).unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert("X-Gitlab-Token", HeaderValue::from_static("secret"));
+    let response = gitlab_webhook(
+        State(state),
+        headers,
+        Bytes::from_static(br#"{
+            "object_kind":"note","project_id":123,
+            "object_attributes":{"id":987,"note":"@ai-check @script-check","noteable_type":"MergeRequest","action":"create"},
+            "merge_request":{"iid":45,"last_commit":{"id":"abc123"}}
+        }"#),
+    )
+    .await
+    .into_response();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(body["accepted"], true);
+    assert!(body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|result| { result["type"] == "ai_review" && result["status"] == "started" }));
+    assert!(body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|result| { result["type"] == "script_task" && result["status"] == "busy" }));
+    drop(permit);
 }
 
 #[tokio::test]

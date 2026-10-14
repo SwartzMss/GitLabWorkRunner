@@ -4,24 +4,21 @@
 
 GitLabWorkRunner is a GitLab-specific Merge Request review service. It receives GitLab webhooks, runs explicitly configured review tasks when a user requests them from an MR comment, and publishes findings back to GitLab MR Discussions.
 
-The current service is comment-driven. Merge request events are accepted for visibility and webhook testing, but they are ignored with reason `merge_request_events_manual_triggers_only`; they do not enter the review queue.
+The current service is comment-driven. Merge request events are accepted for visibility and webhook testing, but they are ignored with reason `merge_request_events_manual_triggers_only`; they do not enter the task queue. MR note commands can start AI reviews and script checks as separate tasks.
 
 The review loop is:
 
 1. Receive a GitLab MR note event containing a standalone `@id`.
 2. Validate the webhook token.
-3. Resolve the requested `[[ai_reviews]]` entries by exact id.
-4. Guard against duplicate in-flight work for `project_id + mr_iid + commit_sha`.
-5. Fetch MR changes through the GitLab API.
-6. Parse the diff and map added lines.
-7. Run the selected AI reviews.
-8. Publish line-level or MR-level comments.
-9. Store review runs, task runs, findings, and published comments in SQLite.
+3. Resolve the requested `[[ai_reviews]]` and `[[script_tasks]]` entries by exact id.
+4. Admit AI and script work through independent in-process concurrency guards.
+5. Run each accepted task independently and publish its comments to the MR.
+6. Store each run, task, finding, and published comment in SQLite.
 
 ## Non-Goals
 
 - It is not a GitLab Runner replacement.
-- It does not automatically execute CI scripts from the target repository.
+- It does not automatically run CI configuration from the target repository; scripts are administrator-configured commands.
 - It does not support GitHub, Bitbucket, Gitea, or other review platforms.
 - It does not implement a container sandbox or distributed scheduler.
 - It does not provide a general LLM plugin system; AI review currently uses OpenAI-compatible Chat Completions.
@@ -32,11 +29,8 @@ The review loop is:
 GitLab MR Note Event
   -> Webhook Server
   -> Manual Command Selector
-  -> Active Review Guard
-  -> GitLab API Client
-  -> Diff Parser
-  -> Review Engine
-  -> Comment Builder
+  -> independent AI Review guard / per-script concurrency guard
+  -> AI Review service / script runner
   -> GitLab Discussion Publisher
   -> SQLite Store
 ```
@@ -67,15 +61,16 @@ GitLab 14.5 note payloads may omit `object_attributes.action`; missing action is
 Manual commands are standalone tokens in MR comments:
 
 ```text
-@ai-review
+@ai-review @lint
 ```
 
 Selection rules:
 
-- `@id` matches `[[ai_reviews]].id`.
+- `@id` matches the id of an `[[ai_reviews]]` or `[[script_tasks]]` entry.
 - Unknown ids are ignored.
 - Issue, wiki, work item, and other non-MR comments are ignored.
-- A single comment may request multiple configured AI reviews.
+- A single comment may request multiple configured tasks.
+- Script and AI work run independently; neither consumes the other's concurrency limit.
 - The same commit can be triggered again after the current run finishes.
 
 The current implementation does not perform an additional GitLab role check for the comment author. Any user who can comment on the MR and knows a configured `@id` can request that task.
@@ -90,7 +85,9 @@ project_id + mr_iid + commit_sha
 
 If the same key is already running, the new request is skipped. For MR note triggers, the service adds an `eyes` emoji to the triggering note and posts an MR-level comment telling the user that the current commit is already being reviewed.
 
-`[server].max_concurrent_reviews` limits total in-process review runs. When the limit is reached, the new request is skipped and the MR receives a queue-busy comment.
+`[ai_review].max_concurrent_reviews` limits process-wide AI Review runs (default `4`). Each script uses its own `[[script_tasks]].max_concurrent` limit (default `1`). A full script limit rejects that invocation immediately and posts an MR comment; there is no queue. A script's `timeout_seconds` defaults to `60`.
+
+The runner passes each script the absolute source directory and a run-specific `result.txt` path as command arguments. Exit code `0` means execution succeeded; every non-zero code or timeout fails the task. An empty result file posts a clean-result MR comment. Non-empty text is posted as an MR comment; `path:line:message` rows become inline comments only when they match an added line in the same commit's diff.
 
 The guard is process-local. Multi-instance deployments need a shared lock in SQLite/PostgreSQL or another coordination layer.
 
@@ -169,6 +166,10 @@ Downloaded archive zip bytes stay in memory and are not written to disk. When re
 
 After completion or failure, AI Review deletes the current context run directory.
 
+Each script run has its own directory under `work/script_tasks/<project>/<mr>/<commit>/<run_id>/<task_id>`. The source snapshot is removed when execution ends; `run.log` retains at most 10 MiB while stdout and stderr continue to be drained. Results larger than 1 MiB are rejected and removed, and a running process is stopped once the limit is detected. The entire script run directory remains available for 24 hours after completion, then startup or hourly cleanup removes it. Cleanup skips directories while execution or comment publishing is active.
+
+Script timeouts kill a dedicated process group on Unix. On Windows, the runner uses the system `taskkill` command with a bounded wait; if it fails, the runner falls back to killing the direct child and spawned descendants may remain.
+
 The service cleans stale work directories older than 24 hours on startup and repeats cleanup hourly while running. Cleanup failures are logged as warnings and do not block reviews.
 
 ## Configuration
@@ -179,7 +180,6 @@ Service configuration lives in `config.toml`:
 [server]
 bind = "0.0.0.0:8080"
 webhook_secret = "change-me"
-max_concurrent_reviews = 4
 
 [gitlab]
 base_url = "https://gitlab.example.com"
@@ -201,6 +201,8 @@ max_extracted_bytes = 209715200
 max_single_file_bytes = 10485760
 max_entry_path_bytes = 512
 ```
+
+Concurrency belongs in `rules.toml`: `[ai_review].max_concurrent_reviews` controls AI runs, and each `[[script_tasks]]` entry controls its own concurrency.
 
 Review configuration lives in `rules.toml`; see `rules.example.toml` for a complete example.
 

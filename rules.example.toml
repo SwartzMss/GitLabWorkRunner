@@ -4,6 +4,8 @@
 # The built-in reviewer system prompt always applies; extra_instructions is appended
 # to the system prompt as administrator review policy.
 [ai_review]
+# Process-wide maximum number of concurrently running AI review requests.
+max_concurrent_reviews = 4
 extra_instructions = ""
 # Built-in read-only context tools are enabled by default. The runner controls call count
 # rounds, call count, and result size.

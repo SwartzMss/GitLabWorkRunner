@@ -248,6 +248,17 @@ impl ReviewService {
             });
         }
 
+        let mut selected_trigger_ids = ai_reviews
+            .iter()
+            .map(|review| review.id.clone())
+            .collect::<Vec<_>>();
+        selected_trigger_ids.extend(
+            self.ruleset
+                .script_tasks_by_ids(&requested_ids)
+                .into_iter()
+                .map(|task| task.id),
+        );
+
         let review_run_id = self.review_run_id();
         let requested_ids_json =
             serde_json::to_string(&requested_ids).unwrap_or_else(|_| "[]".into());
@@ -263,11 +274,12 @@ impl ReviewService {
                 note_id: Some(event.note_id),
                 requested_ids_json: &requested_ids_json,
                 selected_ai_reviews: ai_reviews.len(),
+                selected_script_tasks: 0,
             })
             .await?;
 
         let result = self
-            .review_merge_request_note_inner(event, ai_reviews, requested_ids)
+            .review_merge_request_note_inner(event, ai_reviews, selected_trigger_ids)
             .await;
         match &result {
             Ok(summary) => {
@@ -310,7 +322,7 @@ impl ReviewService {
         ai_reviews: Vec<AiReviewConfig>,
         requested_ids: Vec<String>,
     ) -> AppResult<ReviewSummary> {
-        let selected_ids = selected_manual_ids(&ai_reviews);
+        let selected_ids = requested_ids.clone();
         let review_request = manual_review_request_text(&event.note, &selected_ids);
         let started = Instant::now();
         info!(
@@ -725,7 +737,7 @@ impl ReviewService {
     }
 }
 
-fn discussion_position(
+pub(crate) fn discussion_position(
     changes: &crate::gitlab::MergeRequestChanges,
     draft: &CommentDraft,
     new_line: u32,
@@ -1458,10 +1470,6 @@ pub(crate) fn manual_review_request_text(text: &str, requested_ids: &[String]) -
         .join(" ");
     let request = request.trim();
     (!request.is_empty()).then(|| request.to_string())
-}
-
-fn selected_manual_ids(ai_reviews: &[AiReviewConfig]) -> Vec<String> {
-    ai_reviews.iter().map(|review| review.id.clone()).collect()
 }
 
 fn trim_manual_trigger_token(raw: &str) -> &str {
