@@ -59,11 +59,15 @@ pub(crate) struct ChatMessage {
 #[derive(Deserialize)]
 pub(crate) struct OpenAiChatResponse {
     pub(crate) choices: Vec<OpenAiChoice>,
+    #[serde(default)]
+    pub(crate) usage: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
 pub(crate) struct OpenAiChoice {
     pub(crate) message: OpenAiMessage,
+    #[serde(default)]
+    pub(crate) finish_reason: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -91,7 +95,6 @@ pub(crate) struct OpenAiToolCallFunction {
 
 #[derive(Deserialize)]
 pub(crate) struct AiFindingsResponse {
-    #[serde(default)]
     pub(crate) findings: Vec<AiFinding>,
 }
 
@@ -99,7 +102,6 @@ pub(crate) struct AiFindingsResponse {
 pub(crate) struct AiFinding {
     pub(crate) path: String,
     pub(crate) line: u32,
-    #[serde(default)]
     pub(crate) severity: String,
     #[serde(default)]
     pub(crate) title: String,

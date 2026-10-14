@@ -131,7 +131,7 @@ async fn reviews_merge_request_and_records_state() {
                                     "findings": [{
                                         "path": "src/lib.rs",
                                         "line": 1,
-                                        "severity": "warning",
+                                        "severity": "error",
                                         "title": "Avoid unwrap",
                                         "message": "Do not unwrap."
                                     }]
@@ -237,14 +237,14 @@ async fn continues_publishing_review_comments_after_one_comment_fails() {
                                         {
                                             "path": "src/lib.rs",
                                             "line": 1,
-                                            "severity": "warning",
+                                            "severity": "error",
                                             "title": "AI finding one",
                                             "message": "First finding."
                                         },
                                         {
                                             "path": "src/lib.rs",
                                             "line": 2,
-                                            "severity": "warning",
+                                            "severity": "error",
                                             "title": "AI finding two",
                                             "message": "Second finding."
                                         }
@@ -548,7 +548,7 @@ async fn reviews_merge_request_with_ai_review() {
                                     "findings": [{
                                         "path": "src/lib.rs",
                                         "line": 1,
-                                        "severity": "warning",
+                                        "severity": "error",
                                         "title": "Avoid unwrap",
                                         "message": "Handle the None case instead of unwrapping."
                                     }]
@@ -740,7 +740,7 @@ timeout_seconds = 10
     assert_eq!(summary.findings, 0);
     assert_eq!(summary.comments, 1);
     assert!(!summary.skipped);
-    assert_eq!(ai_request_count.load(Ordering::SeqCst), 2);
+    assert_eq!(ai_request_count.load(Ordering::SeqCst), 3);
     assert_eq!(discussion_count.load(Ordering::SeqCst), 1);
 }
 
@@ -1983,7 +1983,7 @@ async fn manual_note_runs_ai_review() {
                                     "findings": [{
                                         "path": "src/lib.rs",
                                         "line": 1,
-                                        "severity": "warning",
+                                        "severity": "error",
                                         "title": "Manual AI finding",
                                         "message": "This manual trigger should publish."
                                     }]
@@ -2206,7 +2206,7 @@ timeout_seconds = 10
     assert_eq!(summary.findings, 0);
     assert_eq!(summary.comments, 1);
     assert!(!summary.skipped);
-    assert_eq!(ai_request_count.load(Ordering::SeqCst), 2);
+    assert_eq!(ai_request_count.load(Ordering::SeqCst), 3);
     assert_eq!(discussion_count.load(Ordering::SeqCst), 1);
     assert_eq!(emoji_count.load(Ordering::SeqCst), 1);
 }

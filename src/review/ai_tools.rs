@@ -111,14 +111,14 @@ pub(crate) fn review_findings_tool() -> OpenAiTool {
                         "items": {
                             "type": "object",
                             "properties": {
-                                "path": { "type": "string" },
-                                "line": { "type": "integer" },
+                                "path": { "type": "string", "minLength": 1 },
+                                "line": { "type": "integer", "minimum": 1 },
                                 "severity": {
                                     "type": "string",
                                     "enum": ["error"]
                                 },
-                                "title": { "type": "string" },
-                                "message": { "type": "string" }
+                                "title": { "type": "string", "minLength": 1 },
+                                "message": { "type": "string", "minLength": 1 }
                             },
                             "required": ["path", "line", "severity", "title", "message"],
                             "additionalProperties": false

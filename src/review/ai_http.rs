@@ -4,12 +4,14 @@ use crate::{
 };
 use std::{
     error::Error,
-    io,
+    io::{self, Read},
     sync::OnceLock,
     thread,
     time::{Duration, Instant},
 };
 use tracing::{info, warn, Span};
+
+const MAX_AI_RESPONSE_BODY_BYTES: u64 = 4 * 1024 * 1024;
 
 pub(crate) static AI_HTTP_CLIENT: OnceLock<Result<ureq::Agent, String>> = OnceLock::new();
 
@@ -198,7 +200,7 @@ fn perform_ai_review_http_attempt_blocking(
         "AI review blocking API response headers received"
     );
     let body_started = Instant::now();
-    let body = match response.into_string() {
+    let body = match read_ai_response_body(response.into_reader(), timeout_code) {
         Ok(body) => body,
         Err(err) => {
             warn!(
@@ -210,15 +212,7 @@ fn perform_ai_review_http_attempt_blocking(
                 error = %err,
                 "AI review blocking API response body read failed"
             );
-            let code = if is_io_timeout(&err) {
-                timeout_code
-            } else {
-                ReviewErrorCode::AiRequestFailed
-            };
-            return Err(AppError::ai_review(
-                code,
-                format!("AI review blocking API response body read failed: {err}"),
-            ));
+            return Err(err);
         }
     };
     info!(
@@ -230,6 +224,36 @@ fn perform_ai_review_http_attempt_blocking(
         "AI review blocking API response body received"
     );
     Ok(AiReviewHttpResponse { status, body })
+}
+
+fn read_ai_response_body(reader: impl Read, timeout_code: ReviewErrorCode) -> AppResult<String> {
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_AI_RESPONSE_BODY_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            let code = if is_io_timeout(&error) {
+                timeout_code
+            } else {
+                ReviewErrorCode::AiRequestFailed
+            };
+            AppError::ai_review(
+                code,
+                format!("AI review blocking API response body read failed: {error}"),
+            )
+        })?;
+    if bytes.len() as u64 > MAX_AI_RESPONSE_BODY_BYTES {
+        return Err(AppError::ai_review(
+            ReviewErrorCode::AiRequestFailed,
+            format!("AI review API response body exceeded {MAX_AI_RESPONSE_BODY_BYTES} bytes"),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|error| {
+        AppError::ai_review(
+            ReviewErrorCode::AiRequestFailed,
+            format!("AI review API response body was not valid UTF-8: {error}"),
+        )
+    })
 }
 
 fn ureq_response_from_result(
@@ -262,4 +286,35 @@ fn is_ureq_timeout(err: &ureq::Error) -> bool {
 
 fn is_io_timeout(err: &io::Error) -> bool {
     err.kind() == io::ErrorKind::TimedOut
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn accepts_response_body_at_limit() {
+        let body = vec![b'a'; MAX_AI_RESPONSE_BODY_BYTES as usize];
+
+        let parsed =
+            read_ai_response_body(Cursor::new(body), ReviewErrorCode::AiRequestTimeout).unwrap();
+
+        assert_eq!(parsed.len() as u64, MAX_AI_RESPONSE_BODY_BYTES);
+    }
+
+    #[test]
+    fn rejects_response_body_over_limit() {
+        let body = vec![b'a'; MAX_AI_RESPONSE_BODY_BYTES as usize + 1];
+
+        let error = read_ai_response_body(Cursor::new(body), ReviewErrorCode::AiRequestTimeout)
+            .unwrap_err();
+
+        assert_eq!(
+            error.review_failure().map(|failure| failure.code),
+            Some(ReviewErrorCode::AiRequestFailed)
+        );
+        assert!(error.to_string().contains("exceeded"));
+        assert!(!is_retryable_ai_error(&error));
+    }
 }
