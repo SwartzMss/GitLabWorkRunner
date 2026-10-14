@@ -690,6 +690,7 @@ mod tests {
 
     fn test_config() -> AiReviewConfig {
         AiReviewConfig {
+            enabled: true,
             id: "ai-review".into(),
             title: "AI Review".into(),
             base_url: "https://ai.example.com".into(),
@@ -838,6 +839,7 @@ mod tests {
         let path = temp.path().join("large.txt");
         std::fs::write(&path, "一二三四五六").unwrap();
         let config = AiReviewConfig {
+            enabled: true,
             max_tool_result_bytes: 10,
             ..test_config()
         };

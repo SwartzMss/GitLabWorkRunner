@@ -2474,6 +2474,7 @@ mod tests {
 
     fn test_ai_review_config() -> AiReviewConfig {
         AiReviewConfig {
+            enabled: true,
             id: "ai-review".into(),
             title: "AI Review".into(),
             base_url: "https://ai.example.com".into(),
@@ -2594,6 +2595,7 @@ mod tests {
             }
         });
         let config = AiReviewConfig {
+            enabled: true,
             base_url: format!("http://{addr}"),
             ..test_ai_review_config()
         };
@@ -2668,6 +2670,7 @@ mod tests {
             }
         });
         let config = AiReviewConfig {
+            enabled: true,
             base_url: format!("http://{addr}"),
             ..test_ai_review_config()
         };
@@ -3354,6 +3357,7 @@ mod tests {
     #[test]
     fn prompt_includes_extra_ai_review_instructions() {
         let config = AiReviewConfig {
+            enabled: true,
             extra_instructions: "Focus on C++ lifetime bugs.".into(),
             ..test_ai_review_config()
         };
@@ -3812,6 +3816,7 @@ mod tests {
         });
 
         let config = AiReviewConfig {
+            enabled: true,
             base_url: format!("http://{addr}"),
             ..test_ai_review_config()
         };
@@ -3861,6 +3866,7 @@ mod tests {
         });
 
         let config = AiReviewConfig {
+            enabled: true,
             base_url: format!("http://{addr}"),
             ..test_ai_review_config()
         };
@@ -3911,6 +3917,7 @@ mod tests {
         });
 
         let config = AiReviewConfig {
+            enabled: true,
             base_url: format!("http://{addr}"),
             ..test_ai_review_config()
         };
@@ -3979,6 +3986,7 @@ mod tests {
         });
 
         let config = AiReviewConfig {
+            enabled: true,
             base_url: format!("http://{addr}"),
             ..test_ai_review_config()
         };
@@ -4038,6 +4046,7 @@ mod tests {
         });
 
         let config = AiReviewConfig {
+            enabled: true,
             base_url: format!("http://{addr}"),
             ..test_ai_review_config()
         };
@@ -4114,6 +4123,7 @@ mod tests {
         });
 
         let config = AiReviewConfig {
+            enabled: true,
             base_url: format!("http://{addr}"),
             ..test_ai_review_config()
         };
@@ -4197,6 +4207,7 @@ mod tests {
         });
 
         let config = AiReviewConfig {
+            enabled: true,
             base_url: format!("http://{addr}"),
             ..test_ai_review_config()
         };
@@ -4312,6 +4323,7 @@ mod tests {
         std::fs::create_dir_all(source.path().join("src")).unwrap();
         std::fs::write(source.path().join("src/lib.rs"), "panic!();\n").unwrap();
         let config = AiReviewConfig {
+            enabled: true,
             base_url: format!("http://{addr}"),
             ..test_ai_review_config()
         };
@@ -4388,6 +4400,7 @@ mod tests {
         });
 
         let config = AiReviewConfig {
+            enabled: true,
             base_url: format!("http://{addr}"),
             ..test_ai_review_config()
         };
@@ -4485,6 +4498,7 @@ mod tests {
         });
 
         let config = AiReviewConfig {
+            enabled: true,
             base_url: format!("http://{}", addr),
             max_tool_calls: 1,
             ..test_ai_review_config()
@@ -4582,6 +4596,7 @@ mod tests {
         });
 
         let config = AiReviewConfig {
+            enabled: true,
             base_url: format!("http://{addr}"),
             ..test_ai_review_config()
         };
@@ -4659,6 +4674,7 @@ mod tests {
         });
 
         let config = AiReviewConfig {
+            enabled: true,
             base_url: format!("http://{addr}"),
             max_tool_rounds: 1,
             max_tool_calls: 30,
@@ -4716,6 +4732,7 @@ mod tests {
         });
 
         let config = AiReviewConfig {
+            enabled: true,
             base_url: format!("http://{addr}"),
             ..test_ai_review_config()
         };
@@ -4798,6 +4815,7 @@ mod tests {
         });
 
         let config = AiReviewConfig {
+            enabled: true,
             base_url: format!("http://{addr}"),
             max_tool_total_bytes: 40,
             ..test_ai_review_config()
@@ -4902,6 +4920,7 @@ mod tests {
         });
 
         let config = AiReviewConfig {
+            enabled: true,
             base_url: format!("http://{addr}"),
             max_tool_calls: 1,
             ..test_ai_review_config()
@@ -4985,6 +5004,7 @@ mod tests {
         });
 
         let config = AiReviewConfig {
+            enabled: true,
             base_url: format!("http://{}", addr),
             ..test_ai_review_config()
         };
@@ -5098,6 +5118,7 @@ mod tests {
         });
 
         let config = AiReviewConfig {
+            enabled: true,
             base_url: format!("http://{}", addr),
             ..test_ai_review_config()
         };
@@ -5156,6 +5177,7 @@ mod tests {
         });
 
         let config = AiReviewConfig {
+            enabled: true,
             base_url: format!("http://{addr}"),
             ..test_ai_review_config()
         };
@@ -5213,6 +5235,7 @@ mod tests {
         });
 
         let config = AiReviewConfig {
+            enabled: true,
             base_url: format!("http://{}", addr),
             timeout_seconds: 2,
             ..test_ai_review_config()
@@ -5255,6 +5278,7 @@ mod tests {
         });
 
         let config = AiReviewConfig {
+            enabled: true,
             base_url: format!("http://{}", addr),
             timeout_seconds: 4,
             request_timeout_seconds: Some(3),
@@ -5293,6 +5317,7 @@ mod tests {
         });
 
         let config = AiReviewConfig {
+            enabled: true,
             base_url: format!("http://{}", addr),
             timeout_seconds: 10,
             request_timeout_seconds: Some(1),
@@ -5345,6 +5370,7 @@ mod tests {
         });
 
         let config = AiReviewConfig {
+            enabled: true,
             base_url: format!("http://{}", addr),
             timeout_seconds: 10,
             request_timeout_seconds: Some(1),

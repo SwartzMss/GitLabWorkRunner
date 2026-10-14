@@ -659,6 +659,7 @@ mod tests {
             note: "@check".into(),
         };
         let task = ScriptTaskConfig {
+            enabled: true,
             id: "check".into(),
             title: "Check source".into(),
             command: format!(

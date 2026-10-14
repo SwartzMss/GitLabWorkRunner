@@ -1684,6 +1684,7 @@ mod tests {
         .with_review_run_id(run_id)
         .with_ai_execution_seam(seam.clone());
         let review = AiReviewConfig {
+            enabled: true,
             id: format!("review-{suffix}"),
             title: "Review".into(),
             base_url: "http://unused".into(),
@@ -1844,6 +1845,7 @@ mod tests {
         .with_review_run_id(run_id.clone())
         .with_archive_limits(limits);
         let review = AiReviewConfig {
+            enabled: true,
             id: "cleanup-review".into(),
             title: "Cleanup Review".into(),
             base_url: "http://127.0.0.1".into(),
@@ -1985,6 +1987,7 @@ mod tests {
         )
         .with_review_run_id(run_id);
         let review = AiReviewConfig {
+            enabled: true,
             id: "timeout-review".into(),
             title: "Timeout Review".into(),
             base_url: format!("http://{ai_addr}"),

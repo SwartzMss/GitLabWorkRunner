@@ -2,7 +2,7 @@
 
 Language: [简体中文](README.md) | **English**
 
-GitLabWorkRunner is a Rust service for GitLab Merge Request checks. It is triggered by GitLab MR comments, runs configured `[[ai_reviews]]` or `[[script_tasks]]`, and publishes results to GitLab MR Discussions.
+GitLabWorkRunner is a Rust service for GitLab Merge Request checks. It is triggered by GitLab MR comments, runs explicitly enabled `[[ai_reviews]]` or `[[script_tasks]]`, and publishes results to GitLab MR Discussions.
 
 It is not a GitLab Runner replacement. Script tasks run only commands explicitly configured by the administrator in `rules.toml`; repository CI configuration is not run automatically.
 
@@ -223,7 +223,7 @@ The dashboard process does not run migrations. If the database or statistics tab
 
 ## AI Review Config
 
-Tasks are triggered manually from MR comments; MR updates do not run them automatically. `rules.toml` can contain `[ai_review]`, multiple `[[ai_reviews]]`, and multiple `[[script_tasks]]` entries. If the old `config.toml` still contains `[server].max_concurrent_reviews`, startup explains how to move it to `[ai_review].max_concurrent_reviews` in `rules.toml`.
+Tasks are triggered manually from MR comments; MR updates do not run them automatically. `rules.toml` can contain `[ai_review]`, multiple `[[ai_reviews]]`, and multiple `[[script_tasks]]` entries. Each task is disabled by default and must set `enabled = true` to respond to a trigger. Existing entries without `enabled` will become disabled after upgrading; add `enabled = true` to keep them running. If the old `config.toml` still contains `[server].max_concurrent_reviews`, startup explains how to move it to `[ai_review].max_concurrent_reviews` in `rules.toml`.
 
 Recommended `rules.toml` example:
 
@@ -240,6 +240,7 @@ max_tool_result_bytes = 60000
 max_tool_total_bytes = 40000
 
 [[ai_reviews]]
+enabled = true
 id = "ai-review"
 title = "AI Review"
 base_url = "https://api.openai.com/v1"
@@ -251,6 +252,7 @@ max_batch_diff_bytes = 15000
 max_batches = 10
 
 [[script_tasks]]
+enabled = true
 id = "lint"
 title = "Lint check"
 command = "python scripts/lint.py"
@@ -258,6 +260,7 @@ timeout_seconds = 120
 max_concurrent = 2
 
 [[script_tasks]]
+enabled = true
 id = "security-check"
 title = "Security check"
 command = "python scripts/security_check.py"
@@ -306,7 +309,7 @@ After enabling GitLab webhook `Comments`, add standalone commands in an MR comme
 
 An AI Review trigger is skipped while the same `project_id + mr_iid + commit_sha` is still running. It is also skipped when the AI concurrency limit `[ai_review].max_concurrent_reviews` is full. Script tasks check their own per-task limits and remain independent of AI Review activity.
 
-The current implementation does not perform an extra GitLab role check for the comment author. If a user can comment on the MR and the comment contains a valid `[[ai_reviews]].id`, the service runs the matching AI Review. Add a service-side permission check or allowlist if only Maintainers or selected users should be allowed to trigger reviews.
+The current implementation does not perform an extra GitLab role check for the comment author. If a user can comment on the MR and the comment contains the ID of an enabled `[[ai_reviews]]` entry, the service runs the matching AI Review. Add a service-side permission check or allowlist if only Maintainers or selected users should be allowed to trigger reviews.
 
 ## Work Directory Cleanup
 

@@ -95,6 +95,7 @@ async fn non_create_merge_request_note_is_ignored_even_with_manual_command() {
         format!(
             r#"
 [[ai_reviews]]
+enabled = true
 id = "check"
 title = "Check"
 base_url = "{}"
@@ -149,6 +150,7 @@ async fn script_only_create_note_is_queued_independently() {
         rules_file.path(),
         r#"
 [[ai_reviews]]
+enabled = true
 id = "ai-review"
 title = "AI Review"
 base_url = "http://127.0.0.1:1/v1"
@@ -156,6 +158,7 @@ api_key = "test"
 model = "test"
 
 [[script_tasks]]
+enabled = true
 id = "legacy-script"
 title = "Legacy script"
 command = "echo check"
@@ -205,6 +208,7 @@ async fn script_tasks_still_start_when_ai_review_is_already_running() {
         rules_file.path(),
         r#"
 [[ai_reviews]]
+enabled = true
 id = "ai-check"
 title = "AI check"
 base_url = "http://127.0.0.1:1/v1"
@@ -212,6 +216,7 @@ api_key = "test"
 model = "test"
 
 [[script_tasks]]
+enabled = true
 id = "script-check"
 title = "Script check"
 command = "echo check"
@@ -260,6 +265,7 @@ async fn script_task_at_its_limit_is_rejected_without_waiting() {
         rules_file.path(),
         r#"
 [[script_tasks]]
+enabled = true
 id = "script-check"
 title = "Script check"
 command = "echo check"
@@ -299,6 +305,7 @@ async fn script_task_at_its_limit_does_not_block_ai_review() {
         rules_file.path(),
         r#"
 [[ai_reviews]]
+enabled = true
 id = "ai-check"
 title = "AI check"
 base_url = "http://127.0.0.1:1/v1"
@@ -306,6 +313,7 @@ api_key = "test"
 model = "test"
 
 [[script_tasks]]
+enabled = true
 id = "script-check"
 title = "Script check"
 command = "echo check"
@@ -354,6 +362,7 @@ async fn duplicate_running_commit_note_gets_acknowledgement_comment() {
         format!(
             r#"
 [[ai_reviews]]
+enabled = true
 id = "check"
 title = "Check"
 base_url = "{}"
@@ -526,6 +535,7 @@ async fn busy_review_queue_note_gets_acknowledgement_comment() {
         format!(
             r#"
 [[ai_reviews]]
+enabled = true
 id = "check"
 title = "Check"
 base_url = "{}"
@@ -702,6 +712,7 @@ async fn merge_request_webhook_is_ignored_when_review_queue_is_busy() {
         format!(
             r#"
 [[ai_reviews]]
+enabled = true
 id = "check"
 title = "Check"
 base_url = "{}"
@@ -826,6 +837,7 @@ async fn failed_webhook_review_posts_failure_comment() {
         format!(
             r#"
 [[ai_reviews]]
+enabled = true
 id = "check"
 title = "Check"
 base_url = "{}"

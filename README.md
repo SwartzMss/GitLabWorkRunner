@@ -2,7 +2,7 @@
 
 语言：**简体中文** | [English](README.en.md)
 
-GitLabWorkRunner 是一个 Rust 编写的 GitLab Merge Request 检查服务。它通过 GitLab MR 评论触发 `[[ai_reviews]]` 或 `[[script_tasks]]`，并把结果发布到 MR Discussion。
+GitLabWorkRunner 是一个 Rust 编写的 GitLab Merge Request 检查服务。它通过 GitLab MR 评论触发显式启用的 `[[ai_reviews]]` 或 `[[script_tasks]]`，并把结果发布到 MR Discussion。
 
 它不是 GitLab Runner 替代品。脚本任务只运行管理员在 `rules.toml` 中配置的命令，不会自动执行目标仓库里的 CI 配置。
 
@@ -223,7 +223,7 @@ dashboard 进程不会执行 migration。如果数据库或统计表不存在，
 
 ## AI Review 配置
 
-当前通过 MR 评论手动触发任务，不会因为 MR 更新自动执行。`rules.toml` 可包含 `[ai_review]`、多个 `[[ai_reviews]]` 和多个 `[[script_tasks]]`。如果旧 `config.toml` 仍有 `[server].max_concurrent_reviews`，启动时会提示把它迁到 `rules.toml` 的 `[ai_review].max_concurrent_reviews`。
+当前通过 MR 评论手动触发任务，不会因为 MR 更新自动执行。`rules.toml` 可包含 `[ai_review]`、多个 `[[ai_reviews]]` 和多个 `[[script_tasks]]`；每个任务默认关闭，必须设置 `enabled = true` 才会响应触发。已有配置如果没有 `enabled`，升级后会默认关闭，需显式加上 `enabled = true` 才会继续运行。如果旧 `config.toml` 仍有 `[server].max_concurrent_reviews`，启动时会提示把它迁到 `rules.toml` 的 `[ai_review].max_concurrent_reviews`。
 
 推荐 `rules.toml` 示例：
 
@@ -240,6 +240,7 @@ max_tool_result_bytes = 60000
 max_tool_total_bytes = 40000
 
 [[ai_reviews]]
+enabled = true
 id = "ai-review"
 title = "AI Review"
 base_url = "https://api.openai.com/v1"
@@ -251,6 +252,7 @@ max_batch_diff_bytes = 15000
 max_batches = 10
 
 [[script_tasks]]
+enabled = true
 id = "lint"
 title = "Lint check"
 command = "python scripts/lint.py"
@@ -258,6 +260,7 @@ timeout_seconds = 120
 max_concurrent = 2
 
 [[script_tasks]]
+enabled = true
 id = "security-check"
 title = "Security check"
 command = "python scripts/security_check.py"
@@ -376,7 +379,7 @@ Dashboard 的任务明细会显示执行模式、降级原因、context 耗时�
 
 AI Review 在同一个 `project_id + mr_iid + commit_sha` 仍运行时会跳过重复触发；如果 AI 并发数达到 `[ai_review].max_concurrent_reviews`，也会回复队列繁忙提示。脚本任务独立检查各自的并发限制，不会被 AI Review 的重复运行或并发上限拦截。
 
-当前实现不会额外校验评论人的 GitLab 角色；只要用户能在 MR 评论，并且评论内容包含合法的 `[[ai_reviews]].id`，服务就会执行对应 AI Review。如果需要限制只有 Maintainer 或指定用户可以触发，需要在服务侧增加权限校验或 allowlist。
+当前实现不会额外校验评论人的 GitLab 角色；只要用户能在 MR 评论，并且评论内容包含已启用 `[[ai_reviews]]` 的合法 `id`，服务就会执行对应 AI Review。如果需要限制只有 Maintainer 或指定用户可以触发，需要在服务侧增加权限校验或 allowlist。
 
 ## 工作目录清理
 

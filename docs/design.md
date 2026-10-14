@@ -85,7 +85,7 @@ project_id + mr_iid + commit_sha
 
 If the same key is already running, the new request is skipped. For MR note triggers, the service adds an `eyes` emoji to the triggering note and posts an MR-level comment telling the user that the current commit is already being reviewed.
 
-`[ai_review].max_concurrent_reviews` limits process-wide AI Review runs (default `4`). Each script uses its own `[[script_tasks]].max_concurrent` limit (default `1`). A full script limit rejects that invocation immediately and posts an MR comment; there is no queue. A script's `timeout_seconds` defaults to `60`.
+Every `[[ai_reviews]]` and `[[script_tasks]]` entry is disabled by default and must set `enabled = true` before it can be triggered. `[ai_review].max_concurrent_reviews` limits process-wide AI Review runs (default `4`). Each script uses its own `[[script_tasks]].max_concurrent` limit (default `1`). A full script limit rejects that invocation immediately and posts an MR comment; there is no queue. A script's `timeout_seconds` defaults to `60`.
 
 The runner passes each script the absolute source directory and a run-specific `result.txt` path as command arguments. Exit code `0` means execution succeeded; every non-zero code or timeout fails the task. An empty result file posts a clean-result MR comment. Non-empty text is posted as an MR comment; `path:line:message` rows become inline comments only when they match an added line in the same commit's diff.
 

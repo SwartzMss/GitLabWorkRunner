@@ -113,6 +113,7 @@ object_attributes.noteable_type = "MergeRequest"
 - 脚本任务手动触发按 `[[script_tasks]].id` 精确匹配。
 - 同一条评论可以触发多个 ID；脚本任务、其他脚本任务和 AI Review 分别独立运行。
 - AI Review 的进程级并发上限放在 `rules.toml` 的 `[ai_review].max_concurrent_reviews`，默认 `4`。
+- 每个 `[[ai_reviews]]` 和 `[[script_tasks]]` 默认 `enabled = false`，只有显式设置 `enabled = true` 才会响应手动触发。
 - 每个脚本的并发上限由自己的 `max_concurrent` 设置，默认 `1`；名额满时立即失败并发布 MR 评论，不等待。
 - 每个脚本的 `timeout_seconds` 默认 `60` 秒。
 - 超时会终止脚本进程：Unix 使用独立进程组；Windows 使用系统 `taskkill` 并限制等待时间，工具失败时回退为终止直接子进程，派生进程可能继续运行。

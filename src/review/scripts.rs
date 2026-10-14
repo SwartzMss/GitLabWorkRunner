@@ -682,6 +682,7 @@ mod tests {
             )
         };
         let task = ScriptTaskConfig {
+            enabled: true,
             id: "check-root".into(),
             title: "Check root".into(),
             command,
@@ -716,6 +717,7 @@ mod tests {
             archive_limits: ArchiveLimits::default(),
         };
         let task = ScriptTaskConfig {
+            enabled: true,
             id: "failing".into(),
             title: "Failing check".into(),
             command: "exit 1".into(),
@@ -742,6 +744,7 @@ mod tests {
             archive_limits: ArchiveLimits::default(),
         };
         let task = ScriptTaskConfig {
+            enabled: true,
             id: "check".into(),
             title: "Check".into(),
             command: "true".into(),
@@ -796,6 +799,7 @@ mod tests {
         )
         .unwrap();
         let task = ScriptTaskConfig {
+            enabled: true,
             id: "verbose".into(),
             title: "Verbose check".into(),
             command: format!("sh {}", shell_quote_arg(&script_path)),
@@ -829,6 +833,7 @@ mod tests {
         )
         .unwrap();
         let task = ScriptTaskConfig {
+            enabled: true,
             id: "oversized-result".into(),
             title: "Oversized result check".into(),
             command: format!("sh {}", shell_quote_arg(&script_path)),
@@ -871,6 +876,7 @@ mod tests {
         )
         .unwrap();
         let task = ScriptTaskConfig {
+            enabled: true,
             id: "failed-oversized-result".into(),
             title: "Failed oversized result check".into(),
             command: format!("sh {}", shell_quote_arg(&script_path)),
@@ -911,6 +917,7 @@ mod tests {
         )
         .unwrap();
         let task = ScriptTaskConfig {
+            enabled: true,
             id: "timeout".into(),
             title: "Timeout check".into(),
             command: format!("sh {}", shell_quote_arg(&script_path)),

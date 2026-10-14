@@ -15,6 +15,7 @@ max_tool_result_bytes = 60000
 max_tool_total_bytes = 40000
 
 [[ai_reviews]]
+enabled = true
 id = "ai-review"
 title = "AI Review"
 base_url = "https://api.openai.com/v1"

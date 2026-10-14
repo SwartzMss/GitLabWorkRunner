@@ -17,6 +17,8 @@ pub struct RulesFile {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ScriptTaskConfig {
+    #[serde(default)]
+    pub enabled: bool,
     pub id: String,
     pub title: String,
     pub command: String,
@@ -29,6 +31,8 @@ pub struct ScriptTaskConfig {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AiReviewConfig {
+    #[serde(default)]
+    pub enabled: bool,
     pub id: String,
     pub title: String,
     pub base_url: String,
@@ -170,7 +174,11 @@ impl Ruleset {
             }
         }
         let mut ai_reviews = Vec::new();
-        for mut config in parsed.ai_reviews {
+        for mut config in parsed
+            .ai_reviews
+            .into_iter()
+            .filter(|config| config.enabled)
+        {
             config.extra_instructions = parsed.ai_review.extra_instructions.clone();
             config.max_tool_calls = parsed.ai_review.max_tool_calls;
             config.max_tool_rounds = parsed.ai_review.max_tool_rounds;
@@ -182,7 +190,11 @@ impl Ruleset {
         Ok(Self {
             hash,
             ai_reviews,
-            script_tasks: parsed.script_tasks,
+            script_tasks: parsed
+                .script_tasks
+                .into_iter()
+                .filter(|task| task.enabled)
+                .collect(),
             max_concurrent_reviews: parsed.ai_review.max_concurrent_reviews.max(1),
         })
     }
@@ -295,11 +307,13 @@ model = "gpt-4.1-mini"
         let rules = Ruleset::from_toml(
             r#"
 [[script_tasks]]
+enabled = true
 id = "manual-check"
 title = "Manual check"
 command = "python check.py"
 
 [[script_tasks]]
+enabled = true
 id = "security-scan"
 title = "Security scan"
 command = "./scan.sh"
@@ -316,6 +330,55 @@ max_concurrent = 3
         let second = rules.script_tasks_by_ids(&["security-scan".into()]);
         assert_eq!(second[0].timeout_seconds, 120);
         assert_eq!(second[0].max_concurrent, 3);
+    }
+
+    #[test]
+    fn ai_reviews_and_script_tasks_require_explicit_enablement() {
+        let disabled = Ruleset::from_toml(
+            r#"
+[[ai_reviews]]
+id = "ai-review"
+title = "AI Review"
+base_url = "https://api.openai.com/v1"
+api_key = "test-api-key"
+model = "gpt-4.1-mini"
+
+[[script_tasks]]
+id = "lint"
+title = "Lint"
+command = "./lint.sh"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(disabled.ai_review_count(), 0);
+        assert_eq!(disabled.script_task_count(), 0);
+        assert!(disabled.ai_reviews_by_ids(&["ai-review".into()]).is_empty());
+        assert!(disabled.script_tasks_by_ids(&["lint".into()]).is_empty());
+
+        let enabled = Ruleset::from_toml(
+            r#"
+[[ai_reviews]]
+enabled = true
+id = "ai-review"
+title = "AI Review"
+base_url = "https://api.openai.com/v1"
+api_key = "test-api-key"
+model = "gpt-4.1-mini"
+
+[[script_tasks]]
+enabled = true
+id = "lint"
+title = "Lint"
+command = "./lint.sh"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(enabled.ai_review_count(), 1);
+        assert_eq!(enabled.script_task_count(), 1);
+        assert_eq!(enabled.ai_reviews_by_ids(&["ai-review".into()]).len(), 1);
+        assert_eq!(enabled.script_tasks_by_ids(&["lint".into()]).len(), 1);
     }
 
     #[test]
@@ -399,6 +462,7 @@ second_pass_on_clean = true
         let rules = Ruleset::from_toml(
             r#"
 [[ai_reviews]]
+enabled = true
 id = "ai-review"
 title = "AI Review"
 base_url = "https://api.openai.com/v1"
@@ -437,6 +501,7 @@ max_tool_result_bytes = 12000
 max_tool_total_bytes = 12345
 
 [[ai_reviews]]
+enabled = true
 id = "ai-review"
 title = "AI Review"
 base_url = "https://api.openai.com/v1"
@@ -485,6 +550,7 @@ max_batches = 6
         let rules = Ruleset::from_toml(
             r#"
 [[ai_reviews]]
+enabled = true
 id = "ai-review"
 title = "AI Review"
 base_url = "https://api.openai.com/v1"
