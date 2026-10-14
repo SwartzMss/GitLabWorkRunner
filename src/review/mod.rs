@@ -8,6 +8,8 @@ pub mod comments;
 pub mod diff;
 pub(crate) mod notifier;
 pub mod rules;
+pub(crate) mod script_service;
+pub(crate) mod scripts;
 pub mod service;
 pub(crate) mod work_cleanup;
 

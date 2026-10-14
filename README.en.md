@@ -2,9 +2,9 @@
 
 Language: [简体中文](README.md) | **English**
 
-GitLabWorkRunner is a Rust service for manual GitLab Merge Request review. It is triggered by GitLab MR comments, fetches MR changes, runs `[[ai_reviews]]`, and publishes the result back to GitLab MR Discussions.
+GitLabWorkRunner is a Rust service for GitLab Merge Request checks. It is triggered by GitLab MR comments, runs explicitly enabled `[[ai_reviews]]` or `[[script_tasks]]`, and publishes results to GitLab MR Discussions.
 
-It is not a GitLab Runner replacement and does not run CI scripts from the target repository. The current service runs AI Review only.
+It is not a GitLab Runner replacement. Script tasks run only commands explicitly configured by the administrator in `rules.toml`; repository CI configuration is not run automatically.
 
 ## How It Works
 
@@ -44,6 +44,7 @@ See [docs/design.md](docs/design.md) for more design detail.
 - Manual review from GitLab Merge Request Note webhooks.
 - Line-level comments only on added lines in the MR diff.
 - `[[ai_reviews]]`: OpenAI-compatible `POST /chat/completions` review.
+- `[[script_tasks]]`: configured checks against the MR commit, with `result.txt` output published as MR Discussions.
 - Chat Completions `tool_calls` structured output and built-in read-only context tools: `read_file`, `search_code`, and `list_files`.
 - Manual AI Review triggers from MR comments, such as `@ai-review`.
 - If the same `project_id + mr_iid + commit_sha` is already running, duplicate triggers are skipped. For MR comment triggers, the service awards an `eyes` emoji and posts a comment saying the commit is already being reviewed.
@@ -148,7 +149,6 @@ Linux release packages include the same `scripts/linux-background.sh`. When run 
 [server]
 bind = "0.0.0.0:8080"
 webhook_secret = "change-me"
-max_concurrent_reviews = 4
 
 [gitlab]
 base_url = "https://gitlab.example.com"
@@ -173,7 +173,7 @@ max_entry_path_bytes = 512         # 512 bytes
 
 `[gitlab].token` is the token used by the service when calling the GitLab API. It is different from the webhook `Secret token`. Prefer a Project Access Token or a dedicated bot user token with the `api` scope and at least the `Developer` project role. It must be able to read MR diffs, download repository archives, and publish MR discussions. Do not commit a real `config.toml` token to the repository. `api_timeout_seconds` controls regular GitLab API request timeouts, and `archive_timeout_seconds` separately controls repository archive download timeouts. Both default to `30` seconds.
 
-`[server].max_concurrent_reviews` controls how many review runs can execute at the same time in one process. The default is `4`. When the limit is reached, the runner does not start another background review and posts an MR-level comment asking the user to retry later because the review queue is busy. If the request came from an MR note, the service also awards `eyes` to the triggering note.
+`[ai_review].max_concurrent_reviews` controls how many AI Review runs can execute at the same time in one process. The default is `4`. Script tasks do not consume these slots; each script uses its own `[[script_tasks]].max_concurrent` limit. Move this setting from `[server]` in an old `config.toml` to `[ai_review]` in `rules.toml`.
 
 `[archive]` controls safety limits for downloading and extracting GitLab repository archives. If any configured limit is exceeded during AI archive download or extraction (`max_archive_bytes`, `max_extracted_files`, `max_extracted_bytes`, `max_single_file_bytes`, or `max_entry_path_bytes`), the service logs WARN and continues the AI Review with MR diff only. In that fallback, `read_file`, `search_code`, and `list_files` are unavailable, and no `archive_limit_exceeded` failure notification is posted. Archives within the limits are extracted normally and enable the read-only context tools. Non-limit failures—including timeout, permission, HTTP, corrupt ZIP, and filesystem errors—still fail the review through the existing failure path. Depending on the repository, either tune the limits or retain the safety boundary and accept diff-only review; increasing size limits is not the only supported response.
 
@@ -223,12 +223,14 @@ The dashboard process does not run migrations. If the database or statistics tab
 
 ## AI Review Config
 
-Only manual MR comment-triggered reviews are currently supported. MR update events are accepted and ignored instead of entering the review queue. Keep `[ai_review]` and `[[ai_reviews]]` in `rules.toml`. When upgrading, remove every `[[script_tasks]]` block: configuration parsing is strict, so leaving these blocks in place causes the configuration to be rejected.
+Tasks are triggered manually from MR comments; MR updates do not run them automatically. `rules.toml` can contain `[ai_review]`, multiple `[[ai_reviews]]`, and multiple `[[script_tasks]]` entries. Each task is disabled by default and must set `enabled = true` to respond to a trigger. Existing entries without `enabled` will become disabled after upgrading; add `enabled = true` to keep them running. If the old `config.toml` still contains `[server].max_concurrent_reviews`, startup explains how to move it to `[ai_review].max_concurrent_reviews` in `rules.toml`.
 
 Recommended `rules.toml` example:
 
 ```toml
 [ai_review]
+# Process-wide concurrency limit for AI Review runs; defaults to 4.
+max_concurrent_reviews = 4
 # Optional global AI Review prompt settings shared by every [[ai_reviews]] entry.
 # The built-in system prompt always applies; extra_instructions is appended to the system prompt as administrator review policy.
 extra_instructions = ""
@@ -238,6 +240,7 @@ max_tool_result_bytes = 60000
 max_tool_total_bytes = 40000
 
 [[ai_reviews]]
+enabled = true
 id = "ai-review"
 title = "AI Review"
 base_url = "https://api.openai.com/v1"
@@ -247,9 +250,31 @@ timeout_seconds = 1200
 request_timeout_seconds = 300
 max_batch_diff_bytes = 15000
 max_batches = 10
+
+[[script_tasks]]
+enabled = true
+id = "lint"
+title = "Lint check"
+command = "python scripts/lint.py"
+timeout_seconds = 120
+max_concurrent = 2
+
+[[script_tasks]]
+enabled = true
+id = "security-check"
+title = "Security check"
+command = "python scripts/security_check.py"
+timeout_seconds = 60
+max_concurrent = 1
 ```
 
 Posting a standalone `@ai-review` in an MR comment triggers the entry whose `id = "ai-review"`. MR update events are accepted and ignored; they do not enter the review queue.
+
+Posting `@lint` or `@security-check` runs the matching script. Each script has its own `max_concurrent` limit, defaulting to `1`; when full, that request fails immediately and posts an MR comment instead of waiting. Different scripts and AI Review use independent concurrency limits. Each script's `timeout_seconds` controls its execution timeout. On Unix, timeout cleanup kills the dedicated process group. On Windows, it uses the system `taskkill` command with a bounded wait; if that command fails, the runner falls back to killing the direct child, so spawned descendants may remain.
+
+The runner appends the absolute source directory for the MR commit and an absolute, run-specific `result.txt` path to the configured command. The script must write to the second argument; an empty file means no findings. Exit code `0` means the script completed successfully; any non-zero code is a task failure and is reported in an MR comment. Successful runs also post a result comment, including a clean result when the file is empty. A `path:line:message` line becomes an inline comment only when it matches an added line in this commit's diff; other text or results that cannot be located become MR-level comments. Commands run on the runner host, so configure only administrator-trusted commands.
+
+Each run keeps at most 10 MiB in `run.log`; excess stdout and stderr are still drained and discarded. A `result.txt` larger than 1 MiB is rejected, the running script is stopped once the limit is detected, and the oversized result file is removed. Run directories are protected while execution and comment publishing are active. Startup and hourly cleanup remove the full run directory 24 hours after completion.
 
 `[ai_review]` is the global AI Review prompt configuration. The built-in system prompt always applies; `extra_instructions` is appended to the system prompt as administrator review policy. If omitted, only the built-in prompt is used.
 Text after `@ai-review` in an MR comment is passed only as a reviewer-provided scope preference, such as adding focus areas, skipping optional categories, or limiting files/directories. It cannot override the output protocol, safety rules, tool permissions, or high-confidence threshold.
@@ -282,15 +307,16 @@ After enabling GitLab webhook `Comments`, add standalone commands in an MR comme
 @ai-review
 ```
 
-The same commit can be triggered again after the current run finishes. If the same `project_id + mr_iid + commit_sha` is still running, a new trigger is skipped; the service awards `eyes` to the triggering note and posts an MR comment asking the user to retry later. If the global number of running reviews has reached `[server].max_concurrent_reviews`, the trigger is also skipped and the MR receives a queue-busy comment.
+An AI Review trigger is skipped while the same `project_id + mr_iid + commit_sha` is still running. It is also skipped when the AI concurrency limit `[ai_review].max_concurrent_reviews` is full. Script tasks check their own per-task limits and remain independent of AI Review activity.
 
-The current implementation does not perform an extra GitLab role check for the comment author. If a user can comment on the MR and the comment contains a valid `[[ai_reviews]].id`, the service runs the matching AI Review. Add a service-side permission check or allowlist if only Maintainers or selected users should be allowed to trigger reviews.
+The current implementation does not perform an extra GitLab role check for the comment author. If a user can comment on the MR and the comment contains the ID of an enabled `[[ai_reviews]]` entry, the service runs the matching AI Review. Add a service-side permission check or allowlist if only Maintainers or selected users should be allowed to trigger reviews.
 
 ## Work Directory Cleanup
 
 Downloaded GitLab archive zip bytes stay in memory; the service does not write the zip file to disk. When repository context is needed, the archive is extracted under `work/`:
 
 - AI context tools: `work/ai_review_context/.../<review_run_id>/source`
+- Script tasks: `work/script_tasks/<project>/<mr>/<commit>/<run_id>/<task_id>/source`
 
 After normal completion or failure, AI Review removes the current context run directory. On startup, the service cleans stale work directories older than 24 hours, and it repeats that cleanup every hour while running. Cleanup failures are logged as WARN and do not block review.
 

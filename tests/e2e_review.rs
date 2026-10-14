@@ -149,6 +149,7 @@ async fn reviews_merge_request_and_records_state() {
     let ruleset = Ruleset::from_toml(&format!(
         r#"
 [[ai_reviews]]
+enabled = true
 id = "ai-review"
 title = "AI Review"
 base_url = "{}"
@@ -263,6 +264,7 @@ async fn continues_publishing_review_comments_after_one_comment_fails() {
     let ruleset = Ruleset::from_toml(&format!(
         r#"
 [[ai_reviews]]
+enabled = true
 id = "ai-review"
 title = "AI Review"
 base_url = "{}"
@@ -373,6 +375,7 @@ async fn rename_inline_comment_uses_old_path_and_records_fallback_position() {
     let ruleset = Ruleset::from_toml(&format!(
         r#"
 [[ai_reviews]]
+enabled = true
 id = "ai-review"
 title = "AI Review"
 base_url = "{}"
@@ -469,6 +472,7 @@ async fn skips_review_when_diff_refs_are_incomplete() {
     let ruleset = Ruleset::from_toml(&format!(
         r#"
 [[ai_reviews]]
+enabled = true
 id = "ai-review"
 title = "AI Review"
 base_url = "{}"
@@ -593,6 +597,7 @@ async fn reviews_merge_request_with_ai_review() {
     let ruleset = Ruleset::from_toml(&format!(
         r#"
 [[ai_reviews]]
+enabled = true
 id = "ai-review"
 title = "AI Review"
 base_url = "{}"
@@ -711,6 +716,7 @@ async fn manual_ai_review_posts_summary_when_one_review_fails() {
     let ruleset = Ruleset::from_toml(&format!(
         r#"
 [[ai_reviews]]
+enabled = true
 id = "bad-review"
 title = "Bad Review"
 base_url = "{}"
@@ -719,6 +725,7 @@ model = "bad-model"
 timeout_seconds = 10
 
 [[ai_reviews]]
+enabled = true
 id = "good-review"
 title = "Good Review"
 base_url = "{}"
@@ -746,6 +753,7 @@ timeout_seconds = 10
 
 fn test_ai_review_config(base_url: String) -> AiReviewConfig {
     AiReviewConfig {
+        enabled: true,
         id: "ai-review".into(),
         title: "AI Review".into(),
         base_url,
@@ -806,6 +814,7 @@ async fn ai_review_batches_large_merge_request_by_file() {
     spawn_server_on(listener, app);
 
     let config = AiReviewConfig {
+        enabled: true,
         base_url: format!("http://{}", addr),
         max_batch_diff_bytes: 24,
         max_batches: 2,
@@ -882,6 +891,7 @@ async fn batched_ai_review_preserves_coverage_when_total_deadline_fires() {
     );
     spawn_server_on(listener, app);
     let config = AiReviewConfig {
+        enabled: true,
         base_url: format!("http://{}", addr),
         timeout_seconds: 1,
         request_timeout_seconds: Some(5),
@@ -1043,6 +1053,7 @@ async fn ai_review_falls_back_to_json_content_after_retryable_tool_request_failu
     spawn_server_on(listener, app);
 
     let config = AiReviewConfig {
+        enabled: true,
         base_url: format!("http://{}", addr),
         timeout_seconds: 2,
         request_timeout_seconds: Some(1),
@@ -1191,6 +1202,7 @@ async fn ai_review_synthesizes_matching_ids_for_empty_context_tool_calls() {
     spawn_server_on(listener, app);
 
     let config = AiReviewConfig {
+        enabled: true,
         base_url: format!("http://{}", addr),
         ..test_ai_review_config(format!("http://{}", addr))
     };
@@ -1349,6 +1361,7 @@ async fn ai_review_uses_builtin_read_file_context_tool() {
 max_tool_calls = 4
 
 [[ai_reviews]]
+enabled = true
 id = "ai-review"
 title = "AI Review"
 base_url = "{}"
@@ -1429,6 +1442,7 @@ async fn timeout_fallback_persists_final_diff_only_coverage_metadata_and_summary
     let ruleset = Ruleset::from_toml(&format!(
         r#"
 [[ai_reviews]]
+enabled = true
 id = "ai-review"
 title = "AI Review"
 base_url = "{base_url}"
@@ -1629,6 +1643,7 @@ async fn archive_limit_uses_diff_only_execution_without_context_tools() {
     let ruleset = Ruleset::from_toml(&format!(
         r#"
 [[ai_reviews]]
+enabled = true
 id = "ai-review"
 title = "AI Review"
 base_url = "{}"
@@ -1723,6 +1738,7 @@ async fn non_limit_archive_failure_still_fails_before_ai_review() {
     let ruleset = Ruleset::from_toml(&format!(
         r#"
 [[ai_reviews]]
+enabled = true
 id = "ai-review"
 title = "AI Review"
 base_url = "{}"
@@ -1857,6 +1873,7 @@ async fn ai_review_timeout_does_not_block_merge_request_review() {
     let ruleset = Ruleset::from_toml(&format!(
         r#"
 [[ai_reviews]]
+enabled = true
 id = "ai-review"
 title = "AI Review"
 base_url = "{}"
@@ -1899,6 +1916,7 @@ async fn ai_review_timeout_covers_incomplete_response_body() {
         sleep(Duration::from_secs(2)).await;
     });
     let config = AiReviewConfig {
+        enabled: true,
         base_url: format!("http://{}", addr),
         timeout_seconds: 1,
         ..test_ai_review_config(format!("http://{}", addr))
@@ -2023,6 +2041,7 @@ async fn manual_note_runs_ai_review() {
     let ruleset = Ruleset::from_toml(&format!(
         r#"
 [[ai_reviews]]
+enabled = true
 id = "ai-review"
 title = "AI Review"
 base_url = "{}"
@@ -2168,6 +2187,7 @@ async fn manual_note_posts_summary_when_one_ai_review_fails() {
     let ruleset = Ruleset::from_toml(&format!(
         r#"
 [[ai_reviews]]
+enabled = true
 id = "bad-review"
 title = "Bad Review"
 base_url = "{}"
@@ -2176,6 +2196,7 @@ model = "manual-bad-model"
 timeout_seconds = 10
 
 [[ai_reviews]]
+enabled = true
 id = "good-review"
 title = "Good Review"
 base_url = "{}"
@@ -2300,6 +2321,7 @@ async fn manual_note_posts_ai_review_completion_when_no_findings() {
     let ruleset = Ruleset::from_toml(&format!(
         r#"
 [[ai_reviews]]
+enabled = true
 id = "ai-review"
 title = "AI Review"
 base_url = "{}"

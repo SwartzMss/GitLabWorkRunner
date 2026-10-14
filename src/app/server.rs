@@ -1,5 +1,6 @@
 use super::{
     active_reviews::{ActiveReviewGuard, ActiveReviewKey, ActiveReviewStartError, ActiveReviews},
+    script_scheduler::{ScriptTaskPermit, ScriptTaskScheduler},
     webhook_response::{self, WebhookReviewSummary},
 };
 use crate::{
@@ -8,6 +9,7 @@ use crate::{
     gitlab::GitLabClient,
     review::{
         notifier::{ReviewFailureNotification, ReviewNotifier},
+        script_service::ScriptTaskService,
         work_cleanup::{cleanup_stale_review_work, spawn_periodic_stale_review_work_cleanup},
     },
     review::{service::manual_review_ids, ReviewService},
@@ -42,6 +44,7 @@ struct AppState {
     config: AppConfig,
     store: StateStore,
     active_reviews: Arc<ActiveReviews>,
+    script_tasks: Arc<ScriptTaskScheduler>,
 }
 
 pub async fn serve(config: AppConfig, store: StateStore) -> AppResult<()> {
@@ -65,6 +68,7 @@ fn router(config: AppConfig, store: StateStore) -> Router {
         config,
         store,
         active_reviews: Arc::new(ActiveReviews::default()),
+        script_tasks: Arc::new(ScriptTaskScheduler::default()),
     });
     Router::new()
         .route("/healthz", get(healthz))
@@ -217,7 +221,18 @@ async fn gitlab_webhook(
         }
     };
 
-    if !event_requests_review(&event, &ruleset) {
+    let (requested_ai_reviews, requested_script_tasks) = match &event {
+        GitLabWebhookEvent::MergeRequest(_) => (Vec::new(), Vec::new()),
+        GitLabWebhookEvent::MergeRequestNote(note) if note.is_create_action() => {
+            let ids = manual_review_ids(&note.note);
+            (
+                ruleset.ai_reviews_by_ids(&ids),
+                ruleset.script_tasks_by_ids(&ids),
+            )
+        }
+        GitLabWebhookEvent::MergeRequestNote(_) => (Vec::new(), Vec::new()),
+    };
+    if requested_ai_reviews.is_empty() && requested_script_tasks.is_empty() {
         info!(
             review_run_id = %review_run_id,
             project_id = response_summary.project_id,
@@ -230,7 +245,18 @@ async fn gitlab_webhook(
         return webhook_response::ignored(review_run_id, "no_matching_manual_review");
     }
 
-    let active_review_guard = {
+    let max_concurrent_reviews = ruleset.max_concurrent_reviews();
+    let gitlab = GitLabClient::new_with_timeouts(
+        state.config.gitlab.base_url.clone(),
+        gitlab_token.clone(),
+        Duration::from_secs(state.config.gitlab.api_timeout_seconds.max(1)),
+        Duration::from_secs(state.config.gitlab.archive_timeout_seconds.max(1)),
+    );
+    let mut results = Vec::new();
+    let mut started = 0_usize;
+    let mut ai_rejection = None;
+
+    if !requested_ai_reviews.is_empty() {
         let active_key = ActiveReviewKey {
             project_id: response_summary.project_id,
             mr_iid: response_summary.mr_iid,
@@ -239,7 +265,7 @@ async fn gitlab_webhook(
         match state.active_reviews.try_start(
             active_key,
             review_run_id.clone(),
-            state.config.server.max_concurrent_reviews,
+            max_concurrent_reviews,
         ) {
             Ok(start) => {
                 info!(
@@ -249,10 +275,29 @@ async fn gitlab_webhook(
                     commit_sha = %response_summary.commit_sha,
                     queue_status = "accepted",
                     active_count = start.active_count,
-                    max_concurrent_reviews = state.config.server.max_concurrent_reviews.max(1),
+                    max_concurrent_reviews,
                     "review run registered as active"
                 );
-                Some(start.guard)
+                let notifier = ReviewNotifier::new(gitlab.clone());
+                let service = ReviewService::new(gitlab.clone(), state.store.clone(), ruleset)
+                    .with_review_run_id(review_run_id.clone())
+                    .with_archive_limits(state.config.archive.clone());
+                let event_for_task = event.clone();
+                let summary_for_task = response_summary.clone();
+                let review_id = review_run_id.clone();
+                let review_span = info_span!("review_run", review_run_id = %review_id);
+                tokio::spawn(
+                    run_webhook_review(
+                        notifier,
+                        service,
+                        event_for_task,
+                        summary_for_task,
+                        Some(start.guard),
+                    )
+                    .instrument(review_span),
+                );
+                started += 1;
+                results.push(serde_json::json!({"type":"ai_review", "status":"started", "review_run_id":review_run_id}));
             }
             Err(ActiveReviewStartError::Duplicate {
                 active_review_run_id,
@@ -266,7 +311,7 @@ async fn gitlab_webhook(
                     commit_sha = %response_summary.commit_sha,
                     queue_status = "duplicate",
                     active_count,
-                    max_concurrent_reviews = state.config.server.max_concurrent_reviews.max(1),
+                    max_concurrent_reviews,
                     "gitlab webhook review skipped because commit review is already running"
                 );
                 if let GitLabWebhookEvent::MergeRequestNote(event) = &event {
@@ -291,12 +336,18 @@ async fn gitlab_webhook(
                         .instrument(notification_span),
                     );
                 }
-                return webhook_response::review_already_running(
-                    review_run_id,
+                results.push(serde_json::json!({
+                    "type": "ai_review",
+                    "status": "duplicate",
+                    "review_run_id": review_run_id,
+                    "active_review_run_id": active_review_run_id.clone(),
+                    "active_count": active_count,
+                    "max_concurrent_reviews": max_concurrent_reviews,
+                }));
+                ai_rejection = Some(AiRejection::Duplicate {
                     active_review_run_id,
                     active_count,
-                    state.config.server.max_concurrent_reviews,
-                );
+                });
             }
             Err(ActiveReviewStartError::QueueBusy {
                 active_count,
@@ -331,36 +382,105 @@ async fn gitlab_webhook(
                         .instrument(notification_span),
                     );
                 }
-                return webhook_response::review_queue_busy(
+                results.push(serde_json::json!({
+                    "type": "ai_review",
+                    "status": "busy",
+                    "review_run_id": review_run_id,
+                    "active_count": active_count,
+                    "max_concurrent_reviews": max_concurrent_reviews,
+                }));
+                ai_rejection = Some(AiRejection::Busy {
+                    active_count,
+                    max_concurrent_reviews,
+                });
+            }
+        }
+    }
+
+    let has_script_tasks = !requested_script_tasks.is_empty();
+    if !requested_script_tasks.is_empty() {
+        let GitLabWebhookEvent::MergeRequestNote(note_event) = &event else {
+            unreachable!()
+        };
+        for task in requested_script_tasks {
+            let task_run_id = new_review_run_id();
+            let service = ScriptTaskService::new(
+                gitlab.clone(),
+                state.store.clone(),
+                state.config.archive.clone(),
+            );
+            match state
+                .script_tasks
+                .try_acquire(&task.id, task.max_concurrent)
+            {
+                Ok(permit) => {
+                    let event_for_task = note_event.clone();
+                    let script_id = task.id.clone();
+                    let run_id_for_task = task_run_id.clone();
+                    let span = info_span!("script_task", review_run_id = %task_run_id, script_task_id = %script_id);
+                    tokio::spawn(
+                        async move {
+                            let _permit: ScriptTaskPermit = permit;
+                            service.run(&event_for_task, task, &run_id_for_task).await;
+                        }
+                        .instrument(span),
+                    );
+                    started += 1;
+                    results.push(serde_json::json!({"type":"script_task", "id":script_id, "status":"started", "review_run_id":task_run_id}));
+                }
+                Err(busy) => {
+                    let event_for_task = note_event.clone();
+                    let task_for_record = task.clone();
+                    let script_id = task.id.clone();
+                    let run_id_for_task = task_run_id.clone();
+                    let active_count = busy.active_count;
+                    let max_concurrent = busy.max_concurrent;
+                    let span = info_span!("script_task", review_run_id = %task_run_id, script_task_id = %script_id);
+                    tokio::spawn(
+                        async move {
+                            service
+                                .record_busy(
+                                    &event_for_task,
+                                    &task_for_record,
+                                    &run_id_for_task,
+                                    active_count,
+                                    max_concurrent,
+                                )
+                                .await;
+                        }
+                        .instrument(span),
+                    );
+                    results.push(serde_json::json!({"type":"script_task", "id":script_id, "status":"busy", "active_count":active_count, "max_concurrent":max_concurrent, "review_run_id":task_run_id}));
+                }
+            }
+        }
+    }
+
+    if started == 0 {
+        if !has_script_tasks {
+            return match ai_rejection {
+                Some(AiRejection::Duplicate {
+                    active_review_run_id,
+                    active_count,
+                }) => webhook_response::review_already_running(
+                    review_run_id,
+                    active_review_run_id,
+                    active_count,
+                    max_concurrent_reviews,
+                ),
+                Some(AiRejection::Busy {
+                    active_count,
+                    max_concurrent_reviews,
+                }) => webhook_response::review_queue_busy(
                     review_run_id,
                     active_count,
                     max_concurrent_reviews,
-                );
-            }
+                ),
+                None => webhook_response::ignored(review_run_id, "no_matching_manual_review"),
+            };
         }
-    };
-
-    let gitlab = GitLabClient::new_with_timeouts(
-        state.config.gitlab.base_url.clone(),
-        gitlab_token,
-        Duration::from_secs(state.config.gitlab.api_timeout_seconds.max(1)),
-        Duration::from_secs(state.config.gitlab.archive_timeout_seconds.max(1)),
-    );
-    let notifier = ReviewNotifier::new(gitlab.clone());
-    let service = ReviewService::new(gitlab, state.store.clone(), ruleset)
-        .with_review_run_id(review_run_id.clone())
-        .with_archive_limits(state.config.archive.clone());
-    let review_span = info_span!("review_run", review_run_id = %review_run_id);
-    tokio::spawn(
-        run_webhook_review(
-            notifier,
-            service,
-            event,
-            response_summary.clone(),
-            active_review_guard,
-        )
-        .instrument(review_span),
-    );
+        return webhook_response::dispatch_rejected(review_run_id, results, "script_task_busy");
+    }
     info!(
         review_run_id = %review_run_id,
         project_id = response_summary.project_id,
@@ -368,7 +488,22 @@ async fn gitlab_webhook(
         commit_sha = %response_summary.commit_sha,
         "gitlab webhook review task accepted"
     );
-    webhook_response::accepted(review_run_id)
+    if !has_script_tasks {
+        webhook_response::accepted(review_run_id)
+    } else {
+        webhook_response::accepted_runs(review_run_id, results)
+    }
+}
+
+enum AiRejection {
+    Duplicate {
+        active_review_run_id: String,
+        active_count: usize,
+    },
+    Busy {
+        active_count: usize,
+        max_concurrent_reviews: usize,
+    },
 }
 
 async fn run_webhook_review(
@@ -420,26 +555,13 @@ async fn run_webhook_review(
     }
 }
 
-fn event_requests_review(event: &GitLabWebhookEvent, ruleset: &Ruleset) -> bool {
-    match event {
-        GitLabWebhookEvent::MergeRequest(_) => false,
-        GitLabWebhookEvent::MergeRequestNote(event) => {
-            if !event.is_create_action() {
-                return false;
-            }
-            let requested_ids = manual_review_ids(&event.note);
-            !requested_ids.is_empty() && !ruleset.ai_reviews_by_ids(&requested_ids).is_empty()
-        }
-    }
-}
-
 fn new_review_run_id() -> String {
     let sequence = REVIEW_RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let millis = SystemTime::now()
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
+        .map(|duration| duration.as_nanos())
         .unwrap_or_default();
-    format!("rr-{millis}-{sequence}")
+    format!("rr-{nanos}-{}-{sequence}", std::process::id())
 }
 
 #[cfg(test)]

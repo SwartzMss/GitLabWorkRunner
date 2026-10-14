@@ -177,7 +177,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       projects: ["项目", "按 GitLab 项目汇总的 Review 活动"],
       mrs: ["合并请求", "按合并请求汇总的 Review 活动"],
       runs: ["Review 运行", "手动 Review 执行与任务结果"],
-      findings: ["问题", "AI Review 解析出的结果"],
+      findings: ["问题", "AI Review 和脚本检查结果"],
       system: ["系统", "仪表盘服务与存储状态"]
     };
     const json = async (url) => {
@@ -547,9 +547,9 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_copy_is_ai_review_only() {
-        assert!(DASHBOARD_HTML.contains("AI Review 解析出的结果"));
-        assert!(!DASHBOARD_HTML.contains("AI 与脚本解析出的结果"));
+    fn dashboard_copy_covers_ai_reviews_and_script_checks() {
+        assert!(DASHBOARD_HTML.contains("AI Review 和脚本检查结果"));
+        assert!(!DASHBOARD_HTML.contains("AI Review 解析出的结果"));
         assert!(!DASHBOARD_HTML.contains("script_task_failed"));
     }
 

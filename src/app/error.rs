@@ -12,6 +12,10 @@ pub enum ReviewErrorCode {
     AiResponseParseFailed,
     ReviewRunTimeout,
     GitLabCommentFailed,
+    ScriptTaskBusy,
+    ScriptTaskFailed,
+    ScriptTaskTimeout,
+    ScriptTaskOutputLimit,
     PermissionDenied,
     InvalidConfiguration,
     Internal,
@@ -32,6 +36,10 @@ impl ReviewErrorCode {
             Self::AiResponseParseFailed => "ai_response_parse_failed",
             Self::ReviewRunTimeout => "review_run_timeout",
             Self::GitLabCommentFailed => "gitlab_comment_failed",
+            Self::ScriptTaskBusy => "script_task_busy",
+            Self::ScriptTaskFailed => "script_task_failed",
+            Self::ScriptTaskTimeout => "script_task_timeout",
+            Self::ScriptTaskOutputLimit => "script_task_output_limit",
             Self::PermissionDenied => "permission_denied",
             Self::InvalidConfiguration => "invalid_configuration",
             Self::Internal => "internal",
@@ -72,6 +80,8 @@ pub enum AppError {
     Rule(String),
     #[error("ai review error: {0}")]
     AiReview(ReviewFailure),
+    #[error("script task error: {0}")]
+    ScriptTask(ReviewFailure),
     #[error("gitlab api error: {0}")]
     GitLab(ReviewFailure),
     #[error("archive error: {0}")]
@@ -99,15 +109,20 @@ impl AppError {
         Self::GitLab(ReviewFailure::new(code, message))
     }
 
+    pub fn script_task(code: ReviewErrorCode, message: impl Into<String>) -> Self {
+        Self::ScriptTask(ReviewFailure::new(code, message))
+    }
+
     pub fn archive(code: ReviewErrorCode, message: impl Into<String>) -> Self {
         Self::Archive(ReviewFailure::new(code, message))
     }
 
     pub fn review_failure(&self) -> Option<&ReviewFailure> {
         match self {
-            Self::AiReview(failure) | Self::GitLab(failure) | Self::Archive(failure) => {
-                Some(failure)
-            }
+            Self::AiReview(failure)
+            | Self::ScriptTask(failure)
+            | Self::GitLab(failure)
+            | Self::Archive(failure) => Some(failure),
             _ => None,
         }
     }

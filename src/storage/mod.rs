@@ -27,6 +27,7 @@ pub struct ReviewRequestStart<'a> {
     pub note_id: Option<i64>,
     pub requested_ids_json: &'a str,
     pub selected_ai_reviews: usize,
+    pub selected_script_tasks: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -354,7 +355,7 @@ insert into review_requests
 (review_run_id, trigger_type, project_id, project_name, project_path_with_namespace,
  mr_iid, commit_sha, note_id, requested_ids_json,
  selected_ai_reviews, selected_script_tasks, status, findings, comments, timezone, started_at)
-values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'running', 0, 0, ?, ?)
+values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', 0, 0, ?, ?)
 on conflict(review_run_id) do update set
     status = 'running',
     project_name = excluded.project_name,
@@ -374,6 +375,7 @@ on conflict(review_run_id) do update set
         .bind(request.note_id)
         .bind(request.requested_ids_json)
         .bind(request.selected_ai_reviews as i64)
+        .bind(request.selected_script_tasks as i64)
         .bind(REVIEW_TIMEZONE)
         .bind(&now)
         .execute(&self.pool)
@@ -765,6 +767,7 @@ mod tests {
                 note_id: Some(9),
                 requested_ids_json: r#"["ai-review"]"#,
                 selected_ai_reviews: 1,
+                selected_script_tasks: 0,
             })
             .await
             .unwrap();
@@ -853,6 +856,7 @@ mod tests {
                 note_id: None,
                 requested_ids_json: "[]",
                 selected_ai_reviews: 1,
+                selected_script_tasks: 0,
             })
             .await
             .unwrap();

@@ -1,6 +1,6 @@
 # GitLab Webhook 说明
 
-本文说明 GitLabWorkRunner 依赖的 GitLab Webhook 行为，重点是 `Merge request events` 和 `Comments` 什么时候触发，以及服务收到消息后如何判断是否需要执行 Review。
+本文说明 GitLabWorkRunner 依赖的 GitLab Webhook 行为，重点是 `Merge request events` 和 `Comments` 什么时候触发，以及服务收到消息后如何判断是否需要执行 AI Review 或脚本检查。
 
 参考资料：
 
@@ -90,11 +90,11 @@ changes
 | `approval` / `approved` | 审批状态变化 | 接收并忽略，不进入 review 队列 |
 | `unapproval` / `unapproved` | 审批状态变化 | 接收并忽略，不进入 review 队列 |
 
-如果需要执行 Review，请在 MR 评论中发送配置项对应的 `@id`，例如 `@ai-review`。
+如果需要执行任务，请在 MR 评论中发送配置项对应的 `@id`，例如 `@ai-review` 或 `@lint`。
 
-## Comments 手动触发 AI Review
+## Comments 手动触发任务
 
-开启 `Comments` 后，用户可以在 MR 评论中发送 AI Review 命令：
+开启 `Comments` 后，用户可以在 MR 评论中发送任务 ID 命令：
 
 ```text
 @ai-review
@@ -110,16 +110,25 @@ object_attributes.noteable_type = "MergeRequest"
 手动触发行为：
 
 - AI Review 手动触发按 `[[ai_reviews]].id` 精确匹配。
+- 脚本任务手动触发按 `[[script_tasks]].id` 精确匹配。
+- 同一条评论可以触发多个 ID；脚本任务、其他脚本任务和 AI Review 分别独立运行。
+- AI Review 的进程级并发上限放在 `rules.toml` 的 `[ai_review].max_concurrent_reviews`，默认 `4`。
+- 每个 `[[ai_reviews]]` 和 `[[script_tasks]]` 默认 `enabled = false`，只有显式设置 `enabled = true` 才会响应手动触发。
+- 每个脚本的并发上限由自己的 `max_concurrent` 设置，默认 `1`；名额满时立即失败并发布 MR 评论，不等待。
+- 每个脚本的 `timeout_seconds` 默认 `60` 秒。
+- 超时会终止脚本进程：Unix 使用独立进程组；Windows 使用系统 `taskkill` 并限制等待时间，工具失败时回退为终止直接子进程，派生进程可能继续运行。
+- Runner 把源码目录和本次运行专属 `result.txt` 的绝对路径作为命令参数传给脚本。退出码 `0` 表示执行成功，其他退出码都表示失败；成功时会发布检查结果评论，空结果表示未发现问题。`path:line:message` 只在对应当前 commit 的新增 diff 行时发布 inline comment，否则发布 MR 级评论。
+- 每次运行的 `run.log` 最多保留 10 MiB，超出部分会继续读取后丢弃；`result.txt` 超过 1 MiB 会被拒绝并删除，脚本仍在运行时会在检测到超限后终止。脚本运行目录在执行和评论发布期间不会被清理，任务完成 24 小时后由启动或每小时清理删除。
 - 同一个 commit 完成后可以再次触发。
 - 但同一个 `project_id + mr_iid + commit_sha` 如果仍在执行中，新的触发会被跳过；服务会给触发评论加 `eyes`，并回复一条 MR 评论提示当前 commit 已有 review 正在执行，请稍后再试。
-- 如果评论里没有合法 AI Review 命令，或 `@id` 不存在，服务只记录日志并返回 accepted。
+- 如果评论里没有合法任务命令，或 `@id` 不存在，服务只记录日志并返回 accepted。
 - issue、wiki、work item 等非 MR 评论会被忽略。
 
 权限边界：
 
 - Webhook 只负责把 MR 评论事件发给服务，不代表评论人一定有执行任务的额外权限。
 - 当前实现不会额外查询或校验评论人的 GitLab 角色。
-- 只要用户能在 MR 评论，并且评论内容包含合法的 `@id`，服务就会执行对应 AI Review。
+- 只要用户能在 MR 评论，并且评论内容包含合法的 `@id`，服务就会执行对应任务。
 - 如果需要限制只有 Maintainer 或指定用户可以手动触发，需要在服务侧增加评论人权限校验或 allowlist。
 
 ## 当前服务的处理流程
@@ -130,13 +139,12 @@ object_attributes.noteable_type = "MergeRequest"
 2. 解析 payload，确认是 `object_kind = "merge_request"` 或 MR `object_kind = "note"`。
 3. 对 MR event，记录项目、MR、commit 和分支信息后返回 ignored，reason 为 `merge_request_events_manual_triggers_only`。
 4. 对 MR comment event，提取 `project_id`、`mr_iid`、`last_commit.id` 和评论正文。
-5. 解析评论正文中的 `@id`，匹配 `[[ai_reviews]].id`。
-6. 对实际会执行 review 的事件，先登记运行中 key：`project_id + mr_iid + commit_sha`。
-7. 如果同一个 key 已经在运行中，跳过本次 review；MR comment 触发时会加 `eyes` 并发布提示评论。
-8. 通过 GitLab API 拉取 MR changes。
-9. 执行手动匹配到的 AI Review。
-10. 发布 GitLab MR Discussion。
-11. review 完成或失败后，释放运行中 key；因此同一个 commit 完成后可以再次手动触发。
+5. 解析评论正文中的 `@id`，分别匹配 `[[ai_reviews]].id` 和 `[[script_tasks]].id`。
+6. AI Review 只使用 AI 自己的 commit 去重和并发限制；每个脚本只使用该脚本自己的并发计数。
+7. 各个被准入的任务在后台独立执行，不会等待其他 AI 或脚本任务。
+8. 通过 GitLab API 读取 MR commit archive，运行脚本并读取本次调用专属的 `result.txt`；AI Review 则照常读取 MR diff。
+9. 各个任务分别发布结果或失败信息到 GitLab MR Discussion。
+10. 任务结束后释放各自的运行名额；并发已满时该任务立即失败，不进入等待队列。
 
 ## 后续可以增强的地方
 

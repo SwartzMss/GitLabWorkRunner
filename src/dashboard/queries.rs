@@ -59,6 +59,7 @@ pub struct DashboardRun {
     pub note_id: Option<i64>,
     pub requested_ids_json: String,
     pub selected_ai_reviews: i64,
+    pub selected_script_tasks: i64,
     pub status: String,
     pub findings: i64,
     pub comments: i64,
@@ -384,6 +385,7 @@ select
     rr.review_run_id, rr.trigger_type, rr.project_id, rr.mr_iid, rr.commit_sha, rr.note_id, rr.requested_ids_json,
     coalesce(nullif(rr.project_path_with_namespace, ''), nullif(rr.project_name, ''), '#' || rr.project_id) as project_label,
     rr.selected_ai_reviews,
+    rr.selected_script_tasks,
     case
         when rr.status = 'running' then 'running'
         when rr.status = 'completed'
@@ -418,6 +420,7 @@ select
     rr.review_run_id, rr.trigger_type, rr.project_id, rr.mr_iid, rr.commit_sha, rr.note_id, rr.requested_ids_json,
     coalesce(nullif(rr.project_path_with_namespace, ''), nullif(rr.project_name, ''), '#' || rr.project_id) as project_label,
     rr.selected_ai_reviews,
+    rr.selected_script_tasks,
     case
         when rr.status = 'running' then 'running'
         when rr.status = 'completed'
@@ -932,6 +935,7 @@ fn row_to_run(row: SqliteRow) -> DashboardRun {
         note_id: row.get("note_id"),
         requested_ids_json: row.get("requested_ids_json"),
         selected_ai_reviews: row.get("selected_ai_reviews"),
+        selected_script_tasks: row.get("selected_script_tasks"),
         status: row.get("status"),
         findings: row.get("findings"),
         comments: row.get("comments"),
@@ -1022,6 +1026,8 @@ values ('legacy-run', 'script_task', 'legacy-script', 'Legacy Script', 'complete
         let detail = store.run_detail("legacy-run").await.unwrap().unwrap();
 
         assert_eq!(detail.run.review_run_id, "legacy-run");
+        assert_eq!(detail.run.selected_ai_reviews, 1);
+        assert_eq!(detail.run.selected_script_tasks, 2);
         assert_eq!(detail.tasks.len(), 1);
         assert_eq!(detail.tasks[0].task_type, "script_task");
         assert_eq!(detail.tasks[0].execution_mode, None);

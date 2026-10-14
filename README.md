@@ -2,9 +2,9 @@
 
 语言：**简体中文** | [English](README.en.md)
 
-GitLabWorkRunner 是一个 Rust 编写的 GitLab Merge Request 手动 Review 服务。它通过 GitLab MR 评论触发 `[[ai_reviews]]`，获取 MR 变更后把结果发布到 MR Discussion。
+GitLabWorkRunner 是一个 Rust 编写的 GitLab Merge Request 检查服务。它通过 GitLab MR 评论触发显式启用的 `[[ai_reviews]]` 或 `[[script_tasks]]`，并把结果发布到 MR Discussion。
 
-它不是 GitLab Runner 替代品，也不会执行目标仓库里的 CI 脚本；当前只执行 AI Review。
+它不是 GitLab Runner 替代品。脚本任务只运行管理员在 `rules.toml` 中配置的命令，不会自动执行目标仓库里的 CI 配置。
 
 ## 工作原理
 
@@ -44,6 +44,7 @@ sequenceDiagram
 - GitLab Merge Request Note Webhook 手动触发 Review。
 - 只对 MR diff 的新增行发布行级评论。
 - `[[ai_reviews]]`：调用 OpenAI-compatible `POST /chat/completions` 做 AI Review。
+- `[[script_tasks]]`：运行独立配置的检查脚本，读取 MR commit 源码并把 `result.txt` 结果发布到 MR Discussion。
 - 支持 Chat Completions `tool_calls` 结构化输出，以及内置只读上下文工具 `read_file`、`search_code`、`list_files`。
 - MR 评论手动触发 AI Review，例如 `@ai-review`。
 - 同一个 `project_id + mr_iid + commit_sha` 正在执行 review 时，会拦截重复触发；如果是 MR 评论触发，会给评论加 `eyes` 并回复“当前 commit 已有 review 正在执行”。
@@ -148,7 +149,6 @@ Linux 发布包会包含同一个 `scripts/linux-background.sh`；在解压目�
 [server]
 bind = "0.0.0.0:8080"
 webhook_secret = "change-me"
-max_concurrent_reviews = 4
 
 [gitlab]
 base_url = "https://gitlab.example.com"
@@ -173,7 +173,7 @@ max_entry_path_bytes = 512         # 512 bytes
 
 `[gitlab].token` 是服务调用 GitLab API 使用的 token，和 Webhook 里的 `Secret token` 不是同一个东西。建议使用 Project Access Token 或专用 Bot 用户 token，scope 使用 `api`，项目角色至少 `Developer`。它需要能读取 MR diff、下载仓库 archive，并发布 MR discussion。不要把包含真实 token 的 `config.toml` 提交到仓库。`api_timeout_seconds` 控制普通 GitLab API 请求超时，`archive_timeout_seconds` 单独控制 repository archive 下载超时；两者默认都是 `30` 秒。
 
-`[server].max_concurrent_reviews` 控制单进程内最多同时执行多少个 review run，默认 `4`。达到上限时不会启动新的后台 review，并会发布一条 MR 级评论提示当前 review 队列繁忙，请稍后再试；如果是 MR 评论手动触发，服务还会给触发评论加 `eyes`。
+`[ai_review].max_concurrent_reviews` 控制单进程内最多同时执行多少个 AI Review run，默认 `4`。脚本任务不占用这个上限；脚本的并发由每个 `[[script_tasks]].max_concurrent` 单独控制。旧配置中的 `[server].max_concurrent_reviews` 必须迁移到 `rules.toml` 的 `[ai_review]` 下。
 
 `[archive]` 控制 GitLab repository archive 的下载和解压安全限制。AI Review 下载或解压 archive 时，只要超过任一已配置的限制（`max_archive_bytes`、`max_extracted_files`、`max_extracted_bytes`、`max_single_file_bytes` 或 `max_entry_path_bytes`），服务就会记录 WARN，并使用仅包含 MR diff 的输入继续本次 AI Review；此时不会提供 `read_file`、`search_code` 或 `list_files`，也不会发送 `archive_limit_exceeded` 失败通知。未触发限制的 archive 仍会正常解压并启用这些只读上下文工具。超时、权限、HTTP、损坏 ZIP、文件系统等非限制错误仍会让 review 失败并走现有失败通知。遇到限制时可按仓库情况调整限制，也可以保留默认安全边界并接受 diff-only review，无需把增大限制作为唯一方案。
 
@@ -223,12 +223,14 @@ dashboard 进程不会执行 migration。如果数据库或统计表不存在，
 
 ## AI Review 配置
 
-当前只支持在 MR 评论里手动触发 review，不再支持 MR 更新后自动筛选执行。`rules.toml` 里需要保留 `[ai_review]` 和 `[[ai_reviews]]`。升级时请删除所有 `[[script_tasks]]` 配置块；配置解析是严格模式，保留这些块会导致配置被拒绝。
+当前通过 MR 评论手动触发任务，不会因为 MR 更新自动执行。`rules.toml` 可包含 `[ai_review]`、多个 `[[ai_reviews]]` 和多个 `[[script_tasks]]`；每个任务默认关闭，必须设置 `enabled = true` 才会响应触发。已有配置如果没有 `enabled`，升级后会默认关闭，需显式加上 `enabled = true` 才会继续运行。如果旧 `config.toml` 仍有 `[server].max_concurrent_reviews`，启动时会提示把它迁到 `rules.toml` 的 `[ai_review].max_concurrent_reviews`。
 
 推荐 `rules.toml` 示例：
 
 ```toml
 [ai_review]
+# AI Review 进程级并发上限，默认 4。
+max_concurrent_reviews = 4
 # 可选：全局 AI Review prompt 配置，所有 [[ai_reviews]] 共用。
 # 内置 system prompt 始终生效；extra_instructions 会作为管理员配置的审查策略追加到 system prompt。
 extra_instructions = ""
@@ -238,6 +240,7 @@ max_tool_result_bytes = 60000
 max_tool_total_bytes = 40000
 
 [[ai_reviews]]
+enabled = true
 id = "ai-review"
 title = "AI Review"
 base_url = "https://api.openai.com/v1"
@@ -247,9 +250,31 @@ timeout_seconds = 1200
 request_timeout_seconds = 300
 max_batch_diff_bytes = 15000
 max_batches = 10
+
+[[script_tasks]]
+enabled = true
+id = "lint"
+title = "Lint check"
+command = "python scripts/lint.py"
+timeout_seconds = 120
+max_concurrent = 2
+
+[[script_tasks]]
+enabled = true
+id = "security-check"
+title = "Security check"
+command = "python scripts/security_check.py"
+timeout_seconds = 60
+max_concurrent = 1
 ```
 
 在 MR 评论中发送独立的 `@ai-review` 会触发 `id = "ai-review"` 的配置。MR 更新事件会被接收并忽略，不会进入 review 队列。
+
+在 MR 评论中发送 `@lint` 或 `@security-check` 会运行对应脚本。每个脚本单独使用自己的 `max_concurrent` 名额，默认是 `1`；名额占满时本次立即失败并在 MR 留言，不进入等待队列。不同脚本和 AI Review 的并发计数互相独立。脚本运行超时由各自的 `timeout_seconds` 控制。Unix 上超时会终止独立进程组；Windows 上会调用系统 `taskkill` 并限制等待时间，如果该工具失败则回退为终止直接子进程，派生进程可能继续运行。
+
+Runner 会把本次 MR commit 的源码目录绝对路径和本次运行专属的 `result.txt` 绝对路径追加为命令参数。脚本应把结果写入第二个参数指定的文件；空文件表示没有发现。退出码 `0` 表示脚本执行成功，任何非 `0` 都会作为任务失败写入 MR 评论。成功运行时也会评论执行结果，包括空结果的“未发现问题”状态；非空结果中的 `path:line:message` 仅在路径、行号和本次 commit 的新增 diff 行匹配时发 inline comment，其他文本或无法定位的结果会发 MR 级评论。脚本命令在 runner 主机执行，只应配置管理员信任的命令。
+
+每次运行的 `run.log` 最多保留 10 MiB，超出部分会继续读取后丢弃；`result.txt` 超过 1 MiB 会被拒绝，脚本仍在运行时会在检测到超限后终止，并删除超限结果文件。运行目录在任务和评论发布期间受到保护；任务结束 24 小时后，启动或每小时的清理会删除整个旧运行目录。
 `[ai_review]` 是全局 AI Review prompt 配置：内置 system prompt 始终生效，`extra_instructions` 会作为管理员配置的审查策略追加到 system prompt。缺省时只使用内置 prompt，不需要配置。
 `@ai-review` 后面的评论内容只会作为触发者提供的审查范围偏好传给模型，例如增加关注方向、跳过可选检查类别或限定文件目录；它不能覆盖输出协议、安全规则、工具权限或高置信度门槛。
 内置只读上下文工具默认启用。服务会下载 MR head archive，让模型可以通过 tool call 请求 `read_file`、`search_code` 或 `list_files`；runner 只返回仓库目录内的文本内容，不执行 shell，也不会读取 `.env` 或 `.git`。
@@ -352,15 +377,16 @@ Dashboard 的任务明细会显示执行模式、降级原因、context 耗时�
 @ai-review
 ```
 
-同一个 commit 完成后可以再次触发。但如果同一个 `project_id + mr_iid + commit_sha` 仍在执行中，新的触发会被跳过：服务会给触发评论加 `eyes`，并回复一条 MR 评论提示当前 commit 已有 review 正在执行，请稍后再试。如果全局运行中的 review 数已经达到 `[server].max_concurrent_reviews`，也会跳过本次触发并回复队列繁忙提示。
+AI Review 在同一个 `project_id + mr_iid + commit_sha` 仍运行时会跳过重复触发；如果 AI 并发数达到 `[ai_review].max_concurrent_reviews`，也会回复队列繁忙提示。脚本任务独立检查各自的并发限制，不会被 AI Review 的重复运行或并发上限拦截。
 
-当前实现不会额外校验评论人的 GitLab 角色；只要用户能在 MR 评论，并且评论内容包含合法的 `[[ai_reviews]].id`，服务就会执行对应 AI Review。如果需要限制只有 Maintainer 或指定用户可以触发，需要在服务侧增加权限校验或 allowlist。
+当前实现不会额外校验评论人的 GitLab 角色；只要用户能在 MR 评论，并且评论内容包含已启用 `[[ai_reviews]]` 的合法 `id`，服务就会执行对应 AI Review。如果需要限制只有 Maintainer 或指定用户可以触发，需要在服务侧增加权限校验或 allowlist。
 
 ## 工作目录清理
 
 GitLab archive zip 下载后只保存在内存里，不会作为 zip 文件写入磁盘。需要仓库上下文时，服务会把 archive 解压到 `work/` 下：
 
 - AI context tools：`work/ai_review_context/.../<review_run_id>/source`
+- 脚本任务：`work/script_tasks/<project>/<mr>/<commit>/<run_id>/<task_id>/source`
 
 正常完成或失败后，AI Review 会删除本次 context run 目录。服务启动时会清理一次超过 24 小时的残留目录，运行中也会每小时清理一次。清理失败只写 WARN，不会阻断 review。
 

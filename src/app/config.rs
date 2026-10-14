@@ -6,7 +6,6 @@ use std::{fs, path::Path};
 const DEFAULT_LOG_FILE: &str = "logs/gitlab-work-runner.log";
 const DEFAULT_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
 const DEFAULT_LOG_MAX_FILES: usize = 5;
-const DEFAULT_MAX_CONCURRENT_REVIEWS: usize = 4;
 const DEFAULT_DASHBOARD_BIND: &str = "127.0.0.1:8082";
 const DEFAULT_GITLAB_API_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_GITLAB_ARCHIVE_TIMEOUT_SECONDS: u64 = 30;
@@ -29,8 +28,6 @@ pub struct AppConfig {
 pub struct ServerConfig {
     pub bind: String,
     pub webhook_secret: String,
-    #[serde(default = "default_max_concurrent_reviews")]
-    pub max_concurrent_reviews: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -99,10 +96,6 @@ fn default_log_max_files() -> usize {
     DEFAULT_LOG_MAX_FILES
 }
 
-fn default_max_concurrent_reviews() -> usize {
-    DEFAULT_MAX_CONCURRENT_REVIEWS
-}
-
 fn default_dashboard_bind() -> String {
     DEFAULT_DASHBOARD_BIND.into()
 }
@@ -118,6 +111,16 @@ fn default_gitlab_archive_timeout_seconds() -> u64 {
 impl AppConfig {
     pub fn from_path(path: impl AsRef<Path>) -> AppResult<Self> {
         let text = fs::read_to_string(path)?;
+        let value: toml::Value = toml::from_str(&text)?;
+        if value
+            .get("server")
+            .and_then(|server| server.get("max_concurrent_reviews"))
+            .is_some()
+        {
+            return Err(AppError::Config(
+                "[server].max_concurrent_reviews has moved to rules.toml as [ai_review].max_concurrent_reviews".into(),
+            ));
+        }
         Ok(toml::from_str(&text)?)
     }
 
@@ -164,7 +167,6 @@ file = "rules.toml"
 
         assert_eq!(config.server.bind, "127.0.0.1:8080");
         assert_eq!(config.server.webhook_secret, "secret");
-        assert_eq!(config.server.max_concurrent_reviews, 4);
         assert_eq!(config.gitlab.base_url, "https://gitlab.example.com");
         assert_eq!(config.gitlab.token, "glpat-test-token");
         assert_eq!(config.gitlab.api_timeout_seconds, 30);
@@ -180,12 +182,39 @@ file = "rules.toml"
     }
 
     #[test]
+    fn tells_operators_where_to_move_the_ai_concurrency_setting() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"
+[server]
+bind = "127.0.0.1:8080"
+webhook_secret = "secret"
+max_concurrent_reviews = 2
+
+[gitlab]
+base_url = "https://gitlab.example.com"
+token = "token"
+
+[storage]
+database_url = "sqlite::memory:"
+
+[rules]
+file = "rules.toml"
+"#
+        )
+        .unwrap();
+
+        let error = AppConfig::from_path(file.path()).unwrap_err().to_string();
+        assert!(error.contains("[ai_review].max_concurrent_reviews"));
+    }
+
+    #[test]
     fn returns_error_when_gitlab_token_is_empty() {
         let config = AppConfig {
             server: ServerConfig {
                 bind: "127.0.0.1:8080".into(),
                 webhook_secret: "secret".into(),
-                max_concurrent_reviews: 4,
             },
             gitlab: GitLabConfig {
                 base_url: "https://gitlab.example.com".into(),

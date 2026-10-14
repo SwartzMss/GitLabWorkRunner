@@ -42,7 +42,6 @@ mod tests {
             server: ServerConfig {
                 bind: "0.0.0.0:8080".into(),
                 webhook_secret: "secret".into(),
-                max_concurrent_reviews: 4,
             },
             gitlab: GitLabConfig {
                 base_url: "https://gitlab.example.com".into(),
