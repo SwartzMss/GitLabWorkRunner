@@ -22,20 +22,21 @@ Trigger: Merge request events, Comments
 
 Webhook 页面里的 `Secret token` 只用于校验收到的请求是否来自 GitLab。GitLab 会把它放在 `X-Gitlab-Token` 请求头里，服务会用 `config.toml` 的 `[server].webhook_secret` 校验它。
 
-服务真正调用 GitLab API 时使用的是 `config.toml` 里的 `[gitlab].token`。建议使用 Project Access Token 或专用 Bot 用户 token，scope 使用 `api`，项目角色至少 `Developer`。不要把包含真实 token 的 `config.toml` 提交到仓库。
+服务真正调用 GitLab API 时使用的是 `config.toml` 里的 `[gitlab].token`。建议使用 Project Access Token 或专用 Bot 用户 token，scope 使用 `api`，项目角色至少 `Developer`。脚本任务需要读取 MR 的源项目 ID 和项目 clone URL；跨项目 MR 时 token 也要能读取源项目。不要把包含真实 token 的 `config.toml` 提交到仓库。
 
 当前服务会用这个 token 调用：
 
 ```text
 GET /projects/:id/merge_requests/:merge_request_iid
 GET /projects/:id/merge_requests/:merge_request_iid/diffs?page=:page&per_page=100
+GET /projects/:source_project_id
 GET /projects/:id/repository/archive.zip
 POST /projects/:id/merge_requests/:merge_request_iid/discussions
 ```
 
 服务会完整读取 `/diffs` 的分页，并记录 `collapsed`、`too_large`、`generated_file` 状态。无法取得完整 diff 时，Dashboard 会显示不完整覆盖率。只有旧 GitLab 不支持 `/diffs` 时才兼容回退到已弃用的 `/changes`，并检查其 `overflow` 标志。
 
-因此 token 需要能读取 MR diff、读取仓库 archive，并发布 MR discussion。
+因此 token 需要能读取 MR 和源项目元数据、读取源仓库 archive，并发布目标 MR discussion。
 
 ## Merge request events 什么时候触发
 
@@ -118,6 +119,7 @@ object_attributes.noteable_type = "MergeRequest"
 - 每个脚本的 `timeout_seconds` 默认 `60` 秒。
 - 超时会终止脚本进程：Unix 使用独立进程组；Windows 使用系统 `taskkill` 并限制等待时间，工具失败时回退为终止直接子进程，派生进程可能继续运行。
 - Runner 把源码目录和本次运行专属 `result.txt` 的绝对路径作为命令参数传给脚本。退出码 `0` 表示执行成功，其他退出码都表示失败；成功时会发布检查结果评论，空结果表示未发现问题。`path:line:message` 只在对应当前 commit 的新增 diff 行时发布 inline comment，否则发布 MR 级评论。
+- 脚本进程还会收到 `GWR_REPO_URL`、`GWR_COMMIT_SHA`、`GWR_TASK_ID`、`GWR_RUN_ID` 四个环境变量。仓库 URL 对应 MR 源项目，commit SHA 固定为触发时的完整 SHA，并与源码 archive 一致；跨仓库 MR 也使用源仓库。两个位置参数保持不变，clone URL 不包含 Runner 的 GitLab token。
 - 每次运行的 `run.log` 最多保留 10 MiB，超出部分会继续读取后丢弃；`result.txt` 超过 1 MiB 会被拒绝并删除，脚本仍在运行时会在检测到超限后终止。脚本运行目录在执行和评论发布期间不会被清理，任务完成 24 小时后由启动或每小时清理删除。
 - 同一个 commit 完成后可以再次触发。
 - 但同一个 `project_id + mr_iid + commit_sha` 如果仍在执行中，新的触发会被跳过；服务会给触发评论加 `eyes`，并回复一条 MR 评论提示当前 commit 已有 review 正在执行，请稍后再试。
@@ -142,7 +144,7 @@ object_attributes.noteable_type = "MergeRequest"
 5. 解析评论正文中的 `@id`，分别匹配 `[[ai_reviews]].id` 和 `[[script_tasks]].id`。
 6. AI Review 只使用 AI 自己的 commit 去重和并发限制；每个脚本只使用该脚本自己的并发计数。
 7. 各个被准入的任务在后台独立执行，不会等待其他 AI 或脚本任务。
-8. 通过 GitLab API 读取 MR commit archive，运行脚本并读取本次调用专属的 `result.txt`；AI Review 则照常读取 MR diff。
+8. 通过 GitLab API 读取源项目在触发 commit 的 archive，运行脚本并读取本次调用专属的 `result.txt`；AI Review 则照常读取目标 MR diff。
 9. 各个任务分别发布结果或失败信息到 GitLab MR Discussion。
 10. 任务结束后释放各自的运行名额；并发已满时该任务立即失败，不进入等待队列。
 

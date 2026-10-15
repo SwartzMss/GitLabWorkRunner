@@ -22,6 +22,7 @@ pub struct MergeRequestEvent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MergeRequestNoteEvent {
     pub project_id: i64,
+    pub source_project_id: Option<i64>,
     pub project_name: Option<String>,
     pub project_path_with_namespace: Option<String>,
     pub mr_iid: i64,
@@ -96,6 +97,8 @@ struct NoteAttributes {
 struct NoteMergeRequestPayload {
     iid: i64,
     #[serde(default)]
+    source_project_id: Option<i64>,
+    #[serde(default)]
     last_commit: Option<LastCommit>,
 }
 
@@ -155,6 +158,7 @@ pub fn parse_merge_request_note_event(body: &[u8]) -> AppResult<Option<MergeRequ
         .unwrap_or_default();
     Ok(Some(MergeRequestNoteEvent {
         project_id,
+        source_project_id: merge_request.source_project_id,
         project_name: project.as_ref().and_then(|project| project.name.clone()),
         project_path_with_namespace: project.and_then(|project| project.path_with_namespace),
         mr_iid: merge_request.iid,
@@ -217,6 +221,7 @@ mod tests {
             },
             "merge_request": {
                 "iid": 45,
+                "source_project_id": 456,
                 "last_commit": { "id": "abc123" }
             }
         }"#;
@@ -227,6 +232,7 @@ mod tests {
             event,
             GitLabWebhookEvent::MergeRequestNote(MergeRequestNoteEvent {
                 project_id: 123,
+                source_project_id: Some(456),
                 project_name: Some("runner".into()),
                 project_path_with_namespace: Some("platform/runner".into()),
                 mr_iid: 45,
@@ -259,6 +265,7 @@ mod tests {
 
         assert!(event.is_create_action());
         assert_eq!(event.action, "create");
+        assert_eq!(event.source_project_id, None);
     }
 
     #[test]

@@ -102,6 +102,16 @@ struct MergeRequestMetadataResponse {
     changes_count: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct MergeRequestSourceProjectResponse {
+    source_project_id: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct GitLabProjectRepositoryResponse {
+    http_url_to_repo: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct DiffRefs {
     pub base_sha: Option<String>,
@@ -240,6 +250,31 @@ impl GitLabClient {
             }
             Err(err) => Err(err),
         }
+    }
+
+    pub async fn merge_request_source_project_id(
+        &self,
+        project_id: i64,
+        mr_iid: i64,
+    ) -> AppResult<i64> {
+        let url = format!(
+            "{}/api/v4/projects/{}/merge_requests/{}",
+            self.base_url, project_id, mr_iid
+        );
+        let (_, body, _) = self
+            .get_api_text(url, "fetch merge request source project from gitlab")
+            .await?;
+        let metadata: MergeRequestSourceProjectResponse = serde_json::from_str(&body)?;
+        require_source_project_id(metadata.source_project_id, mr_iid)
+    }
+
+    pub async fn project_http_url_to_repo(&self, project_id: i64) -> AppResult<String> {
+        let url = format!("{}/api/v4/projects/{}", self.base_url, project_id);
+        let (_, body, _) = self
+            .get_api_text(url, "fetch source project clone URL from gitlab")
+            .await?;
+        let project: GitLabProjectRepositoryResponse = serde_json::from_str(&body)?;
+        require_http_clone_url(project.http_url_to_repo, project_id)
     }
 
     async fn merge_request_diffs(
@@ -768,6 +803,33 @@ fn reclassify_gitlab_comment_failure(error: AppError) -> AppError {
     }
 }
 
+fn require_source_project_id(source_project_id: Option<i64>, mr_iid: i64) -> AppResult<i64> {
+    source_project_id.filter(|id| *id > 0).ok_or_else(|| {
+        AppError::gitlab(
+            ReviewErrorCode::GitLabApiFailed,
+            format!("merge request !{mr_iid} has no available source project"),
+        )
+    })
+}
+
+fn require_http_clone_url(clone_url: Option<String>, project_id: i64) -> AppResult<String> {
+    let clone_url = clone_url.map(|url| url.trim().to_owned()).filter(|url| {
+        let Some((scheme, authority_and_path)) = url.split_once("://") else {
+            return false;
+        };
+        let authority = authority_and_path.split('/').next().unwrap_or_default();
+        matches!(scheme, "http" | "https")
+            && !authority.is_empty()
+            && !url.chars().any(char::is_whitespace)
+    });
+    clone_url.ok_or_else(|| {
+        AppError::gitlab(
+            ReviewErrorCode::GitLabApiFailed,
+            format!("project {project_id} has no valid HTTP clone URL"),
+        )
+    })
+}
+
 fn longest_timeout(first: Duration, second: Duration) -> Duration {
     first.max(second)
 }
@@ -908,6 +970,50 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         format!("http://{}", addr)
+    }
+
+    #[tokio::test]
+    async fn reads_merge_request_source_project_and_project_clone_url() {
+        let app = Router::new()
+            .route(
+                "/api/v4/projects/1/merge_requests/2",
+                get(|| async { Json(json!({ "source_project_id": 9 })) }),
+            )
+            .route(
+                "/api/v4/projects/9",
+                get(|| async {
+                    Json(json!({
+                        "http_url_to_repo": "https://gitlab.example/group/source.git"
+                    }))
+                }),
+            );
+        let base_url = spawn_server(app).await;
+        let client = GitLabClient::new(base_url, "test-token".into());
+
+        let source_project_id = client.merge_request_source_project_id(1, 2).await.unwrap();
+        let clone_url = client
+            .project_http_url_to_repo(source_project_id)
+            .await
+            .unwrap();
+
+        assert_eq!(source_project_id, 9);
+        assert_eq!(clone_url, "https://gitlab.example/group/source.git");
+    }
+
+    #[test]
+    fn rejects_missing_source_project_ids_and_invalid_clone_urls() {
+        assert!(require_source_project_id(None, 2).is_err());
+        assert!(require_source_project_id(Some(0), 2).is_err());
+        assert_eq!(require_source_project_id(Some(9), 2).unwrap(), 9);
+        assert!(require_http_clone_url(None, 9).is_err());
+        assert!(require_http_clone_url(Some(String::new()), 9).is_err());
+        assert!(require_http_clone_url(Some("ssh://git@example.org/project".into()), 9).is_err());
+        assert!(require_http_clone_url(Some("https:///project".into()), 9).is_err());
+        assert_eq!(
+            require_http_clone_url(Some("https://git.example/group/project.git".into()), 9)
+                .unwrap(),
+            "https://git.example/group/project.git"
+        );
     }
 
     #[tokio::test]

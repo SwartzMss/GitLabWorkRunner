@@ -171,7 +171,7 @@ max_entry_path_bytes = 512         # 512 bytes
 
 ```
 
-`[gitlab].token` 是服务调用 GitLab API 使用的 token，和 Webhook 里的 `Secret token` 不是同一个东西。建议使用 Project Access Token 或专用 Bot 用户 token，scope 使用 `api`，项目角色至少 `Developer`。它需要能读取 MR diff、下载仓库 archive，并发布 MR discussion。不要把包含真实 token 的 `config.toml` 提交到仓库。`api_timeout_seconds` 控制普通 GitLab API 请求超时，`archive_timeout_seconds` 单独控制 repository archive 下载超时；两者默认都是 `30` 秒。
+`[gitlab].token` 是服务调用 GitLab API 使用的 token，和 Webhook 里的 `Secret token` 不是同一个东西。建议使用 Project Access Token 或专用 Bot 用户 token，scope 使用 `api`，项目角色至少 `Developer`。它需要能读取 MR 和源项目元数据、下载源仓库 archive，并发布目标 MR discussion；跨项目 MR 还需要读取源项目。不要把包含真实 token 的 `config.toml` 提交到仓库。`api_timeout_seconds` 控制普通 GitLab API 请求超时，`archive_timeout_seconds` 单独控制 repository archive 下载超时；两者默认都是 `30` 秒。
 
 `[ai_review].max_concurrent_reviews` 控制单进程内最多同时执行多少个 AI Review run，默认 `4`。脚本任务不占用这个上限；脚本的并发由每个 `[[script_tasks]].max_concurrent` 单独控制。旧配置中的 `[server].max_concurrent_reviews` 必须迁移到 `rules.toml` 的 `[ai_review]` 下。
 
@@ -273,6 +273,19 @@ max_concurrent = 1
 在 MR 评论中发送 `@lint` 或 `@security-check` 会运行对应脚本。每个脚本单独使用自己的 `max_concurrent` 名额，默认是 `1`；名额占满时本次立即失败并在 MR 留言，不进入等待队列。不同脚本和 AI Review 的并发计数互相独立。脚本运行超时由各自的 `timeout_seconds` 控制。Unix 上超时会终止独立进程组；Windows 上会调用系统 `taskkill` 并限制等待时间，如果该工具失败则回退为终止直接子进程，派生进程可能继续运行。
 
 Runner 会把本次 MR commit 的源码目录绝对路径和本次运行专属的 `result.txt` 绝对路径追加为命令参数。脚本应把结果写入第二个参数指定的文件；空文件表示没有发现。退出码 `0` 表示脚本执行成功，任何非 `0` 都会作为任务失败写入 MR 评论。成功运行时也会评论执行结果，包括空结果的“未发现问题”状态；非空结果中的 `path:line:message` 仅在路径、行号和本次 commit 的新增 diff 行匹配时发 inline comment，其他文本或无法定位的结果会发 MR 级评论。脚本命令在 runner 主机执行，只应配置管理员信任的命令。
+
+Runner 还会为每次脚本进程单独设置 `GWR_REPO_URL`、`GWR_COMMIT_SHA`、`GWR_TASK_ID` 和 `GWR_RUN_ID` 环境变量。`GWR_REPO_URL` 指向 MR 的源仓库，`GWR_COMMIT_SHA` 是本次触发时固定的完整 commit SHA，与传入源码一致；跨仓库 MR 也会使用源仓库。源码由 archive 解压而来，不包含 `.git`。原来的两个位置参数不变，脚本可以按需读取这些环境变量；Runner 不会把 GitLab token 放进 clone URL。
+
+Python 脚本可以这样读取：
+
+```python
+import os
+
+repo_url = os.environ["GWR_REPO_URL"]
+commit_sha = os.environ["GWR_COMMIT_SHA"]
+task_id = os.environ["GWR_TASK_ID"]
+run_id = os.environ["GWR_RUN_ID"]
+```
 
 每次运行的 `run.log` 最多保留 10 MiB，超出部分会继续读取后丢弃；`result.txt` 超过 1 MiB 会被拒绝，脚本仍在运行时会在检测到超限后终止，并删除超限结果文件。运行目录在任务和评论发布期间受到保护；任务结束 24 小时后，启动或每小时的清理会删除整个旧运行目录。
 `[ai_review]` 是全局 AI Review prompt 配置：内置 system prompt 始终生效，`extra_instructions` 会作为管理员配置的审查策略追加到 system prompt。缺省时只使用内置 prompt，不需要配置。

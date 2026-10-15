@@ -89,6 +89,8 @@ Every `[[ai_reviews]]` and `[[script_tasks]]` entry is disabled by default and m
 
 The runner passes each script the absolute source directory and a run-specific `result.txt` path as command arguments. Exit code `0` means execution succeeded; every non-zero code or timeout fails the task. An empty result file posts a clean-result MR comment. Non-empty text is posted as an MR comment; `path:line:message` rows become inline comments only when they match an added line in the same commit's diff.
 
+Each script process also receives `GWR_REPO_URL`, `GWR_COMMIT_SHA`, `GWR_TASK_ID`, and `GWR_RUN_ID` in its own environment. The URL identifies the source project for cross-project MRs, and the full SHA matches the commit used to download the source archive. The archive does not contain `.git`. The positional arguments and command working directory remain unchanged. The runner does not place its GitLab API token in the clone URL.
+
 The guard is process-local. Multi-instance deployments need a shared lock in SQLite/PostgreSQL or another coordination layer.
 
 ## GitLab API Client
@@ -98,13 +100,14 @@ Required GitLab REST API calls:
 ```text
 GET /projects/:id/merge_requests/:merge_request_iid
 GET /projects/:id/merge_requests/:merge_request_iid/diffs?page=:page&per_page=100
+GET /projects/:source_project_id
 GET /projects/:id/repository/archive.zip
 POST /projects/:id/merge_requests/:merge_request_iid/discussions
 ```
 
 Diff pages are fetched until pagination is complete. File-level `collapsed`, `too_large`, and `generated_file` metadata is preserved; unavailable diffs make review coverage incomplete. The deprecated `/changes` endpoint is used only as a compatibility fallback when `/diffs` is unavailable, and its `overflow` flag is also treated as incomplete coverage.
 
-The service uses `[gitlab].token`, not the webhook secret, for API calls. The token needs `api` scope and permission to read MR diffs, download repository archives, and publish MR discussions.
+The service uses `[gitlab].token`, not the webhook secret, for API calls. The token needs `api` scope and permission to read MR and source project metadata, download source repository archives, and publish discussions on the target MR. Cross project MRs also require access to the source project.
 
 ## Diff Parser
 

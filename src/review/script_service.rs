@@ -204,10 +204,28 @@ impl ScriptTaskService {
         task: &ScriptTaskConfig,
         run_id: &str,
     ) -> AppResult<(usize, usize)> {
+        if !is_full_git_commit_sha(&event.commit_sha) {
+            return Err(AppError::script_task(
+                ReviewErrorCode::ScriptTaskFailed,
+                format!(
+                    "script task `{}` requires a complete 40-character commit SHA",
+                    task.id
+                ),
+            ));
+        }
+        let source_project_id = self
+            .gitlab
+            .merge_request_source_project_id(event.project_id, event.mr_iid)
+            .await?;
+        validate_source_project_id(event.source_project_id, source_project_id, &task.id)?;
+        let repo_url = self
+            .gitlab
+            .project_http_url_to_repo(source_project_id)
+            .await?;
         let archive = self
             .gitlab
             .repository_archive(
-                event.project_id,
+                source_project_id,
                 &event.commit_sha,
                 self.archive_limits.max_archive_bytes,
             )
@@ -216,6 +234,7 @@ impl ScriptTaskService {
             project_id: event.project_id,
             mr_iid: event.mr_iid,
             commit_sha: &event.commit_sha,
+            repo_url: &repo_url,
             run_id,
         };
         let mut runner = ScriptTaskRunner::new().with_archive_limits(self.archive_limits.clone());
@@ -497,6 +516,28 @@ impl ScriptTaskService {
     }
 }
 
+fn is_full_git_commit_sha(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn validate_source_project_id(
+    webhook_source_project_id: Option<i64>,
+    gitlab_source_project_id: i64,
+    task_id: &str,
+) -> AppResult<()> {
+    if webhook_source_project_id
+        .is_some_and(|webhook_project_id| webhook_project_id != gitlab_source_project_id)
+    {
+        return Err(AppError::script_task(
+            ReviewErrorCode::ScriptTaskFailed,
+            format!(
+                "script task `{task_id}` source project changed after the webhook was received"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn is_added_line(diff: &str, requested_line: u32) -> bool {
     crate::review::diff::parse_unified_diff("", "", diff)
         .map(|parsed| {
@@ -612,6 +653,29 @@ mod tests {
         bytes.into_inner()
     }
 
+    #[test]
+    fn script_context_requires_a_full_git_sha() {
+        assert!(is_full_git_commit_sha(
+            "0123456789abcdef0123456789abcdef01234567"
+        ));
+        assert!(is_full_git_commit_sha(
+            "ABCDEF0123456789ABCDEF0123456789ABCDEF01"
+        ));
+        assert!(!is_full_git_commit_sha("abc123"));
+        assert!(!is_full_git_commit_sha(
+            "0123456789abcdef0123456789abcdef0123456g"
+        ));
+        assert!(!is_full_git_commit_sha(""));
+    }
+
+    #[test]
+    fn changed_source_project_is_rejected_before_archive_download() {
+        let error = validate_source_project_id(Some(456), 789, "check").unwrap_err();
+        assert!(error.to_string().contains("source project changed"));
+        assert!(validate_source_project_id(None, 789, "check").is_ok());
+        assert!(validate_source_project_id(Some(789), 789, "check").is_ok());
+    }
+
     #[tokio::test]
     async fn successful_script_result_is_posted_as_an_mr_comment() {
         let archive_bytes = Arc::new(archive_with_source());
@@ -620,11 +684,23 @@ mod tests {
         let script_path = temp.path().join("script.sh");
         fs::write(
             &script_path,
-            "printf 'src/lib.rs:7:bad value\\n' > \"$2\"\n",
+            "test \"$GWR_REPO_URL\" = 'https://gitlab.example/source/project.git' && test \"$GWR_COMMIT_SHA\" = '0123456789abcdef0123456789abcdef01234567' && test \"$GWR_TASK_ID\" = 'check' && test -n \"$GWR_RUN_ID\" && printf 'src/lib.rs:7:bad value\\n' > \"$2\"\n",
         )
         .unwrap();
         let app = Router::new()
-            .route("/api/v4/projects/123/repository/archive.zip", get(archive))
+            .route(
+                "/api/v4/projects/123/merge_requests/45",
+                get(|| async { Json(serde_json::json!({ "source_project_id": 456 })) }),
+            )
+            .route(
+                "/api/v4/projects/456",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "http_url_to_repo": "https://gitlab.example/source/project.git"
+                    }))
+                }),
+            )
+            .route("/api/v4/projects/456/repository/archive.zip", get(archive))
             .route(
                 "/api/v4/projects/123/merge_requests/45/discussions",
                 post(discussion),
@@ -650,10 +726,11 @@ mod tests {
         .with_work_root(temp.path().join("work"));
         let event = MergeRequestNoteEvent {
             project_id: 123,
+            source_project_id: Some(456),
             project_name: None,
             project_path_with_namespace: None,
             mr_iid: 45,
-            commit_sha: "abc123".into(),
+            commit_sha: "0123456789abcdef0123456789abcdef01234567".into(),
             action: "create".into(),
             note_id: 1,
             note: "@check".into(),
