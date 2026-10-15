@@ -258,6 +258,7 @@ title = "Lint check"
 command = "python scripts/lint.py"
 timeout_seconds = 120
 max_concurrent = 2
+download_archive = true
 
 [[script_tasks]]
 enabled = true
@@ -274,7 +275,9 @@ Posting `@lint` or `@security-check` runs the matching script. Each script has i
 
 The runner appends the absolute source directory for the MR commit and an absolute, run-specific `result.txt` path to the configured command. The script must write to the second argument; an empty file means no findings. Exit code `0` means the script completed successfully; any non-zero code is a task failure and is reported in an MR comment. Successful runs also post a result comment, including a clean result when the file is empty. A `path:line:message` line becomes an inline comment only when it matches an added line in this commit's diff; other text or results that cannot be located become MR-level comments. Commands run on the runner host, so configure only administrator-trusted commands.
 
-Each script process also receives `GWR_REPO_URL`, `GWR_COMMIT_SHA`, `GWR_TASK_ID`, and `GWR_RUN_ID` as environment variables. `GWR_REPO_URL` points to the MR source repository, and `GWR_COMMIT_SHA` is the full commit SHA fixed when the task was triggered; both match the source archive passed to the script. Cross-project MRs use the source repository. The source comes from an archive and does not contain `.git`. The two positional arguments stay unchanged, and the runner never embeds its GitLab token in the clone URL.
+`download_archive` defaults to `true` for each script task. Set it to `false` when the script needs only the repository URL and the commit SHA from the triggering comment; this skips archive download and extraction. The runner still passes both positional arguments, with the first pointing to an empty source directory and the second to `result.txt`.
+
+Each script process also receives `GWR_REPO_URL`, `GWR_COMMIT_SHA`, `GWR_TASK_ID`, and `GWR_RUN_ID` as environment variables. `GWR_REPO_URL` points to the MR source repository, and `GWR_COMMIT_SHA` is the full commit SHA from the triggering comment. Cross-project MRs use the source repository. When `download_archive` is enabled, that SHA selects the source archive, which does not contain `.git`. The two positional arguments stay unchanged, and the runner never embeds its GitLab token in the clone URL.
 
 Python scripts can read them with `os.environ["GWR_REPO_URL"]`, `os.environ["GWR_COMMIT_SHA"]`, `os.environ["GWR_TASK_ID"]`, and `os.environ["GWR_RUN_ID"]`.
 

@@ -21,6 +21,8 @@ enabled = false
 id = "example-check"
 title = "Example check"
 command = "python scripts/check.py"
+# Set false for tasks that use only GWR_REPO_URL/GWR_COMMIT_SHA and do not need repository files.
+download_archive = true
 timeout_seconds = 60
 max_concurrent = 1
 
