@@ -612,6 +612,25 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    fn native_script_command(script_path: &Path) -> String {
+        if cfg!(windows) {
+            shell_quote_arg(script_path)
+        } else {
+            format!("sh {}", shell_quote_arg(script_path))
+        }
+    }
+
+    fn script_command(script_path: &Path) -> String {
+        if cfg!(windows) {
+            format!(
+                "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {}",
+                shell_quote_arg(script_path)
+            )
+        } else {
+            format!("sh {}", shell_quote_arg(script_path))
+        }
+    }
+
     fn test_archive() -> Vec<u8> {
         let mut bytes = Cursor::new(Vec::new());
         {
@@ -740,11 +759,7 @@ mod tests {
             "printf '%s\\n' \"$#\" \"$1\" \"$2\" \"$GWR_REPO_URL\" \"$GWR_COMMIT_SHA\" \"$GWR_TASK_ID\" \"$GWR_RUN_ID\" > \"$2\"\n",
         )
         .unwrap();
-        let command = if cfg!(windows) {
-            format!("call {}", shell_quote_arg(&script_path))
-        } else {
-            format!("sh {}", shell_quote_arg(&script_path))
-        };
+        let command = native_script_command(&script_path);
         let task = ScriptTaskConfig {
             enabled: true,
             id: "check-env".into(),
@@ -801,11 +816,7 @@ mod tests {
             "printf '%s\\n' \"$GWR_REPO_URL\" \"$GWR_COMMIT_SHA\" \"$GWR_TASK_ID\" \"$GWR_RUN_ID\" > \"$2\"\n",
         )
         .unwrap();
-        let command = if cfg!(windows) {
-            format!("call {}", shell_quote_arg(&script_path))
-        } else {
-            format!("sh {}", shell_quote_arg(&script_path))
-        };
+        let command = native_script_command(&script_path);
         let task_a = ScriptTaskConfig {
             enabled: true,
             id: "task-a".into(),
@@ -975,7 +986,18 @@ mod tests {
             work_root: temp.path().join("work"),
             archive_limits: ArchiveLimits::default(),
         };
-        let script_path = temp.path().join("verbose.sh");
+        let script_path = temp.path().join(if cfg!(windows) {
+            "verbose.ps1"
+        } else {
+            "verbose.sh"
+        });
+        #[cfg(windows)]
+        fs::write(
+            &script_path,
+            "$payload = 'x' * 6000000\n[Console]::Out.Write($payload)\n[Console]::Error.Write($payload)\n",
+        )
+        .unwrap();
+        #[cfg(not(windows))]
         fs::write(
             &script_path,
             "head -c 6000000 /dev/zero\nhead -c 6000000 /dev/zero >&2\n",
@@ -985,7 +1007,7 @@ mod tests {
             enabled: true,
             id: "verbose".into(),
             title: "Verbose check".into(),
-            command: format!("sh {}", shell_quote_arg(&script_path)),
+            command: script_command(&script_path),
             timeout_seconds: 10,
             max_concurrent: 1,
         };
@@ -1010,7 +1032,18 @@ mod tests {
             work_root: temp.path().join("work"),
             archive_limits: ArchiveLimits::default(),
         };
-        let script_path = temp.path().join("oversized-result.sh");
+        let script_path = temp.path().join(if cfg!(windows) {
+            "oversized-result.ps1"
+        } else {
+            "oversized-result.sh"
+        });
+        #[cfg(windows)]
+        fs::write(
+            &script_path,
+            "$bytes = New-Object byte[] 1048577\n[System.IO.File]::WriteAllBytes($args[1], $bytes)\nStart-Sleep -Seconds 30\n",
+        )
+        .unwrap();
+        #[cfg(not(windows))]
         fs::write(
             &script_path,
             "i=0\nwhile [ \"$i\" -lt 129 ]; do\n  printf '%8192s' '' >> \"$2\"\n  i=$((i + 1))\ndone\nsleep 30\n",
@@ -1020,7 +1053,7 @@ mod tests {
             enabled: true,
             id: "oversized-result".into(),
             title: "Oversized result check".into(),
-            command: format!("sh {}", shell_quote_arg(&script_path)),
+            command: script_command(&script_path),
             timeout_seconds: 60,
             max_concurrent: 1,
         };
@@ -1054,7 +1087,18 @@ mod tests {
             work_root: temp.path().join("work"),
             archive_limits: ArchiveLimits::default(),
         };
-        let script_path = temp.path().join("failed-oversized-result.sh");
+        let script_path = temp.path().join(if cfg!(windows) {
+            "failed-oversized-result.ps1"
+        } else {
+            "failed-oversized-result.sh"
+        });
+        #[cfg(windows)]
+        fs::write(
+            &script_path,
+            "$bytes = New-Object byte[] 1048577\n[System.IO.File]::WriteAllBytes($args[1], $bytes)\nStart-Sleep -Seconds 2\nexit 7\n",
+        )
+        .unwrap();
+        #[cfg(not(windows))]
         fs::write(
             &script_path,
             "i=0\nwhile [ \"$i\" -lt 129 ]; do\n  printf '%8192s' '' >> \"$2\"\n  i=$((i + 1))\ndone\nexit 7\n",
@@ -1064,7 +1108,7 @@ mod tests {
             enabled: true,
             id: "failed-oversized-result".into(),
             title: "Failed oversized result check".into(),
-            command: format!("sh {}", shell_quote_arg(&script_path)),
+            command: script_command(&script_path),
             timeout_seconds: 10,
             max_concurrent: 1,
         };
