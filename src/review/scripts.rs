@@ -107,17 +107,28 @@ impl ScriptTaskRunner {
             commit_sha: context.commit_sha.to_string(),
             script_task_id: task.id.clone(),
         };
-        let extracted_files = extract_zip_archive(archive, &source_dir, &self.archive_limits)?;
-        info!(
-            project_id = context.project_id,
-            mr_iid = context.mr_iid,
-            commit_sha = %context.commit_sha,
-            script_task_id = %task.id,
-            archive_bytes = archive.len(),
-            extracted_files,
-            source_dir = %source_dir.display(),
-            "script task archive extracted"
-        );
+        if task.download_archive {
+            let extracted_files = extract_zip_archive(archive, &source_dir, &self.archive_limits)?;
+            info!(
+                project_id = context.project_id,
+                mr_iid = context.mr_iid,
+                commit_sha = %context.commit_sha,
+                script_task_id = %task.id,
+                archive_bytes = archive.len(),
+                extracted_files,
+                source_dir = %source_dir.display(),
+                "script task archive extracted"
+            );
+        } else {
+            info!(
+                project_id = context.project_id,
+                mr_iid = context.mr_iid,
+                commit_sha = %context.commit_sha,
+                script_task_id = %task.id,
+                source_dir = %source_dir.display(),
+                "script task archive download and extraction skipped"
+            );
+        }
         let script_cwd = script_working_dir()?;
 
         let command_with_args = command_with_script_args(&task.command, &source_dir, &result_path);
@@ -718,6 +729,7 @@ mod tests {
         };
         let task = ScriptTaskConfig {
             enabled: true,
+            download_archive: true,
             id: "check-root".into(),
             title: "Check root".into(),
             command,
@@ -772,6 +784,7 @@ mod tests {
         let command = native_script_command(&script_path);
         let task = ScriptTaskConfig {
             enabled: true,
+            download_archive: true,
             id: "check-env".into(),
             title: "Check environment".into(),
             command,
@@ -829,6 +842,7 @@ mod tests {
         let command = native_script_command(&script_path);
         let task_a = ScriptTaskConfig {
             enabled: true,
+            download_archive: true,
             id: "task-a".into(),
             title: "Task A".into(),
             command: command.clone(),
@@ -924,6 +938,7 @@ mod tests {
         };
         let task = ScriptTaskConfig {
             enabled: true,
+            download_archive: true,
             id: "failing".into(),
             title: "Failing check".into(),
             command: "exit 1".into(),
@@ -952,6 +967,7 @@ mod tests {
         };
         let task = ScriptTaskConfig {
             enabled: true,
+            download_archive: true,
             id: "check".into(),
             title: "Check".into(),
             command: "true".into(),
@@ -1019,6 +1035,7 @@ mod tests {
         .unwrap();
         let task = ScriptTaskConfig {
             enabled: true,
+            download_archive: true,
             id: "verbose".into(),
             title: "Verbose check".into(),
             command: script_command(&script_path),
@@ -1065,6 +1082,7 @@ mod tests {
         .unwrap();
         let task = ScriptTaskConfig {
             enabled: true,
+            download_archive: true,
             id: "oversized-result".into(),
             title: "Oversized result check".into(),
             command: script_command(&script_path),
@@ -1120,6 +1138,7 @@ mod tests {
         .unwrap();
         let task = ScriptTaskConfig {
             enabled: true,
+            download_archive: true,
             id: "failed-oversized-result".into(),
             title: "Failed oversized result check".into(),
             command: script_command(&script_path),
@@ -1162,6 +1181,7 @@ mod tests {
         .unwrap();
         let task = ScriptTaskConfig {
             enabled: true,
+            download_archive: true,
             id: "timeout".into(),
             title: "Timeout check".into(),
             command: format!("sh {}", shell_quote_arg(&script_path)),

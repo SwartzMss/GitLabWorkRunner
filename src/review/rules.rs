@@ -19,6 +19,8 @@ pub struct RulesFile {
 pub struct ScriptTaskConfig {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default = "default_script_download_archive")]
+    pub download_archive: bool,
     pub id: String,
     pub title: String,
     pub command: String,
@@ -234,6 +236,9 @@ impl Ruleset {
 
 fn default_script_timeout_seconds() -> u64 {
     60
+}
+fn default_script_download_archive() -> bool {
+    true
 }
 fn default_script_max_concurrent() -> usize {
     1

@@ -258,6 +258,7 @@ title = "Lint check"
 command = "python scripts/lint.py"
 timeout_seconds = 120
 max_concurrent = 2
+download_archive = true
 
 [[script_tasks]]
 enabled = true
@@ -274,7 +275,9 @@ max_concurrent = 1
 
 Runner 会把本次 MR commit 的源码目录绝对路径和本次运行专属的 `result.txt` 绝对路径追加为命令参数。脚本应把结果写入第二个参数指定的文件；空文件表示没有发现。退出码 `0` 表示脚本执行成功，任何非 `0` 都会作为任务失败写入 MR 评论。成功运行时也会评论执行结果，包括空结果的“未发现问题”状态；非空结果中的 `path:line:message` 仅在路径、行号和本次 commit 的新增 diff 行匹配时发 inline comment，其他文本或无法定位的结果会发 MR 级评论。脚本命令在 runner 主机执行，只应配置管理员信任的命令。
 
-Runner 还会为每次脚本进程单独设置 `GWR_REPO_URL`、`GWR_COMMIT_SHA`、`GWR_TASK_ID` 和 `GWR_RUN_ID` 环境变量。`GWR_REPO_URL` 指向 MR 的源仓库，`GWR_COMMIT_SHA` 是本次触发时固定的完整 commit SHA，与传入源码一致；跨仓库 MR 也会使用源仓库。源码由 archive 解压而来，不包含 `.git`。原来的两个位置参数不变，脚本可以按需读取这些环境变量；Runner 不会把 GitLab token 放进 clone URL。
+脚本任务的 `download_archive` 默认是 `true`。如果脚本只需要仓库 URL 和触发评论对应的 commit SHA，可设为 `false` 跳过 archive 下载和解压；Runner 仍会传入两个位置参数，第一个参数指向空源码目录，第二个参数仍是 `result.txt` 路径。
+
+Runner 还会为每次脚本进程单独设置 `GWR_REPO_URL`、`GWR_COMMIT_SHA`、`GWR_TASK_ID` 和 `GWR_RUN_ID` 环境变量。`GWR_REPO_URL` 指向 MR 的源仓库，`GWR_COMMIT_SHA` 是触发评论对应的完整 commit SHA；跨仓库 MR 也会使用源仓库。启用 `download_archive` 时，源码由该 SHA 对应的 archive 解压而来，且不包含 `.git`。原来的两个位置参数不变，脚本可以按需读取这些环境变量；Runner 不会把 GitLab token 放进 clone URL。
 
 Python 脚本可以这样读取：
 

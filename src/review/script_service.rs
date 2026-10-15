@@ -222,14 +222,17 @@ impl ScriptTaskService {
             .gitlab
             .project_http_url_to_repo(source_project_id)
             .await?;
-        let archive = self
-            .gitlab
-            .repository_archive(
-                source_project_id,
-                &event.commit_sha,
-                self.archive_limits.max_archive_bytes,
-            )
-            .await?;
+        let archive = if task.download_archive {
+            self.gitlab
+                .repository_archive(
+                    source_project_id,
+                    &event.commit_sha,
+                    self.archive_limits.max_archive_bytes,
+                )
+                .await?
+        } else {
+            Vec::new()
+        };
         let context = ScriptTaskContext {
             project_id: event.project_id,
             mr_iid: event.mr_iid,
@@ -737,6 +740,7 @@ mod tests {
         };
         let task = ScriptTaskConfig {
             enabled: true,
+            download_archive: true,
             id: "check".into(),
             title: "Check source".into(),
             command: format!(
