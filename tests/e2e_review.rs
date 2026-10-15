@@ -37,6 +37,7 @@ use zip::{write::SimpleFileOptions, ZipWriter};
 fn manual_note_event(note: &str) -> MergeRequestNoteEvent {
     MergeRequestNoteEvent {
         project_id: 123,
+        source_project_id: None,
         project_name: None,
         project_path_with_namespace: None,
         mr_iid: 45,
@@ -2058,6 +2059,7 @@ timeout_seconds = 10
     let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset);
     let event = MergeRequestNoteEvent {
         project_id: 123,
+        source_project_id: None,
         project_name: None,
         project_path_with_namespace: None,
         mr_iid: 45,
@@ -2213,6 +2215,7 @@ timeout_seconds = 10
         .with_review_run_id("rr-partial-manual".into());
     let event = MergeRequestNoteEvent {
         project_id: 123,
+        source_project_id: None,
         project_name: None,
         project_path_with_namespace: None,
         mr_iid: 45,
@@ -2337,6 +2340,7 @@ timeout_seconds = 10
     let service = ReviewService::new(GitLabClient::new(base_url, "token".into()), store, ruleset);
     let event = MergeRequestNoteEvent {
         project_id: 123,
+        source_project_id: None,
         project_name: None,
         project_path_with_namespace: None,
         mr_iid: 45,

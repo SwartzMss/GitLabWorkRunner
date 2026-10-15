@@ -31,10 +31,12 @@ pub struct ScriptTaskRunner {
     archive_limits: ArchiveLimits,
 }
 
+#[derive(Clone, Copy)]
 pub struct ScriptTaskContext<'a> {
     pub project_id: i64,
     pub mr_iid: i64,
     pub commit_sha: &'a str,
+    pub repo_url: &'a str,
     pub run_id: &'a str,
 }
 
@@ -154,7 +156,11 @@ impl ScriptTaskRunner {
             .current_dir(&script_cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            .kill_on_drop(true)
+            .env("GWR_REPO_URL", context.repo_url)
+            .env("GWR_COMMIT_SHA", context.commit_sha)
+            .env("GWR_TASK_ID", &task.id)
+            .env("GWR_RUN_ID", context.run_id);
 
         let started = Instant::now();
         let mut child = command.spawn()?;
@@ -693,6 +699,7 @@ mod tests {
             project_id: 1,
             mr_iid: 2,
             commit_sha: "abc",
+            repo_url: "https://gitlab.example/group/repo.git",
             run_id: "run-one",
         };
 
@@ -707,6 +714,180 @@ mod tests {
         assert!(!result.result_path.parent().unwrap().join("source").exists());
         assert!(result.run_log_path.exists());
         assert_eq!(fs::read_to_string(result.result_path).unwrap().trim(), "ok");
+    }
+
+    #[tokio::test]
+    async fn script_receives_run_context_in_environment_and_keeps_two_path_arguments() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = ScriptTaskRunner {
+            work_root: temp.path().join("work"),
+            archive_limits: ArchiveLimits::default(),
+        };
+        let script_path = temp.path().join(if cfg!(windows) {
+            "record-context.cmd"
+        } else {
+            "record-context.sh"
+        });
+        #[cfg(windows)]
+        fs::write(
+            &script_path,
+            "@echo off\r\nif not \"%~3\"==\"\" exit /b 1\r\n> \"%~2\" echo 2\r\n>> \"%~2\" echo %~1\r\n>> \"%~2\" echo %~2\r\n>> \"%~2\" echo %GWR_REPO_URL%\r\n>> \"%~2\" echo %GWR_COMMIT_SHA%\r\n>> \"%~2\" echo %GWR_TASK_ID%\r\n>> \"%~2\" echo %GWR_RUN_ID%\r\n",
+        )
+        .unwrap();
+        #[cfg(not(windows))]
+        fs::write(
+            &script_path,
+            "printf '%s\\n' \"$#\" \"$1\" \"$2\" \"$GWR_REPO_URL\" \"$GWR_COMMIT_SHA\" \"$GWR_TASK_ID\" \"$GWR_RUN_ID\" > \"$2\"\n",
+        )
+        .unwrap();
+        let command = if cfg!(windows) {
+            format!("call {}", shell_quote_arg(&script_path))
+        } else {
+            format!("sh {}", shell_quote_arg(&script_path))
+        };
+        let task = ScriptTaskConfig {
+            enabled: true,
+            id: "check-env".into(),
+            title: "Check environment".into(),
+            command,
+            timeout_seconds: 5,
+            max_concurrent: 1,
+        };
+        let repo_url = "https://gitlab.example/group/source.git";
+        let context = ScriptTaskContext {
+            project_id: 12,
+            mr_iid: 34,
+            commit_sha: "0123456789abcdef0123456789abcdef01234567",
+            repo_url,
+            run_id: "run-unique-1",
+        };
+
+        let result = runner.run(&task, &context, &test_archive()).await.unwrap();
+
+        assert_eq!(result.status, ScriptTaskStatus::Passed);
+        let values = fs::read_to_string(result.result_path).unwrap();
+        let values = values.lines().collect::<Vec<_>>();
+        assert_eq!(values.len(), 7);
+        assert_eq!(values[0], "2");
+        assert!(values[1].ends_with("/source") || values[1].ends_with("\\source"));
+        assert!(values[2].ends_with("/result.txt") || values[2].ends_with("\\result.txt"));
+        assert_eq!(values[3], repo_url);
+        assert_eq!(values[4], context.commit_sha);
+        assert_eq!(values[5], task.id);
+        assert_eq!(values[6], context.run_id);
+    }
+
+    #[tokio::test]
+    async fn concurrent_script_runs_keep_task_and_commit_environment_separate() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = ScriptTaskRunner {
+            work_root: temp.path().join("work"),
+            archive_limits: ArchiveLimits::default(),
+        };
+        let script_path = temp.path().join(if cfg!(windows) {
+            "record-context.cmd"
+        } else {
+            "record-context.sh"
+        });
+        #[cfg(windows)]
+        fs::write(
+            &script_path,
+            "@echo off\r\n> \"%~2\" echo %GWR_REPO_URL%\r\n>> \"%~2\" echo %GWR_COMMIT_SHA%\r\n>> \"%~2\" echo %GWR_TASK_ID%\r\n>> \"%~2\" echo %GWR_RUN_ID%\r\n",
+        )
+        .unwrap();
+        #[cfg(not(windows))]
+        fs::write(
+            &script_path,
+            "printf '%s\\n' \"$GWR_REPO_URL\" \"$GWR_COMMIT_SHA\" \"$GWR_TASK_ID\" \"$GWR_RUN_ID\" > \"$2\"\n",
+        )
+        .unwrap();
+        let command = if cfg!(windows) {
+            format!("call {}", shell_quote_arg(&script_path))
+        } else {
+            format!("sh {}", shell_quote_arg(&script_path))
+        };
+        let task_a = ScriptTaskConfig {
+            enabled: true,
+            id: "task-a".into(),
+            title: "Task A".into(),
+            command: command.clone(),
+            timeout_seconds: 5,
+            max_concurrent: 2,
+        };
+        let task_b = ScriptTaskConfig {
+            id: "task-b".into(),
+            title: "Task B".into(),
+            ..task_a.clone()
+        };
+        let context_a = ScriptTaskContext {
+            project_id: 12,
+            mr_iid: 34,
+            commit_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            repo_url: "https://gitlab.example/group/a.git",
+            run_id: "run-a-1",
+        };
+        let context_b = ScriptTaskContext {
+            project_id: 12,
+            mr_iid: 34,
+            commit_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            repo_url: "https://gitlab.example/group/b.git",
+            run_id: "run-b-1",
+        };
+        let context_a_again = ScriptTaskContext {
+            commit_sha: "cccccccccccccccccccccccccccccccccccccccc",
+            repo_url: "https://gitlab.example/group/c.git",
+            run_id: "run-a-2",
+            ..context_a
+        };
+
+        let archive = test_archive();
+        let (run_a, run_b, run_a_again) = tokio::join!(
+            runner.run(&task_a, &context_a, &archive),
+            runner.run(&task_b, &context_b, &archive),
+            runner.run(&task_a, &context_a_again, &archive),
+        );
+        let run_a = run_a.unwrap();
+        let run_b = run_b.unwrap();
+        let run_a_again = run_a_again.unwrap();
+
+        assert_ne!(run_a.result_path, run_a_again.result_path);
+        assert_ne!(run_a.result_path, run_b.result_path);
+        assert_eq!(
+            fs::read_to_string(run_a.result_path)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            [
+                "https://gitlab.example/group/a.git",
+                context_a.commit_sha,
+                "task-a",
+                "run-a-1"
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(run_b.result_path)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            [
+                "https://gitlab.example/group/b.git",
+                context_b.commit_sha,
+                "task-b",
+                "run-b-1"
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(run_a_again.result_path)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            [
+                "https://gitlab.example/group/c.git",
+                context_a_again.commit_sha,
+                "task-a",
+                "run-a-2"
+            ]
+        );
     }
 
     #[tokio::test]
@@ -728,6 +909,7 @@ mod tests {
             project_id: 1,
             mr_iid: 2,
             commit_sha: "abc",
+            repo_url: "https://gitlab.example/group/repo.git",
             run_id: "run-1",
         };
 
@@ -755,6 +937,7 @@ mod tests {
             project_id: 1,
             mr_iid: 2,
             commit_sha: "abc",
+            repo_url: "https://gitlab.example/group/repo.git",
             run_id: "run-1",
         };
         let second = ScriptTaskContext {
@@ -810,6 +993,7 @@ mod tests {
             project_id: 1,
             mr_iid: 2,
             commit_sha: "abc",
+            repo_url: "https://gitlab.example/group/repo.git",
             run_id: "run-verbose",
         };
 
@@ -844,6 +1028,7 @@ mod tests {
             project_id: 1,
             mr_iid: 2,
             commit_sha: "abc",
+            repo_url: "https://gitlab.example/group/repo.git",
             run_id: "run-oversized-result",
         };
 
@@ -887,6 +1072,7 @@ mod tests {
             project_id: 1,
             mr_iid: 2,
             commit_sha: "abc",
+            repo_url: "https://gitlab.example/group/repo.git",
             run_id: "run-failed-oversized-result",
         };
 
@@ -928,6 +1114,7 @@ mod tests {
             project_id: 1,
             mr_iid: 2,
             commit_sha: "abc",
+            repo_url: "https://gitlab.example/group/repo.git",
             run_id: "run-timeout",
         };
 
