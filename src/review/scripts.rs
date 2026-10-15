@@ -379,11 +379,12 @@ fn shell_command(command: &str, check_root: &Path, result_path: &Path) -> Comman
     #[cfg(windows)]
     {
         let mut process = Command::new("cmd");
+        let command = command_with_script_args(command, check_root, result_path);
+        // cmd.exe has custom /C parsing, so preserve the inner path quotes verbatim.
         process
+            .arg("/S")
             .arg("/C")
-            .arg(command)
-            .arg(check_root)
-            .arg(result_path);
+            .raw_arg(format!(" \"{command}\""));
         process
     }
     #[cfg(not(windows))]
@@ -631,6 +632,15 @@ mod tests {
         }
     }
 
+    fn assert_script_status(result: &ScriptTaskResult, expected: ScriptTaskStatus) {
+        assert_eq!(
+            result.status,
+            expected,
+            "script output:\n{}",
+            fs::read_to_string(&result.run_log_path).unwrap_or_default()
+        );
+    }
+
     fn test_archive() -> Vec<u8> {
         let mut bytes = Cursor::new(Vec::new());
         {
@@ -750,7 +760,7 @@ mod tests {
         #[cfg(windows)]
         fs::write(
             &script_path,
-            "@echo off\r\nif not \"%~3\"==\"\" exit /b 1\r\n> \"%~2\" echo 2\r\n>> \"%~2\" echo %~1\r\n>> \"%~2\" echo %~2\r\n>> \"%~2\" echo %GWR_REPO_URL%\r\n>> \"%~2\" echo %GWR_COMMIT_SHA%\r\n>> \"%~2\" echo %GWR_TASK_ID%\r\n>> \"%~2\" echo %GWR_RUN_ID%\r\n",
+            "@echo off\r\n@echo arg1=%~1\r\n@echo arg2=%~2\r\n@echo arg3=%~3\r\n@echo repo=%GWR_REPO_URL%\r\n@echo commit=%GWR_COMMIT_SHA%\r\n@echo task=%GWR_TASK_ID%\r\n@echo run=%GWR_RUN_ID%\r\nif not \"%~3\"==\"\" exit /b 1\r\n> \"%~2\" echo 2\r\n>> \"%~2\" echo %~1\r\n>> \"%~2\" echo %~2\r\n>> \"%~2\" echo %GWR_REPO_URL%\r\n>> \"%~2\" echo %GWR_COMMIT_SHA%\r\n>> \"%~2\" echo %GWR_TASK_ID%\r\n>> \"%~2\" echo %GWR_RUN_ID%\r\n",
         )
         .unwrap();
         #[cfg(not(windows))]
@@ -779,7 +789,7 @@ mod tests {
 
         let result = runner.run(&task, &context, &test_archive()).await.unwrap();
 
-        assert_eq!(result.status, ScriptTaskStatus::Passed);
+        assert_script_status(&result, ScriptTaskStatus::Passed);
         let values = fs::read_to_string(result.result_path).unwrap();
         let values = values.lines().collect::<Vec<_>>();
         assert_eq!(values.len(), 7);
@@ -860,6 +870,10 @@ mod tests {
         let run_a = run_a.unwrap();
         let run_b = run_b.unwrap();
         let run_a_again = run_a_again.unwrap();
+
+        assert_script_status(&run_a, ScriptTaskStatus::Passed);
+        assert_script_status(&run_b, ScriptTaskStatus::Passed);
+        assert_script_status(&run_a_again, ScriptTaskStatus::Passed);
 
         assert_ne!(run_a.result_path, run_a_again.result_path);
         assert_ne!(run_a.result_path, run_b.result_path);
@@ -1021,7 +1035,7 @@ mod tests {
 
         let result = runner.run(&task, &context, &test_archive()).await.unwrap();
 
-        assert_eq!(result.status, ScriptTaskStatus::Passed);
+        assert_script_status(&result, ScriptTaskStatus::Passed);
         assert!(fs::metadata(result.run_log_path).unwrap().len() <= 10 * 1024 * 1024);
     }
 
@@ -1073,7 +1087,7 @@ mod tests {
         .expect("result output limit should stop a script before its timeout")
         .unwrap();
 
-        assert_eq!(format!("{:?}", result.status), "OutputLimit");
+        assert_script_status(&result, ScriptTaskStatus::OutputLimit);
         assert!(
             !result.result_path.exists(),
             "oversized result files should not be retained with the run artifacts"
@@ -1122,7 +1136,7 @@ mod tests {
 
         let result = runner.run(&task, &context, &test_archive()).await.unwrap();
 
-        assert_eq!(result.status, ScriptTaskStatus::OutputLimit);
+        assert_script_status(&result, ScriptTaskStatus::OutputLimit);
         assert!(!result.result_path.exists());
     }
 
