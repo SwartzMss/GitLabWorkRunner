@@ -379,11 +379,12 @@ fn shell_command(command: &str, check_root: &Path, result_path: &Path) -> Comman
     #[cfg(windows)]
     {
         let mut process = Command::new("cmd");
+        let command = command_with_script_args(command, check_root, result_path);
+        // cmd.exe has custom /C parsing, so preserve the inner path quotes verbatim.
         process
+            .arg("/S")
             .arg("/C")
-            .arg(command)
-            .arg(check_root)
-            .arg(result_path);
+            .raw_arg(format!(" \"{command}\""));
         process
     }
     #[cfg(not(windows))]
