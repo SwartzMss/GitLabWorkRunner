@@ -1564,7 +1564,7 @@ async fn archive_limit_uses_diff_only_execution_without_context_tools() {
             post(move |body: Bytes| {
                 let ai_request_count = Arc::clone(&ai_request_count_for_handler);
                 async move {
-                    let attempt = ai_request_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    ai_request_count.fetch_add(1, Ordering::SeqCst);
                     let body: Value = serde_json::from_slice(&body).unwrap();
                     assert_eq!(body["response_format"]["type"], "json_object");
                     assert!(body.get("tools").is_none());
