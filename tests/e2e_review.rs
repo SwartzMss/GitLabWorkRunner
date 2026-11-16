@@ -1420,7 +1420,7 @@ async fn timeout_fallback_persists_final_diff_only_coverage_metadata_and_summary
                         sleep(Duration::from_secs(2)).await;
                         return Json(json!({"choices":[{"message":{"content":"{\"findings\":[]}"}}]}));
                     }
-                    Json(json!({"choices":[{"message":{"content":"","tool_calls":[{"id":"fallback-submit","type":"function","function":{"name":"submit_review_findings","arguments":"{\"findings\":[{\"path\":\"src/a.rs\",\"line\":1,\"severity\":\"error\",\"title\":\"Fallback only\",\"message\":\"Found by diff-only fallback.\"}]}"}}]}}]}))
+                    Json(json!({"choices":[{"finish_reason":"stop","message":{"content":"{\"findings\":[{\"path\":\"src/a.rs\",\"line\":1,\"severity\":\"error\",\"title\":\"Fallback only\",\"message\":\"Found by diff-only fallback.\"}]}"}}]}))
                 }
             }),
         )
@@ -1482,11 +1482,9 @@ max_batches = 1
         );
         bodies[1].clone()
     };
-    assert_eq!(fallback["tools"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        fallback["tools"][0]["function"]["name"],
-        "submit_review_findings"
-    );
+    assert_eq!(fallback["response_format"]["type"], "json_object");
+    assert!(fallback.get("tools").is_none());
+    assert!(fallback.get("tool_choice").is_none());
     assert!(fallback["messages"]
         .as_array()
         .unwrap()
@@ -1566,60 +1564,20 @@ async fn archive_limit_uses_diff_only_execution_without_context_tools() {
             post(move |body: Bytes| {
                 let ai_request_count = Arc::clone(&ai_request_count_for_handler);
                 async move {
-                    let attempt = ai_request_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    ai_request_count.fetch_add(1, Ordering::SeqCst);
                     let body: Value = serde_json::from_slice(&body).unwrap();
-                    let tool_names: Vec<_> = body["tools"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .map(|tool| tool["function"]["name"].as_str().unwrap())
-                        .collect();
-                    assert_eq!(tool_names, vec!["submit_review_findings"]);
+                    assert_eq!(body["response_format"]["type"], "json_object");
+                    assert!(body.get("tools").is_none());
+                    assert!(body.get("tool_choice").is_none());
                     assert!(body["messages"]
                         .as_array()
                         .unwrap()
                         .iter()
                         .all(|message| message["role"] != "tool"));
-                    if attempt % 2 == 1 {
-                        return Json(json!({
-                            "choices": [{
-                                "message": {
-                                    "content": "",
-                                    "tool_calls": [{
-                                        "id": "hallucinated-read",
-                                        "type": "function",
-                                        "function": {
-                                            "name": "read_file",
-                                            "arguments": "{\"path\":\"src/lib.rs\"}"
-                                        }
-                                    }]
-                                }
-                            }]
-                        }));
-                    }
-                    assert!(body["messages"].as_array().unwrap().iter().all(|message| {
-                        message["tool_calls"].as_array().is_none_or(|calls| {
-                            calls.iter().all(|call| {
-                                !matches!(
-                                    call["function"]["name"].as_str(),
-                                    Some("read_file" | "search_code" | "list_files")
-                                )
-                            })
-                        })
-                    }));
                     Json(json!({
                         "choices": [{
-                            "message": {
-                                "content": "",
-                                "tool_calls": [{
-                                    "id": "call-submit",
-                                    "type": "function",
-                                    "function": {
-                                        "name": "submit_review_findings",
-                                        "arguments": "{\"findings\":[]}"
-                                    }
-                                }]
-                            }
+                            "finish_reason": "stop",
+                            "message": {"content": "{\"findings\":[]}"}
                         }]
                     }))
                 }
@@ -1672,7 +1630,7 @@ model = "test-model"
         .unwrap();
 
     assert_eq!(archive_request_count.load(Ordering::SeqCst), 1);
-    assert_eq!(ai_request_count.load(Ordering::SeqCst), 2);
+    assert_eq!(ai_request_count.load(Ordering::SeqCst), 1);
     assert_eq!(summary.findings, 0);
     assert_eq!(summary.comments, 1);
     let body = summary_body.lock().unwrap().clone();

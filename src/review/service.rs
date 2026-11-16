@@ -2087,13 +2087,9 @@ mod tests {
             message["role"] == "system"
                 && message["content"].as_str() == Some(TIMEOUT_DIFF_ONLY_INSTRUCTION)
         }));
-        let tool_names = fallback["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|tool| tool["function"]["name"].as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(tool_names, vec!["submit_review_findings"]);
+        assert_eq!(fallback["response_format"]["type"], "json_object");
+        assert!(fallback.get("tools").is_none());
+        assert!(fallback.get("tool_choice").is_none());
         assert!(fallback_messages.last().unwrap()["content"]
             .as_str()
             .unwrap()
