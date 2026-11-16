@@ -168,6 +168,7 @@ struct AiReviewSingleOptions<'a> {
     review_request: Option<&'a str>,
     trusted_runtime_instruction: Option<&'a str>,
     progress: Option<mpsc::UnboundedSender<AiReviewProgress>>,
+    force_json_output: bool,
 }
 
 pub async fn run_ai_review(
@@ -237,6 +238,7 @@ pub(crate) async fn run_ai_review_execution_with_runtime_instruction_and_progres
         review_request,
         trusted_runtime_instruction,
         progress,
+        trusted_runtime_instruction.is_some(),
     )
     .await
 }
@@ -285,6 +287,7 @@ async fn run_ai_review_single(
         review_request,
         trusted_runtime_instruction,
         progress,
+        force_json_output,
     } = options;
     let api_key = config.api_key.trim();
     if api_key.is_empty() {
@@ -298,7 +301,9 @@ async fn run_ai_review_single(
     let request_timeout = Duration::from_secs(request_timeout_seconds);
     let request_guard_timeout = request_timeout + Duration::from_secs(5);
     let client = shared_ai_http_client()?;
-    let mut use_tool_calls = true;
+    // Diff-only fallback uses JSON output and exposes no tools, including
+    // submit_review_findings, to avoid an unnecessary tool-call round trip.
+    let mut use_tool_calls = !force_json_output;
     let tool_context = AiReviewToolContext::new(config, source_dir);
     let context_tools_enabled = tool_context.enabled();
     let context_tool_names = tool_context.enabled_tool_names();
@@ -553,6 +558,7 @@ async fn run_batched_ai_review(
     review_request: Option<&str>,
     trusted_runtime_instruction: Option<&str>,
     progress: Option<mpsc::UnboundedSender<AiReviewProgress>>,
+    force_json_output: bool,
 ) -> AiReviewExecution {
     let deadline = Instant::now() + Duration::from_secs(config.timeout_seconds.max(1));
     let mut plan = plan_ai_review_batches(
@@ -628,6 +634,7 @@ async fn run_batched_ai_review(
                     review_request,
                     trusted_runtime_instruction,
                     progress: progress.clone(),
+                    force_json_output,
                 },
             ),
         )
@@ -5202,6 +5209,53 @@ mod tests {
             error.review_failure().map(|failure| failure.code),
             Some(ReviewErrorCode::AiToolLoopTimeout)
         );
+    }
+
+    #[tokio::test]
+    async fn diff_only_runtime_instruction_uses_json_without_tools() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_json_request(&mut stream).await;
+            assert_eq!(request["response_format"]["type"], "json_object");
+            assert!(request.get("tools").is_none());
+            assert!(request.get("tool_choice").is_none());
+
+            let body = br#"{"choices":[{"finish_reason":"stop","message":{"content":"{\"findings\":[]}"}}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+        });
+
+        let config = AiReviewConfig {
+            enabled: true,
+            base_url: format!("http://{addr}"),
+            ..test_ai_review_config()
+        };
+        let changes = vec![GitLabChange {
+            old_path: "src/lib.rs".into(),
+            new_path: "src/lib.rs".into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: "@@ -1 +1 @@\n+panic!();\n".into(),
+        }];
+
+        let execution = run_ai_review_execution_with_runtime_instruction(
+            &config,
+            &changes,
+            None,
+            None,
+            Some("Review only the supplied diff."),
+        )
+        .await;
+
+        assert!(execution.result.unwrap().is_empty());
+        assert_eq!(execution.coverage.unwrap().completed_batches, 1);
     }
 
     #[tokio::test]
