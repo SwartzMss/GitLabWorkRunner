@@ -915,7 +915,7 @@ fn is_tool_call_rejection(status: u16, body: &str) -> bool {
 }
 
 fn is_retryable_ai_http_response(status: u16, body: &str) -> bool {
-    is_timeout_ai_http_response(status, body) || matches!(status, 429 | 500 | 502 | 503)
+    is_timeout_ai_http_response(status, body) || matches!(status, 429 | 502 | 503)
 }
 
 fn provider_http_error_code(
@@ -927,7 +927,7 @@ fn provider_http_error_code(
         ReviewErrorCode::PermissionDenied
     } else if should_enter_timeout_finalization(status, body) {
         timeout_code
-    } else if is_retryable_ai_http_response(status, body) {
+    } else if is_retryable_ai_http_response(status, body) || status == 500 {
         ReviewErrorCode::AiProviderUnavailable
     } else {
         ReviewErrorCode::AiRequestFailed

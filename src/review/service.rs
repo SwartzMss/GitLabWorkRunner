@@ -1670,6 +1670,7 @@ mod tests {
                 total_diff_bytes: 0,
                 reviewed_diff_bytes: 0,
             }],
+            provider: AiReviewProviderMetadata::default(),
         }
     }
 

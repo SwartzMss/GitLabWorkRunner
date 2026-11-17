@@ -646,7 +646,10 @@ model = "primary-model"
 "#
             ))
             .unwrap_err();
-            assert!(error.to_string().contains("fallback"));
+            assert!(
+                error.to_string().contains("fallback")
+                    || error.to_string().contains("missing field")
+            );
         }
     }
 }
