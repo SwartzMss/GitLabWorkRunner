@@ -1238,13 +1238,21 @@ async fn ai_review_switches_to_backup_provider_once_and_keeps_it_for_remaining_b
     });
     let changes = ["src/a.rs", "src/b.rs", "src/c.rs"]
         .into_iter()
-        .map(|path| GitLabChange {
-            old_path: path.into(),
-            new_path: path.into(),
-            new_file: false,
-            renamed_file: false,
-            deleted_file: false,
-            diff: format!("@@ -1 +1 @@\n+let value = 1; // {path}\n"),
+        .map(|path| {
+            let diff = match path {
+                "src/a.rs" => "@@ -1 +1 @@\n+let a = 1;\n",
+                "src/b.rs" => "@@ -1 +1 @@\n+let b = 2;\n",
+                "src/c.rs" => "@@ -1 +1 @@\n+let c = 3;\n",
+                _ => unreachable!(),
+            };
+            GitLabChange {
+                old_path: path.into(),
+                new_path: path.into(),
+                new_file: false,
+                renamed_file: false,
+                deleted_file: false,
+                diff: diff.into(),
+            }
         })
         .collect::<Vec<_>>();
 
