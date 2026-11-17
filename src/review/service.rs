@@ -9,7 +9,7 @@ use crate::{
     error::{AppError, AppResult, ReviewErrorCode, ReviewFailure},
     gitlab::{CreateDiscussionRequest, DiscussionPosition, GitLabChange, GitLabClient},
     review::archive::extract_zip_archive,
-    rules::{AiReviewConfig, AiReviewProviderConfig, Finding, Ruleset, Severity},
+    rules::{AiReviewConfig, Finding, Ruleset, Severity},
     storage::{
         ReviewRequestStart, StateStore, StoredComment, StoredFinding, StoredReviewCoverage,
         StoredReviewCoverageFile, TaskRunExecutionMetadata, TaskRunFinish, TaskRunProgress,
@@ -24,6 +24,8 @@ use std::{
     time::Instant,
 };
 use tracing::{info, warn};
+#[cfg(test)]
+use crate::rules::AiReviewProviderConfig;
 
 const ARCHIVE_DIFF_ONLY_INSTRUCTION: &str = "Repository context is unavailable for this execution. Review only the supplied MR diff. Do not request or rely on repository context tools.";
 const TIMEOUT_DIFF_ONLY_INSTRUCTION: &str = "The context-assisted review timed out. Start a new review using only the supplied MR diff, and base every finding on that diff. Do not request or rely on repository context tools.";

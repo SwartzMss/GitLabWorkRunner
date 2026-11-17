@@ -245,6 +245,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       archive_limit_exceeded: "Archive 超出安全限制",
       review_run_timeout: "Context Review 整体超时",
       ai_request_timeout: "AI 请求超时",
+      ai_provider_unavailable: "AI 服务暂不可用",
       ai_tool_loop_timeout: "Context tool loop 超时"
     }[reason] || reason || "");
     const renderFailure = (failure) => failure ? `<div class="failure"><div><span class="badge failed">${esc(errorCodeText(failure.code))}</span>${failure.code ? ` <code>${esc(failure.code)}</code>` : ""}</div><pre class="failure-message">${esc(failure.message || "-")}</pre></div>` : "";
