@@ -251,6 +251,13 @@ request_timeout_seconds = 300
 max_batch_diff_bytes = 15000
 max_batches = 10
 
+# 可选备用模型：仍属于同一个 AI Review 任务，不要另建第二个 [[ai_reviews]]。
+# 主模型连续遇到可切换的服务故障时，Runner 会重跑当前失败批次并将后续批次固定到备用模型。
+# [ai_reviews.fallback]
+# base_url = "https://backup-provider.example/v1"
+# api_key = "<your-backup-ai-api-key>"
+# model = "backup-model"
+
 [[script_tasks]]
 enabled = true
 id = "lint"
@@ -269,7 +276,7 @@ timeout_seconds = 60
 max_concurrent = 1
 ```
 
-在 MR 评论中发送独立的 `@ai-review` 会触发 `id = "ai-review"` 的配置。MR 更新事件会被接收并忽略，不会进入 review 队列。
+在 MR 评论中发送独立的 `@ai-review` 会触发 `id = "ai-review"` 的配置。可选的 `[ai_reviews.fallback]` 用于配置备用服务入口、Token 和模型；主模型遇到请求超时、限流、服务端故障、连接故障或认证失败时，Runner 会在当前 Review 内切换一次，重跑失败批次，并让后续批次继续使用备用模型。Context 超时后进入 Diff-only 时也会沿用当前模型。未配置 fallback 时行为保持原样。MR 更新事件会被接收并忽略，不会进入 review 队列。
 
 在 MR 评论中发送 `@lint` 或 `@security-check` 会运行对应脚本。每个脚本单独使用自己的 `max_concurrent` 名额，默认是 `1`；名额占满时本次立即失败并在 MR 留言，不进入等待队列。不同脚本和 AI Review 的并发计数互相独立。脚本运行超时由各自的 `timeout_seconds` 控制。Unix 上超时会终止独立进程组；Windows 上会调用系统 `taskkill` 并限制等待时间，如果该工具失败则回退为终止直接子进程，派生进程可能继续运行。
 
