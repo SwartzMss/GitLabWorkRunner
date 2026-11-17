@@ -645,7 +645,8 @@ model = "primary-model"
 {fallback}
 "#
             ))
-            .unwrap_err();
+            .err()
+            .unwrap();
             assert!(
                 error.to_string().contains("fallback")
                     || error.to_string().contains("missing field")
