@@ -1216,7 +1216,7 @@ async fn ai_review_switches_to_backup_provider_once_and_keeps_it_for_remaining_b
                                     "findings": [{
                                         "path": path,
                                         "line": 1,
-                                        "severity": "warning",
+                                        "severity": "error",
                                         "title": "Backup finding",
                                         "message": "Completed by backup."
                                     }]
