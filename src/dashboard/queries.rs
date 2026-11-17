@@ -120,6 +120,9 @@ pub struct DashboardTaskRun {
     pub finished_at: Option<String>,
     pub execution_mode: Option<String>,
     pub fallback_reason: Option<String>,
+    pub primary_model: Option<String>,
+    pub actual_model: Option<String>,
+    pub provider_fallback_reason: Option<String>,
     pub context_elapsed_ms: Option<i64>,
     pub fallback_elapsed_ms: Option<i64>,
     pub context_elapsed_display: Option<String>,
@@ -278,6 +281,9 @@ impl DashboardStore {
             "coverage_complete",
             "execution_mode",
             "fallback_reason",
+            "primary_model",
+            "actual_model",
+            "provider_fallback_reason",
             "context_elapsed_ms",
             "fallback_elapsed_ms",
             "progress_phase",
@@ -643,7 +649,8 @@ where 1 = 1
         let rows = sqlx::query(
             r#"
 select task_type, task_id, title, status, findings, comments, error_code, error, started_at, finished_at,
-    execution_mode, fallback_reason, context_elapsed_ms, fallback_elapsed_ms,
+    execution_mode, fallback_reason, primary_model, actual_model, provider_fallback_reason,
+    context_elapsed_ms, fallback_elapsed_ms,
     progress_phase, progress_message, progress_current, progress_total, progress_unit, progress_updated_at,
     coverage_total_files, coverage_fully_reviewed_files, coverage_partially_reviewed_files,
     coverage_unreviewed_files, coverage_total_diff_bytes, coverage_reviewed_diff_bytes,
@@ -698,6 +705,9 @@ from review_coverage_files where review_run_id = ? and task_type = ? and task_id
                 finished_at: row.get("finished_at"),
                 execution_mode: row.get("execution_mode"),
                 fallback_reason: row.get("fallback_reason"),
+                primary_model: row.get("primary_model"),
+                actual_model: row.get("actual_model"),
+                provider_fallback_reason: row.get("provider_fallback_reason"),
                 context_elapsed_ms,
                 fallback_elapsed_ms,
                 context_elapsed_display,
@@ -1032,6 +1042,9 @@ values ('legacy-run', 'script_task', 'legacy-script', 'Legacy Script', 'complete
         assert_eq!(detail.tasks[0].task_type, "script_task");
         assert_eq!(detail.tasks[0].execution_mode, None);
         assert_eq!(detail.tasks[0].fallback_reason, None);
+        assert_eq!(detail.tasks[0].primary_model, None);
+        assert_eq!(detail.tasks[0].actual_model, None);
+        assert_eq!(detail.tasks[0].provider_fallback_reason, None);
         assert_eq!(detail.tasks[0].context_elapsed_ms, None);
         assert_eq!(detail.tasks[0].fallback_elapsed_ms, None);
         assert_eq!(detail.tasks[0].context_elapsed_display, None);
@@ -1053,6 +1066,10 @@ values ('legacy-run', 'script_task', 'legacy-script', 'Legacy Script', 'complete
             .execute(&pool).await.unwrap();
         sqlx::query("insert into review_task_runs (review_run_id, task_type, task_id, title, status, findings, comments, execution_mode, fallback_reason, context_elapsed_ms, fallback_elapsed_ms, progress_phase, progress_message, progress_current, progress_total, progress_unit, progress_updated_at, started_at) values ('metadata-run', 'ai_review', 'known', 'Known', 'completed', 0, 0, 'diff_only_fallback', 'archive_limit_exceeded', 2400000, 386000, 'reviewing_batch', '正在审查第 2 / 5 个批次', 2, 5, 'batch', '2025-01-01T00:00:02Z', '2025-01-01T00:00:00Z'), ('metadata-run', 'ai_review', 'unknown', 'Unknown', 'completed', 0, 0, '<future-mode>', '<future-reason>', 1, 2, null, null, null, null, null, null, '2025-01-01T00:00:01Z')")
             .execute(&pool).await.unwrap();
+        sqlx::query("update review_task_runs set primary_model = 'primary-model', actual_model = 'backup-model', provider_fallback_reason = 'http_504' where review_run_id = 'metadata-run' and task_id = 'known'")
+            .execute(&pool)
+            .await
+            .unwrap();
         pool.close().await;
 
         let detail = DashboardStore::connect(&database_url)
@@ -1070,6 +1087,12 @@ values ('legacy-run', 'script_task', 'legacy-script', 'Legacy Script', 'complete
         assert_eq!(
             detail.tasks[0].fallback_reason.as_deref(),
             Some("archive_limit_exceeded")
+        );
+        assert_eq!(detail.tasks[0].primary_model.as_deref(), Some("primary-model"));
+        assert_eq!(detail.tasks[0].actual_model.as_deref(), Some("backup-model"));
+        assert_eq!(
+            detail.tasks[0].provider_fallback_reason.as_deref(),
+            Some("http_504")
         );
         assert_eq!(detail.tasks[0].context_elapsed_ms, Some(2_400_000));
         assert_eq!(detail.tasks[0].fallback_elapsed_ms, Some(386_000));

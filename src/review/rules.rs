@@ -32,6 +32,14 @@ pub struct ScriptTaskConfig {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct AiReviewProviderConfig {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AiReviewConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -40,6 +48,8 @@ pub struct AiReviewConfig {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    #[serde(default)]
+    pub fallback: Option<AiReviewProviderConfig>,
     #[serde(default = "default_ai_timeout_seconds")]
     pub timeout_seconds: u64,
     #[serde(default)]
@@ -181,6 +191,20 @@ impl Ruleset {
             .into_iter()
             .filter(|config| config.enabled)
         {
+            if let Some(fallback) = config.fallback.as_ref() {
+                for (field, value) in [
+                    ("base_url", fallback.base_url.as_str()),
+                    ("api_key", fallback.api_key.as_str()),
+                    ("model", fallback.model.as_str()),
+                ] {
+                    if value.trim().is_empty() {
+                        return Err(crate::error::AppError::Config(format!(
+                            "AI review `{}` fallback `{}` must not be empty",
+                            config.id, field
+                        )));
+                    }
+                }
+            }
             config.extra_instructions = parsed.ai_review.extra_instructions.clone();
             config.max_tool_calls = parsed.ai_review.max_tool_calls;
             config.max_tool_rounds = parsed.ai_review.max_tool_rounds;
@@ -568,5 +592,61 @@ model = "gpt-4.1-mini"
 
         assert!(rules.ai_reviews_by_ids(&["other".into()]).is_empty());
         assert_eq!(rules.ai_reviews_by_ids(&["ai-review".into()]).len(), 1);
+    }
+
+    #[test]
+    fn parses_optional_ai_review_fallback_provider_without_creating_another_task() {
+        let rules = Ruleset::from_toml(
+            r#"
+[[ai_reviews]]
+enabled = true
+id = "ai-review"
+title = "AI Review"
+base_url = "https://primary.example/v1"
+api_key = "primary-token"
+model = "primary-model"
+
+[ai_reviews.fallback]
+base_url = "https://backup.example/v1"
+api_key = "backup-token"
+model = "backup-model"
+"#,
+        )
+        .unwrap();
+
+        let reviews = rules.ai_reviews_by_ids(&["ai-review".into()]);
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].model, "primary-model");
+        let fallback = reviews[0].fallback.as_ref().unwrap();
+        assert_eq!(fallback.base_url, "https://backup.example/v1");
+        assert_eq!(fallback.api_key, "backup-token");
+        assert_eq!(fallback.model, "backup-model");
+    }
+
+    #[test]
+    fn rejects_incomplete_ai_review_fallback_provider() {
+        for fallback in [
+            "api_key = \"backup-token\"\nmodel = \"backup-model\"",
+            "base_url = \"https://backup.example/v1\"\nmodel = \"backup-model\"",
+            "base_url = \"https://backup.example/v1\"\napi_key = \"backup-token\"",
+            "base_url = \"\"\napi_key = \"backup-token\"\nmodel = \"backup-model\"",
+        ] {
+            let error = Ruleset::from_toml(&format!(
+                r#"
+[[ai_reviews]]
+enabled = true
+id = "ai-review"
+title = "AI Review"
+base_url = "https://primary.example/v1"
+api_key = "primary-token"
+model = "primary-model"
+
+[ai_reviews.fallback]
+{fallback}
+"#
+            ))
+            .unwrap_err();
+            assert!(error.to_string().contains("fallback"));
+        }
     }
 }

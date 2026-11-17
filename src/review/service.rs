@@ -2,7 +2,8 @@ use crate::{
     ai_review::{
         run_ai_review_execution_with_runtime_instruction_and_progress, timeout_fallback_reason,
         AiReviewExecution, AiReviewExecutionMetadata, AiReviewExecutionMode,
-        AiReviewFallbackReason, AiReviewProgress, ReviewCoverage, ReviewCoverageFile,
+        AiReviewFallbackReason, AiReviewProgress, AiReviewProviderMetadata, ReviewCoverage,
+        ReviewCoverageFile,
     },
     comments::{build_comment_drafts, CommentDraft},
     error::{AppError, AppResult, ReviewErrorCode, ReviewFailure},
@@ -1095,6 +1096,7 @@ impl ReviewService {
             fallback_reason: Some(reason),
             context_elapsed_ms: Some(context_elapsed_ms),
             fallback_elapsed_ms: None,
+            provider: execution.provider.clone(),
         };
         self.update_ai_task_execution_metadata(review, &fallback_metadata)
             .await;
@@ -1113,10 +1115,19 @@ impl ReviewService {
             max_fallback_attempts = 1,
             "context work directory removed; starting one-shot diff-only AI review fallback"
         );
+        let mut fallback_config = review.clone();
+        if execution.provider.fallback_used {
+            if let Some(backup) = review.fallback.as_ref() {
+                fallback_config.base_url = backup.base_url.clone();
+                fallback_config.api_key = backup.api_key.clone();
+                fallback_config.model = backup.model.clone();
+                fallback_config.fallback = None;
+            }
+        }
         let fallback_started = Instant::now();
         let fallback = self
             .execute_ai_review(
-                review,
+                &fallback_config,
                 changes,
                 None,
                 review_request,
@@ -1124,6 +1135,14 @@ impl ReviewService {
             )
             .await;
         let fallback_elapsed_ms = elapsed_ms(fallback_started);
+        let mut provider_metadata = fallback.provider.clone();
+        provider_metadata.primary_model = review.model.clone();
+        if execution.provider.fallback_used {
+            provider_metadata.fallback_used = true;
+            if provider_metadata.fallback_reason.is_none() {
+                provider_metadata.fallback_reason = execution.provider.fallback_reason.clone();
+            }
+        }
         match &fallback.result {
             Ok(_) => info!(
                 project_id = event.project_id,
@@ -1174,6 +1193,7 @@ impl ReviewService {
                 fallback_reason: Some(reason),
                 context_elapsed_ms: Some(context_elapsed_ms),
                 fallback_elapsed_ms: Some(fallback_elapsed_ms),
+                provider: provider_metadata,
             },
         })
     }
@@ -1210,6 +1230,7 @@ impl ReviewService {
                     fallback_reason: Some(AiReviewFallbackReason::ArchiveLimitExceeded),
                     context_elapsed_ms: Some(context_elapsed_ms),
                     fallback_elapsed_ms: None,
+                    provider: AiReviewProviderMetadata::primary(review.model.clone()),
                 };
                 self.update_ai_task_execution_metadata(review, &fallback_metadata)
                     .await;
@@ -1230,6 +1251,7 @@ impl ReviewService {
                         fallback_reason: Some(AiReviewFallbackReason::ArchiveLimitExceeded),
                         context_elapsed_ms: Some(context_elapsed_ms),
                         fallback_elapsed_ms: Some(elapsed_ms(fallback_started)),
+                        provider: execution.provider.clone(),
                     },
                 };
             }
@@ -1239,12 +1261,14 @@ impl ReviewService {
                         result: Err(err),
                         coverage: None,
                         incomplete_files: Vec::new(),
+                        provider: AiReviewProviderMetadata::primary(review.model.clone()),
                     },
                     metadata: AiReviewExecutionMetadata {
                         execution_mode: AiReviewExecutionMode::Context,
                         fallback_reason: None,
                         context_elapsed_ms: Some(elapsed_ms(context_started)),
                         fallback_elapsed_ms: None,
+                        provider: AiReviewProviderMetadata::primary(review.model.clone()),
                     },
                 };
             }
@@ -1254,6 +1278,7 @@ impl ReviewService {
             fallback_reason: None,
             context_elapsed_ms: Some(elapsed_ms(context_started)),
             fallback_elapsed_ms: None,
+            provider: AiReviewProviderMetadata::primary(review.model.clone()),
         };
         self.update_ai_task_execution_metadata(review, &context_metadata)
             .await;
@@ -1286,6 +1311,7 @@ impl ReviewService {
                 fallback_reason: None,
                 context_elapsed_ms: Some(elapsed_ms(context_started)),
                 fallback_elapsed_ms: None,
+                provider: execution.provider.clone(),
             },
         }
     }

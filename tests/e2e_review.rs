@@ -12,7 +12,7 @@ use gitlab_work_runner::{
     gitlab::GitLabChange,
     gitlab::GitLabClient,
     review::{ArchiveLimits, ReviewService},
-    rules::{AiReviewConfig, Ruleset},
+    rules::{AiReviewConfig, AiReviewProviderConfig, Ruleset},
     storage::StateStore,
     webhook::MergeRequestNoteEvent,
 };
@@ -760,6 +760,7 @@ fn test_ai_review_config(base_url: String) -> AiReviewConfig {
         base_url,
         api_key: "test-api-key".into(),
         model: "test-model".into(),
+        fallback: None,
         timeout_seconds: 10,
         request_timeout_seconds: None,
         max_batch_diff_bytes: 30_000,
@@ -1139,6 +1140,130 @@ async fn ai_review_retries_server_side_request_timeout_response() {
     assert_eq!(ai_request_count.load(Ordering::SeqCst), 2);
     assert_eq!(findings.len(), 1);
     assert_eq!(findings[0].title, "Retried after timeout");
+}
+
+#[tokio::test]
+async fn ai_review_switches_to_backup_provider_once_and_keeps_it_for_remaining_batches() {
+    let primary_count = Arc::new(AtomicUsize::new(0));
+    let primary_count_for_handler = Arc::clone(&primary_count);
+    let (primary_listener, primary_addr) = bind_test_listener().await;
+    let primary_app = Router::new().route(
+        "/chat/completions",
+        post(move |body: Bytes| {
+            let count = Arc::clone(&primary_count_for_handler);
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                let prompt = body["messages"][1]["content"].as_str().unwrap();
+                if prompt.contains("File: src/a.rs") {
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "choices": [{
+                                "message": {
+                                    "content": serde_json::json!({
+                                        "findings": [{
+                                            "path": "src/a.rs",
+                                            "line": 1,
+                                            "severity": "error",
+                                            "title": "Primary finding",
+                                            "message": "Completed by primary."
+                                        }]
+                                    }).to_string()
+                                }
+                            }]
+                        })),
+                    )
+                } else if prompt.contains("File: src/b.rs") {
+                    (
+                        StatusCode::GATEWAY_TIMEOUT,
+                        Json(json!({"error": {"message": "gateway timeout"}})),
+                    )
+                } else {
+                    panic!("primary provider must not receive later batches after failover: {prompt}");
+                }
+            }
+        }),
+    );
+    spawn_server_on(primary_listener, primary_app);
+
+    let backup_count = Arc::new(AtomicUsize::new(0));
+    let backup_count_for_handler = Arc::clone(&backup_count);
+    let (backup_listener, backup_addr) = bind_test_listener().await;
+    let backup_app = Router::new().route(
+        "/chat/completions",
+        post(move |body: Bytes| {
+            let count = Arc::clone(&backup_count_for_handler);
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                let prompt = body["messages"][1]["content"].as_str().unwrap();
+                let path = if prompt.contains("File: src/b.rs") {
+                    "src/b.rs"
+                } else if prompt.contains("File: src/c.rs") {
+                    "src/c.rs"
+                } else {
+                    panic!("backup provider received an unexpected batch: {prompt}");
+                };
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "choices": [{
+                            "message": {
+                                "content": serde_json::json!({
+                                    "findings": [{
+                                        "path": path,
+                                        "line": 1,
+                                        "severity": "warning",
+                                        "title": "Backup finding",
+                                        "message": "Completed by backup."
+                                    }]
+                                }).to_string()
+                            }
+                        }]
+                    })),
+                )
+            }
+        }),
+    );
+    spawn_server_on(backup_listener, backup_app);
+
+    let mut config = test_ai_review_config(format!("http://{}", primary_addr));
+    config.max_batch_diff_bytes = 24;
+    config.max_batches = 3;
+    config.fallback = Some(AiReviewProviderConfig {
+        base_url: format!("http://{}", backup_addr),
+        api_key: "backup-test-token".into(),
+        model: "backup-test-model".into(),
+    });
+    let changes = ["src/a.rs", "src/b.rs", "src/c.rs"]
+        .into_iter()
+        .map(|path| GitLabChange {
+            old_path: path.into(),
+            new_path: path.into(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            diff: format!("@@ -1 +1 @@\n+let value = 1; // {path}\n"),
+        })
+        .collect::<Vec<_>>();
+
+    let execution = run_ai_review_execution_with_context(&config, &changes, None, None).await;
+    let findings = execution.result.unwrap();
+
+    assert_eq!(primary_count.load(Ordering::SeqCst), 3);
+    assert_eq!(backup_count.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        findings.iter().map(|finding| finding.path.as_str()).collect::<Vec<_>>(),
+        vec!["src/a.rs", "src/b.rs", "src/c.rs"]
+    );
+    assert_eq!(execution.provider.primary_model, "test-model");
+    assert_eq!(execution.provider.actual_model, "backup-test-model");
+    assert!(execution.provider.fallback_used);
+    assert_eq!(
+        execution.provider.fallback_reason.as_deref(),
+        Some("request_timeout")
+    );
 }
 
 #[tokio::test]

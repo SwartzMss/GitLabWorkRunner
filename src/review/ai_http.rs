@@ -129,13 +129,12 @@ pub(crate) fn is_retryable_ai_error(err: &AppError) -> bool {
         AppError::Reqwest(err) => {
             err.is_timeout() || err.is_connect() || err.is_request() || err.is_body()
         }
-        AppError::AiReview(failure) => {
-            failure.message.contains("blocking API request failed")
-                || failure
-                    .message
-                    .contains("blocking API response body read failed")
-                || failure.message.contains("blocking HTTP task failed")
-        }
+        AppError::AiReview(failure) => matches!(
+            failure.code,
+            ReviewErrorCode::AiRequestTimeout
+                | ReviewErrorCode::AiToolLoopTimeout
+                | ReviewErrorCode::AiProviderUnavailable
+        ),
         _ => false,
     }
 }
@@ -235,7 +234,7 @@ fn read_ai_response_body(reader: impl Read, timeout_code: ReviewErrorCode) -> Ap
             let code = if is_io_timeout(&error) {
                 timeout_code
             } else {
-                ReviewErrorCode::AiRequestFailed
+                ReviewErrorCode::AiProviderUnavailable
             };
             AppError::ai_review(
                 code,
@@ -267,7 +266,7 @@ fn ureq_response_from_result(
             let code = if is_ureq_timeout(&err) {
                 timeout_code
             } else {
-                ReviewErrorCode::AiRequestFailed
+                ReviewErrorCode::AiProviderUnavailable
             };
             Err(AppError::ai_review(
                 code,

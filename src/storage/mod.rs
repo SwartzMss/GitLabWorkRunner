@@ -207,6 +207,12 @@ create table if not exists review_task_runs (
             .await?;
         self.ensure_column("review_task_runs", "fallback_elapsed_ms", "integer")
             .await?;
+        self.ensure_column("review_task_runs", "primary_model", "text")
+            .await?;
+        self.ensure_column("review_task_runs", "actual_model", "text")
+            .await?;
+        self.ensure_column("review_task_runs", "provider_fallback_reason", "text")
+            .await?;
         for column in [
             "progress_current",
             "progress_total",
@@ -452,6 +458,9 @@ on conflict(review_run_id, task_type, task_id) do update set
     progress_total = null,
     progress_unit = null,
     progress_updated_at = null,
+    primary_model = null,
+    actual_model = null,
+    provider_fallback_reason = null,
     finished_at = null
 "#,
         )
@@ -519,7 +528,8 @@ where review_run_id = ? and task_type = ? and task_id = ?
         sqlx::query(
             r#"
 update review_task_runs
-set execution_mode = ?, fallback_reason = ?, context_elapsed_ms = ?, fallback_elapsed_ms = ?
+set execution_mode = ?, fallback_reason = ?, context_elapsed_ms = ?, fallback_elapsed_ms = ?,
+    primary_model = ?, actual_model = ?, provider_fallback_reason = ?
 where review_run_id = ? and task_type = ? and task_id = ?
 "#,
         )
@@ -531,6 +541,9 @@ where review_run_id = ? and task_type = ? and task_id = ?
         )
         .bind(task.metadata.context_elapsed_ms.map(saturating_u64_to_i64))
         .bind(task.metadata.fallback_elapsed_ms.map(saturating_u64_to_i64))
+        .bind(&task.metadata.provider.primary_model)
+        .bind(&task.metadata.provider.actual_model)
+        .bind(task.metadata.provider.fallback_reason.as_deref())
         .bind(task.review_run_id)
         .bind(task.task_type)
         .bind(task.task_id)
@@ -581,7 +594,10 @@ update review_task_runs set
     execution_mode = case when ? then ? else execution_mode end,
     fallback_reason = case when ? then ? else fallback_reason end,
     context_elapsed_ms = case when ? then ? else context_elapsed_ms end,
-    fallback_elapsed_ms = case when ? then ? else fallback_elapsed_ms end
+    fallback_elapsed_ms = case when ? then ? else fallback_elapsed_ms end,
+    primary_model = case when ? then ? else primary_model end,
+    actual_model = case when ? then ? else actual_model end,
+    provider_fallback_reason = case when ? then ? else provider_fallback_reason end
 where review_run_id = ? and task_type = ? and task_id = ?
 "#,
         )
@@ -603,6 +619,12 @@ where review_run_id = ? and task_type = ? and task_id = ?
         .bind(metadata.and_then(|metadata| metadata.context_elapsed_ms.map(saturating_u64_to_i64)))
         .bind(metadata.is_some())
         .bind(metadata.and_then(|metadata| metadata.fallback_elapsed_ms.map(saturating_u64_to_i64)))
+        .bind(metadata.is_some())
+        .bind(metadata.map(|metadata| metadata.provider.primary_model.as_str()))
+        .bind(metadata.is_some())
+        .bind(metadata.map(|metadata| metadata.provider.actual_model.as_str()))
+        .bind(metadata.is_some())
+        .bind(metadata.and_then(|metadata| metadata.provider.fallback_reason.as_deref()))
         .bind(task.review_run_id)
         .bind(task.task_type)
         .bind(task.task_id)
@@ -1002,6 +1024,12 @@ mod tests {
             fallback_reason: Some(AiReviewFallbackReason::AiToolLoopTimeout),
             context_elapsed_ms: Some(2_400_000),
             fallback_elapsed_ms: Some(386_000),
+            provider: crate::review::ai::AiReviewProviderMetadata {
+                primary_model: "primary-model".into(),
+                actual_model: "backup-model".into(),
+                fallback_used: true,
+                fallback_reason: Some("request_timeout".into()),
+            },
         };
 
         store
@@ -1014,7 +1042,7 @@ mod tests {
             .unwrap();
 
         let row = sqlx::query(
-            "select execution_mode, fallback_reason, context_elapsed_ms, fallback_elapsed_ms from review_task_runs where review_run_id = ?",
+            "select execution_mode, fallback_reason, context_elapsed_ms, fallback_elapsed_ms, primary_model, actual_model, provider_fallback_reason from review_task_runs where review_run_id = ?",
         )
         .bind("rr-metadata")
         .fetch_one(&store.pool)
@@ -1027,6 +1055,12 @@ mod tests {
         );
         assert_eq!(row.get::<i64, _>("context_elapsed_ms"), 2_400_000);
         assert_eq!(row.get::<i64, _>("fallback_elapsed_ms"), 386_000);
+        assert_eq!(row.get::<String, _>("primary_model"), "primary-model");
+        assert_eq!(row.get::<String, _>("actual_model"), "backup-model");
+        assert_eq!(
+            row.get::<String, _>("provider_fallback_reason"),
+            "request_timeout"
+        );
     }
 
     #[tokio::test]
@@ -1047,6 +1081,7 @@ mod tests {
             fallback_reason: Some(AiReviewFallbackReason::AiRequestTimeout),
             context_elapsed_ms: Some(2_400_000),
             fallback_elapsed_ms: None,
+        provider: crate::review::ai::AiReviewProviderMetadata::default(),
         };
 
         store
@@ -1094,6 +1129,7 @@ mod tests {
             fallback_reason: None,
             context_elapsed_ms: Some(215),
             fallback_elapsed_ms: None,
+        provider: crate::review::ai::AiReviewProviderMetadata::default(),
         };
 
         store
@@ -1165,6 +1201,7 @@ mod tests {
             fallback_reason: None,
             context_elapsed_ms: Some(u64::MAX),
             fallback_elapsed_ms: Some(u64::MAX),
+        provider: crate::review::ai::AiReviewProviderMetadata::default(),
         };
 
         store
@@ -1211,6 +1248,7 @@ mod tests {
             fallback_reason: None,
             context_elapsed_ms: Some(42),
             fallback_elapsed_ms: None,
+        provider: crate::review::ai::AiReviewProviderMetadata::default(),
         };
 
         store
