@@ -1244,6 +1244,7 @@ impl ReviewService {
                         Some(ARCHIVE_DIFF_ONLY_INSTRUCTION),
                     )
                     .await;
+                let provider_metadata = execution.provider.clone();
                 return AiReviewExecutionWithMetadata {
                     execution,
                     metadata: AiReviewExecutionMetadata {
@@ -1251,7 +1252,7 @@ impl ReviewService {
                         fallback_reason: Some(AiReviewFallbackReason::ArchiveLimitExceeded),
                         context_elapsed_ms: Some(context_elapsed_ms),
                         fallback_elapsed_ms: Some(elapsed_ms(fallback_started)),
-                        provider: execution.provider.clone(),
+                        provider: provider_metadata,
                     },
                 };
             }
@@ -1304,6 +1305,7 @@ impl ReviewService {
         {
             return fallback;
         }
+        let provider_metadata = execution.provider.clone();
         AiReviewExecutionWithMetadata {
             execution,
             metadata: AiReviewExecutionMetadata {
@@ -1311,7 +1313,7 @@ impl ReviewService {
                 fallback_reason: None,
                 context_elapsed_ms: Some(elapsed_ms(context_started)),
                 fallback_elapsed_ms: None,
-                provider: execution.provider.clone(),
+                provider: provider_metadata,
             },
         }
     }

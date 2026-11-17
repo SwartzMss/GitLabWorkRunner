@@ -151,6 +151,10 @@ mod tests {
             "ai_tool_loop_timeout"
         );
         assert_eq!(
+            ReviewErrorCode::AiProviderUnavailable.as_str(),
+            "ai_provider_unavailable"
+        );
+        assert_eq!(
             ReviewErrorCode::AiResponseParseFailed.as_str(),
             "ai_response_parse_failed"
         );
