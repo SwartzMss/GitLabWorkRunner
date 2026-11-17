@@ -1180,7 +1180,9 @@ async fn ai_review_switches_to_backup_provider_once_and_keeps_it_for_remaining_b
                         Json(json!({"error": {"message": "gateway timeout"}})),
                     )
                 } else {
-                    panic!("primary provider must not receive later batches after failover: {prompt}");
+                    panic!(
+                        "primary provider must not receive later batches after failover: {prompt}"
+                    );
                 }
             }
         }),
@@ -1262,7 +1264,10 @@ async fn ai_review_switches_to_backup_provider_once_and_keeps_it_for_remaining_b
     assert_eq!(primary_count.load(Ordering::SeqCst), 3);
     assert_eq!(backup_count.load(Ordering::SeqCst), 2);
     assert_eq!(
-        findings.iter().map(|finding| finding.path.as_str()).collect::<Vec<_>>(),
+        findings
+            .iter()
+            .map(|finding| finding.path.as_str())
+            .collect::<Vec<_>>(),
         vec!["src/a.rs", "src/b.rs", "src/c.rs"]
     );
     assert_eq!(execution.provider.primary_model, "test-model");

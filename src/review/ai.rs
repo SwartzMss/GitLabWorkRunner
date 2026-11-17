@@ -2615,7 +2615,10 @@ mod tests {
         for (code, reason) in [
             (ReviewErrorCode::AiRequestTimeout, "request_timeout"),
             (ReviewErrorCode::AiToolLoopTimeout, "tool_loop_timeout"),
-            (ReviewErrorCode::AiProviderUnavailable, "provider_unavailable"),
+            (
+                ReviewErrorCode::AiProviderUnavailable,
+                "provider_unavailable",
+            ),
             (ReviewErrorCode::PermissionDenied, "permission_denied"),
         ] {
             let error = AppError::ai_review(code, "provider failure");
@@ -2650,7 +2653,11 @@ mod tests {
             ReviewErrorCode::AiProviderUnavailable
         );
         assert_eq!(
-            provider_http_error_code(500, "internal server error", ReviewErrorCode::AiRequestTimeout),
+            provider_http_error_code(
+                500,
+                "internal server error",
+                ReviewErrorCode::AiRequestTimeout
+            ),
             ReviewErrorCode::AiProviderUnavailable
         );
         assert_eq!(

@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::rules::AiReviewProviderConfig;
 use crate::{
     ai_review::{
         run_ai_review_execution_with_runtime_instruction_and_progress, timeout_fallback_reason,
@@ -24,8 +26,6 @@ use std::{
     time::Instant,
 };
 use tracing::{info, warn};
-#[cfg(test)]
-use crate::rules::AiReviewProviderConfig;
 
 const ARCHIVE_DIFF_ONLY_INSTRUCTION: &str = "Repository context is unavailable for this execution. Review only the supplied MR diff. Do not request or rely on repository context tools.";
 const TIMEOUT_DIFF_ONLY_INSTRUCTION: &str = "The context-assisted review timed out. Start a new review using only the supplied MR diff, and base every finding on that diff. Do not request or rely on repository context tools.";
@@ -944,7 +944,10 @@ impl ReviewService {
                 timeout_seconds: review.timeout_seconds,
                 max_batches: review.max_batches,
                 model: review.model.clone(),
-                fallback_model: review.fallback.as_ref().map(|provider| provider.model.clone()),
+                fallback_model: review
+                    .fallback
+                    .as_ref()
+                    .map(|provider| provider.model.clone()),
                 trusted_runtime_instruction: trusted_runtime_instruction.map(str::to_string),
             });
             return seam
@@ -1824,7 +1827,8 @@ mod tests {
         let mut diff_only_success = scripted_execution(Ok(Vec::new()), 2);
         diff_only_success.provider = AiReviewProviderMetadata::primary("backup-model");
         let (service, seam, mut review, event, changes) =
-            scripted_timeout_service(vec![context_failure, diff_only_success], "backup-context").await;
+            scripted_timeout_service(vec![context_failure, diff_only_success], "backup-context")
+                .await;
         review.model = "primary-model".into();
         review.fallback = Some(AiReviewProviderConfig {
             base_url: "https://backup.example/v1".into(),
@@ -1843,7 +1847,10 @@ mod tests {
         assert_eq!(calls[0].fallback_model.as_deref(), Some("backup-model"));
         assert_eq!(calls[1].model, "backup-model");
         assert_eq!(calls[1].fallback_model, None);
-        assert_eq!(calls[1].trusted_runtime_instruction.as_deref(), Some(TIMEOUT_DIFF_ONLY_INSTRUCTION));
+        assert_eq!(
+            calls[1].trusted_runtime_instruction.as_deref(),
+            Some(TIMEOUT_DIFF_ONLY_INSTRUCTION)
+        );
         assert_eq!(result.metadata.provider.primary_model, "primary-model");
         assert_eq!(result.metadata.provider.actual_model, "backup-model");
         assert!(result.metadata.provider.fallback_used);

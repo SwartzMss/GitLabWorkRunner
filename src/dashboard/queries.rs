@@ -1088,8 +1088,14 @@ values ('legacy-run', 'script_task', 'legacy-script', 'Legacy Script', 'complete
             detail.tasks[0].fallback_reason.as_deref(),
             Some("archive_limit_exceeded")
         );
-        assert_eq!(detail.tasks[0].primary_model.as_deref(), Some("primary-model"));
-        assert_eq!(detail.tasks[0].actual_model.as_deref(), Some("backup-model"));
+        assert_eq!(
+            detail.tasks[0].primary_model.as_deref(),
+            Some("primary-model")
+        );
+        assert_eq!(
+            detail.tasks[0].actual_model.as_deref(),
+            Some("backup-model")
+        );
         assert_eq!(
             detail.tasks[0].provider_fallback_reason.as_deref(),
             Some("http_504")

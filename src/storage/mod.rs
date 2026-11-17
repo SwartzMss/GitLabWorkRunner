@@ -1081,7 +1081,7 @@ mod tests {
             fallback_reason: Some(AiReviewFallbackReason::AiRequestTimeout),
             context_elapsed_ms: Some(2_400_000),
             fallback_elapsed_ms: None,
-        provider: crate::review::ai::AiReviewProviderMetadata::default(),
+            provider: crate::review::ai::AiReviewProviderMetadata::default(),
         };
 
         store
@@ -1129,7 +1129,7 @@ mod tests {
             fallback_reason: None,
             context_elapsed_ms: Some(215),
             fallback_elapsed_ms: None,
-        provider: crate::review::ai::AiReviewProviderMetadata::default(),
+            provider: crate::review::ai::AiReviewProviderMetadata::default(),
         };
 
         store
@@ -1201,7 +1201,7 @@ mod tests {
             fallback_reason: None,
             context_elapsed_ms: Some(u64::MAX),
             fallback_elapsed_ms: Some(u64::MAX),
-        provider: crate::review::ai::AiReviewProviderMetadata::default(),
+            provider: crate::review::ai::AiReviewProviderMetadata::default(),
         };
 
         store
@@ -1248,7 +1248,7 @@ mod tests {
             fallback_reason: None,
             context_elapsed_ms: Some(42),
             fallback_elapsed_ms: None,
-        provider: crate::review::ai::AiReviewProviderMetadata::default(),
+            provider: crate::review::ai::AiReviewProviderMetadata::default(),
         };
 
         store
