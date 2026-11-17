@@ -696,6 +696,7 @@ mod tests {
             base_url: "https://ai.example.com".into(),
             api_key: "test-key".into(),
             model: "test-model".into(),
+            fallback: None,
             timeout_seconds: 60,
             request_timeout_seconds: None,
             max_batch_diff_bytes: 30_000,

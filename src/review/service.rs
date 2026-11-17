@@ -2084,6 +2084,7 @@ mod tests {
             base_url: format!("http://{ai_addr}"),
             api_key: "key".into(),
             model: "model".into(),
+            fallback: None,
             timeout_seconds: 5,
             request_timeout_seconds: Some(2),
             max_batch_diff_bytes: 30,
