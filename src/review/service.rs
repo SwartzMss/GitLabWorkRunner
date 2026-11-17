@@ -9,7 +9,7 @@ use crate::{
     error::{AppError, AppResult, ReviewErrorCode, ReviewFailure},
     gitlab::{CreateDiscussionRequest, DiscussionPosition, GitLabChange, GitLabClient},
     review::archive::extract_zip_archive,
-    rules::{AiReviewConfig, Finding, Ruleset, Severity},
+    rules::{AiReviewConfig, AiReviewProviderConfig, Finding, Ruleset, Severity},
     storage::{
         ReviewRequestStart, StateStore, StoredComment, StoredFinding, StoredReviewCoverage,
         StoredReviewCoverageFile, TaskRunExecutionMetadata, TaskRunFinish, TaskRunProgress,
@@ -114,6 +114,8 @@ struct TestAiExecutionCall {
     source_available: bool,
     timeout_seconds: u64,
     max_batches: usize,
+    model: String,
+    fallback_model: Option<String>,
     trusted_runtime_instruction: Option<String>,
 }
 
@@ -939,6 +941,8 @@ impl ReviewService {
                 source_available: source_dir.is_some(),
                 timeout_seconds: review.timeout_seconds,
                 max_batches: review.max_batches,
+                model: review.model.clone(),
+                fallback_model: review.fallback.as_ref().map(|provider| provider.model.clone()),
                 trusted_runtime_instruction: trusted_runtime_instruction.map(str::to_string),
             });
             return seam
@@ -1719,6 +1723,7 @@ mod tests {
             base_url: "http://unused".into(),
             api_key: "key".into(),
             model: "model".into(),
+            fallback: None,
             timeout_seconds: 37,
             request_timeout_seconds: Some(11),
             max_batch_diff_bytes: 7,
@@ -1797,6 +1802,53 @@ mod tests {
                 Some(TIMEOUT_DIFF_ONLY_INSTRUCTION)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn timeout_diff_only_fallback_keeps_the_backup_provider_selected_by_context() {
+        let mut context_failure = scripted_execution(
+            Err(AppError::ai_review(
+                ReviewErrorCode::AiRequestTimeout,
+                "primary provider timed out",
+            )),
+            1,
+        );
+        context_failure.provider = AiReviewProviderMetadata {
+            primary_model: "primary-model".into(),
+            actual_model: "backup-model".into(),
+            fallback_used: true,
+            fallback_reason: Some("request_timeout".into()),
+        };
+        let mut diff_only_success = scripted_execution(Ok(Vec::new()), 2);
+        diff_only_success.provider = AiReviewProviderMetadata::primary("backup-model");
+        let (service, seam, mut review, event, changes) =
+            scripted_timeout_service(vec![context_failure, diff_only_success], "backup-context").await;
+        review.model = "primary-model".into();
+        review.fallback = Some(AiReviewProviderConfig {
+            base_url: "https://backup.example/v1".into(),
+            api_key: "backup-token".into(),
+            model: "backup-model".into(),
+        });
+
+        let result = service
+            .run_ai_review_with_timeout_fallback(&review, &changes, &event, None)
+            .await;
+
+        assert!(result.execution.result.is_ok());
+        let calls = seam.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].model, "primary-model");
+        assert_eq!(calls[0].fallback_model.as_deref(), Some("backup-model"));
+        assert_eq!(calls[1].model, "backup-model");
+        assert_eq!(calls[1].fallback_model, None);
+        assert_eq!(calls[1].trusted_runtime_instruction.as_deref(), Some(TIMEOUT_DIFF_ONLY_INSTRUCTION));
+        assert_eq!(result.metadata.provider.primary_model, "primary-model");
+        assert_eq!(result.metadata.provider.actual_model, "backup-model");
+        assert!(result.metadata.provider.fallback_used);
+        assert_eq!(
+            result.metadata.provider.fallback_reason.as_deref(),
+            Some("request_timeout")
+        );
     }
 
     #[tokio::test]
@@ -1880,6 +1932,7 @@ mod tests {
             base_url: "http://127.0.0.1".into(),
             api_key: "key".into(),
             model: "model".into(),
+            fallback: None,
             timeout_seconds: 1,
             request_timeout_seconds: None,
             max_batch_diff_bytes: 1,
