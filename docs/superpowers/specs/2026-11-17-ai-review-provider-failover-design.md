@@ -48,17 +48,17 @@ base_url = "https://primary-provider.example/v1"
 api_key = "<primary-token>"
 model = "primary-model"
 
-# Optional Backup. Omitting this table disables provider failover.
-[ai_reviews.fallback]
-base_url = "https://backup-provider.example/v1"
-api_key = "<backup-token>"
-model = "backup-model"
-
 # These remain review-level settings and are shared by both providers.
 timeout_seconds = 4800
 request_timeout_seconds = 420
 max_batch_diff_bytes = 25000
 max_batches = 0
+
+# Optional Backup. Omitting this table disables provider failover.
+[ai_reviews.fallback]
+base_url = "https://backup-provider.example/v1"
+api_key = "<backup-token>"
+model = "backup-model"
 ```
 
 ### Configuration model
