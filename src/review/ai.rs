@@ -2611,6 +2611,59 @@ mod tests {
     }
 
     #[test]
+    fn provider_failover_classifies_only_structured_provider_failures() {
+        for (code, reason) in [
+            (ReviewErrorCode::AiRequestTimeout, "request_timeout"),
+            (ReviewErrorCode::AiToolLoopTimeout, "tool_loop_timeout"),
+            (ReviewErrorCode::AiProviderUnavailable, "provider_unavailable"),
+            (ReviewErrorCode::PermissionDenied, "permission_denied"),
+        ] {
+            let error = AppError::ai_review(code, "provider failure");
+            assert_eq!(ai_provider_failover_reason(&error), Some(reason));
+        }
+
+        assert_eq!(
+            ai_provider_failover_reason(&AppError::ai_review(
+                ReviewErrorCode::AiRequestFailed,
+                "invalid request"
+            )),
+            None
+        );
+        assert_eq!(
+            ai_provider_failover_reason(&AppError::Storage("database unavailable".into())),
+            None
+        );
+    }
+
+    #[test]
+    fn provider_http_status_classification_preserves_timeout_and_non_provider_errors() {
+        assert_eq!(
+            provider_http_error_code(504, "", ReviewErrorCode::AiRequestTimeout),
+            ReviewErrorCode::AiRequestTimeout
+        );
+        assert_eq!(
+            provider_http_error_code(504, "", ReviewErrorCode::AiToolLoopTimeout),
+            ReviewErrorCode::AiToolLoopTimeout
+        );
+        assert_eq!(
+            provider_http_error_code(429, "", ReviewErrorCode::AiRequestTimeout),
+            ReviewErrorCode::AiProviderUnavailable
+        );
+        assert_eq!(
+            provider_http_error_code(500, "internal server error", ReviewErrorCode::AiRequestTimeout),
+            ReviewErrorCode::AiProviderUnavailable
+        );
+        assert_eq!(
+            provider_http_error_code(401, "unauthorized", ReviewErrorCode::AiRequestTimeout),
+            ReviewErrorCode::PermissionDenied
+        );
+        assert_eq!(
+            provider_http_error_code(400, "bad request", ReviewErrorCode::AiRequestTimeout),
+            ReviewErrorCode::AiRequestFailed
+        );
+    }
+
+    #[test]
     fn timeout_fallback_classifies_only_structured_timeout_codes() {
         for (code, expected) in [
             (
