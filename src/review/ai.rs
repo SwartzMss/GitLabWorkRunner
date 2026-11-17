@@ -78,12 +78,46 @@ impl AiReviewFallbackReason {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AiReviewProviderMetadata {
+    pub primary_model: String,
+    pub actual_model: String,
+    pub fallback_used: bool,
+    pub fallback_reason: Option<String>,
+}
+
+impl AiReviewProviderMetadata {
+    pub fn primary(model: impl Into<String>) -> Self {
+        let model = model.into();
+        Self {
+            primary_model: model.clone(),
+            actual_model: model,
+            fallback_used: false,
+            fallback_reason: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AiReviewExecutionMetadata {
     pub execution_mode: AiReviewExecutionMode,
     pub fallback_reason: Option<AiReviewFallbackReason>,
     pub context_elapsed_ms: Option<u64>,
     pub fallback_elapsed_ms: Option<u64>,
+    pub provider: AiReviewProviderMetadata,
+}
+
+pub(crate) fn ai_provider_failover_reason(error: &AppError) -> Option<&'static str> {
+    let AppError::AiReview(failure) = error else {
+        return None;
+    };
+    match failure.code {
+        ReviewErrorCode::AiRequestTimeout => Some("request_timeout"),
+        ReviewErrorCode::AiToolLoopTimeout => Some("tool_loop_timeout"),
+        ReviewErrorCode::AiProviderUnavailable => Some("provider_unavailable"),
+        ReviewErrorCode::PermissionDenied => Some("permission_denied"),
+        _ => None,
+    }
 }
 
 pub(crate) fn timeout_fallback_reason(error: &AppError) -> Option<AiReviewFallbackReason> {
@@ -128,6 +162,7 @@ pub struct AiReviewExecution {
     pub result: AppResult<Vec<Finding>>,
     pub coverage: Option<ReviewCoverage>,
     pub incomplete_files: Vec<ReviewCoverageFile>,
+    pub provider: AiReviewProviderMetadata,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -448,13 +483,11 @@ async fn run_ai_review_single(
                             last_error = Some(err);
                             continue;
                         }
-                        let code = if matches!(status, 401 | 403) {
-                            ReviewErrorCode::PermissionDenied
-                        } else if should_enter_timeout_finalization(status, &body) {
-                            ReviewErrorCode::AiRequestTimeout
-                        } else {
-                            ReviewErrorCode::AiRequestFailed
-                        };
+                        let code = provider_http_error_code(
+                            status,
+                            &body,
+                            ReviewErrorCode::AiRequestTimeout,
+                        );
                         return Err(AppError::ai_review(
                             code,
                             format!(
@@ -561,6 +594,8 @@ async fn run_batched_ai_review(
     force_json_output: bool,
 ) -> AiReviewExecution {
     let deadline = Instant::now() + Duration::from_secs(config.timeout_seconds.max(1));
+    let mut active_config = config.clone();
+    let mut provider = AiReviewProviderMetadata::primary(config.model.clone());
     let mut plan = plan_ai_review_batches(
         changes,
         config.max_batch_diff_bytes.max(1),
@@ -615,19 +650,22 @@ async fn run_batched_ai_review(
         );
         info!(
             ai_review_id = %config.id,
+            provider_role = if provider.fallback_used { "backup" } else { "primary" },
+            model = %provider.actual_model,
             batch_index,
             batch_count,
             file_count = batch_changes.len(),
             diff_bytes = batch_changes.iter().map(|change| change.diff.len()).sum::<usize>(),
             "AI review batch started"
         );
+        let batch_diff_limit = batch_prompt_payload_limit(&batch_changes);
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let result = match tokio::time::timeout(
+        let mut result = match tokio::time::timeout(
             remaining,
             run_ai_review_single(
-                config,
+                &active_config,
                 &batch_changes,
-                batch_prompt_payload_limit(&batch_changes),
+                batch_diff_limit,
                 AiReviewSingleOptions {
                     batch: Some((batch_index, batch_count)),
                     source_dir,
@@ -643,6 +681,58 @@ async fn run_batched_ai_review(
             Ok(result) => result,
             Err(_) => Err(ai_review_deadline_error(config)),
         };
+
+        if let Err(primary_error) = &result {
+            if !provider.fallback_used {
+                if let (Some(backup), Some(reason)) = (
+                    config.fallback.as_ref(),
+                    ai_provider_failover_reason(primary_error),
+                ) {
+                    warn!(
+                        ai_review_id = %config.id,
+                        provider_role = "primary",
+                        primary_model = %config.model,
+                        backup_model = %backup.model,
+                        batch_index,
+                        batch_count,
+                        failover_reason = reason,
+                        error = %primary_error,
+                        "AI review primary provider failed; switching failed batch to backup"
+                    );
+                    active_config.base_url = backup.base_url.clone();
+                    active_config.api_key = backup.api_key.clone();
+                    active_config.model = backup.model.clone();
+                    active_config.fallback = None;
+                    provider.actual_model = backup.model.clone();
+                    provider.fallback_used = true;
+                    provider.fallback_reason = Some(reason.to_string());
+
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    result = match tokio::time::timeout(
+                        remaining,
+                        run_ai_review_single(
+                            &active_config,
+                            &batch_changes,
+                            batch_diff_limit,
+                            AiReviewSingleOptions {
+                                batch: Some((batch_index, batch_count)),
+                                source_dir,
+                                review_request,
+                                trusted_runtime_instruction,
+                                progress: progress.clone(),
+                                force_json_output,
+                            },
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err(ai_review_deadline_error(config)),
+                    };
+                }
+            }
+        }
+
         match result {
             Ok(mut batch_result) => {
                 max_tool_rounds_used_in_batch =
@@ -675,6 +765,7 @@ async fn run_batched_ai_review(
                     result: Err(err),
                     coverage: Some(plan.coverage),
                     incomplete_files: plan.incomplete_files,
+                    provider,
                 };
             }
         }
@@ -686,6 +777,10 @@ async fn run_batched_ai_review(
     plan.coverage.tool_rounds_used = max_tool_rounds_used_in_batch;
     info!(
         ai_review_id = %config.id,
+        provider_role = if provider.fallback_used { "backup" } else { "primary" },
+        actual_model = %provider.actual_model,
+        provider_fallback_used = provider.fallback_used,
+        provider_fallback_reason = provider.fallback_reason.as_deref().unwrap_or(""),
         coverage_files = %format!("{}/{}", plan.coverage.fully_reviewed_files + plan.coverage.partially_reviewed_files, plan.coverage.total_files),
         coverage_diff_bytes = %format!("{}/{}", plan.coverage.reviewed_diff_bytes, plan.coverage.total_diff_bytes),
         required_batches = plan.coverage.required_batches,
@@ -705,6 +800,7 @@ async fn run_batched_ai_review(
         result: Ok(all_findings),
         coverage: Some(plan.coverage),
         incomplete_files: plan.incomplete_files,
+        provider,
     }
 }
 
@@ -839,6 +935,22 @@ fn is_tool_call_rejection(status: u16, body: &str) -> bool {
 
 fn is_retryable_ai_http_response(status: u16, body: &str) -> bool {
     is_timeout_ai_http_response(status, body) || matches!(status, 429 | 502 | 503)
+}
+
+fn provider_http_error_code(
+    status: u16,
+    body: &str,
+    timeout_code: ReviewErrorCode,
+) -> ReviewErrorCode {
+    if matches!(status, 401 | 403) {
+        ReviewErrorCode::PermissionDenied
+    } else if should_enter_timeout_finalization(status, body) {
+        timeout_code
+    } else if is_retryable_ai_http_response(status, body) || status == 500 {
+        ReviewErrorCode::AiProviderUnavailable
+    } else {
+        ReviewErrorCode::AiRequestFailed
+    }
 }
 
 fn is_timeout_ai_http_response(status: u16, body: &str) -> bool {
@@ -1422,13 +1534,11 @@ async fn complete_ai_review_response(context: AiReviewCompletion<'_>) -> AppResu
             })
         })?;
         if !(200..300).contains(&response.status) {
-            let code = if matches!(response.status, 401 | 403) {
-                ReviewErrorCode::PermissionDenied
-            } else if should_enter_timeout_finalization(response.status, &response.body) {
-                ReviewErrorCode::AiToolLoopTimeout
-            } else {
-                ReviewErrorCode::AiRequestFailed
-            };
+            let code = provider_http_error_code(
+                response.status,
+                &response.body,
+                ReviewErrorCode::AiToolLoopTimeout,
+            );
             return Err(AppError::ai_review(
                 code,
                 format!(
@@ -2487,6 +2597,7 @@ mod tests {
             base_url: "https://ai.example.com".into(),
             api_key: "test-key".into(),
             model: "test-model".into(),
+            fallback: None,
             timeout_seconds: 60,
             request_timeout_seconds: None,
             max_batch_diff_bytes: 30_000,
@@ -2497,6 +2608,66 @@ mod tests {
             max_tool_result_bytes: 60_000,
             max_tool_total_bytes: 40_000,
         }
+    }
+
+    #[test]
+    fn provider_failover_classifies_only_structured_provider_failures() {
+        for (code, reason) in [
+            (ReviewErrorCode::AiRequestTimeout, "request_timeout"),
+            (ReviewErrorCode::AiToolLoopTimeout, "tool_loop_timeout"),
+            (
+                ReviewErrorCode::AiProviderUnavailable,
+                "provider_unavailable",
+            ),
+            (ReviewErrorCode::PermissionDenied, "permission_denied"),
+        ] {
+            let error = AppError::ai_review(code, "provider failure");
+            assert_eq!(ai_provider_failover_reason(&error), Some(reason));
+        }
+
+        assert_eq!(
+            ai_provider_failover_reason(&AppError::ai_review(
+                ReviewErrorCode::AiRequestFailed,
+                "invalid request"
+            )),
+            None
+        );
+        assert_eq!(
+            ai_provider_failover_reason(&AppError::Storage("database unavailable".into())),
+            None
+        );
+    }
+
+    #[test]
+    fn provider_http_status_classification_preserves_timeout_and_non_provider_errors() {
+        assert_eq!(
+            provider_http_error_code(504, "", ReviewErrorCode::AiRequestTimeout),
+            ReviewErrorCode::AiRequestTimeout
+        );
+        assert_eq!(
+            provider_http_error_code(504, "", ReviewErrorCode::AiToolLoopTimeout),
+            ReviewErrorCode::AiToolLoopTimeout
+        );
+        assert_eq!(
+            provider_http_error_code(429, "", ReviewErrorCode::AiRequestTimeout),
+            ReviewErrorCode::AiProviderUnavailable
+        );
+        assert_eq!(
+            provider_http_error_code(
+                500,
+                "internal server error",
+                ReviewErrorCode::AiRequestTimeout
+            ),
+            ReviewErrorCode::AiProviderUnavailable
+        );
+        assert_eq!(
+            provider_http_error_code(401, "unauthorized", ReviewErrorCode::AiRequestTimeout),
+            ReviewErrorCode::PermissionDenied
+        );
+        assert_eq!(
+            provider_http_error_code(400, "bad request", ReviewErrorCode::AiRequestTimeout),
+            ReviewErrorCode::AiRequestFailed
+        );
     }
 
     #[test]

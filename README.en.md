@@ -251,6 +251,13 @@ request_timeout_seconds = 300
 max_batch_diff_bytes = 15000
 max_batches = 10
 
+# Optional backup provider. It remains part of this AI Review task; do not add another [[ai_reviews]] entry.
+# After a retryable provider failure, the runner retries the failed batch and pins later batches to the backup.
+# [ai_reviews.fallback]
+# base_url = "https://backup-provider.example/v1"
+# api_key = "<your-backup-ai-api-key>"
+# model = "backup-model"
+
 [[script_tasks]]
 enabled = true
 id = "lint"
@@ -269,7 +276,7 @@ timeout_seconds = 60
 max_concurrent = 1
 ```
 
-Posting a standalone `@ai-review` in an MR comment triggers the entry whose `id = "ai-review"`. MR update events are accepted and ignored; they do not enter the review queue.
+Posting a standalone `@ai-review` in an MR comment triggers the entry whose `id = "ai-review"`. The optional `[ai_reviews.fallback]` table configures a backup endpoint, token, and model. If the primary encounters a request timeout, rate limit, provider/server or transport failure, or authentication rejection, the runner switches once within that review, retries only the failed batch, and pins subsequent batches to the backup. A Context timeout followed by Diff-only fallback keeps the active provider. Without a fallback table, behavior remains unchanged. MR update events are accepted and ignored; they do not enter the review queue.
 
 Posting `@lint` or `@security-check` runs the matching script. Each script has its own `max_concurrent` limit, defaulting to `1`; when full, that request fails immediately and posts an MR comment instead of waiting. Different scripts and AI Review use independent concurrency limits. Each script's `timeout_seconds` controls its execution timeout. On Unix, timeout cleanup kills the dedicated process group. On Windows, it uses the system `taskkill` command with a bounded wait; if that command fails, the runner falls back to killing the direct child, so spawned descendants may remain.
 

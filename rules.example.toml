@@ -39,3 +39,10 @@ request_timeout_seconds = 420
 # This does not require MCP; findings are read from submit_review_findings arguments when tool_calls are returned.
 max_batch_diff_bytes = 25000
 max_batches = 0
+
+# Optional AI Review backup provider. Uncomment to enable automatic failover.
+# This stays inside the same [[ai_reviews]] task; do not add another [[ai_reviews]] entry.
+# [ai_reviews.fallback]
+# base_url = "https://backup-provider.example/v1"
+# api_key = "<your-backup-ai-api-key>"
+# model = "backup-model"

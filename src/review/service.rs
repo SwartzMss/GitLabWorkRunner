@@ -1,8 +1,11 @@
+#[cfg(test)]
+use crate::rules::AiReviewProviderConfig;
 use crate::{
     ai_review::{
         run_ai_review_execution_with_runtime_instruction_and_progress, timeout_fallback_reason,
         AiReviewExecution, AiReviewExecutionMetadata, AiReviewExecutionMode,
-        AiReviewFallbackReason, AiReviewProgress, ReviewCoverage, ReviewCoverageFile,
+        AiReviewFallbackReason, AiReviewProgress, AiReviewProviderMetadata, ReviewCoverage,
+        ReviewCoverageFile,
     },
     comments::{build_comment_drafts, CommentDraft},
     error::{AppError, AppResult, ReviewErrorCode, ReviewFailure},
@@ -113,6 +116,8 @@ struct TestAiExecutionCall {
     source_available: bool,
     timeout_seconds: u64,
     max_batches: usize,
+    model: String,
+    fallback_model: Option<String>,
     trusted_runtime_instruction: Option<String>,
 }
 
@@ -938,6 +943,11 @@ impl ReviewService {
                 source_available: source_dir.is_some(),
                 timeout_seconds: review.timeout_seconds,
                 max_batches: review.max_batches,
+                model: review.model.clone(),
+                fallback_model: review
+                    .fallback
+                    .as_ref()
+                    .map(|provider| provider.model.clone()),
                 trusted_runtime_instruction: trusted_runtime_instruction.map(str::to_string),
             });
             return seam
@@ -1095,6 +1105,7 @@ impl ReviewService {
             fallback_reason: Some(reason),
             context_elapsed_ms: Some(context_elapsed_ms),
             fallback_elapsed_ms: None,
+            provider: execution.provider.clone(),
         };
         self.update_ai_task_execution_metadata(review, &fallback_metadata)
             .await;
@@ -1113,10 +1124,19 @@ impl ReviewService {
             max_fallback_attempts = 1,
             "context work directory removed; starting one-shot diff-only AI review fallback"
         );
+        let mut fallback_config = review.clone();
+        if execution.provider.fallback_used {
+            if let Some(backup) = review.fallback.as_ref() {
+                fallback_config.base_url = backup.base_url.clone();
+                fallback_config.api_key = backup.api_key.clone();
+                fallback_config.model = backup.model.clone();
+                fallback_config.fallback = None;
+            }
+        }
         let fallback_started = Instant::now();
         let fallback = self
             .execute_ai_review(
-                review,
+                &fallback_config,
                 changes,
                 None,
                 review_request,
@@ -1124,6 +1144,14 @@ impl ReviewService {
             )
             .await;
         let fallback_elapsed_ms = elapsed_ms(fallback_started);
+        let mut provider_metadata = fallback.provider.clone();
+        provider_metadata.primary_model = review.model.clone();
+        if execution.provider.fallback_used {
+            provider_metadata.fallback_used = true;
+            if provider_metadata.fallback_reason.is_none() {
+                provider_metadata.fallback_reason = execution.provider.fallback_reason.clone();
+            }
+        }
         match &fallback.result {
             Ok(_) => info!(
                 project_id = event.project_id,
@@ -1174,6 +1202,7 @@ impl ReviewService {
                 fallback_reason: Some(reason),
                 context_elapsed_ms: Some(context_elapsed_ms),
                 fallback_elapsed_ms: Some(fallback_elapsed_ms),
+                provider: provider_metadata,
             },
         })
     }
@@ -1210,6 +1239,7 @@ impl ReviewService {
                     fallback_reason: Some(AiReviewFallbackReason::ArchiveLimitExceeded),
                     context_elapsed_ms: Some(context_elapsed_ms),
                     fallback_elapsed_ms: None,
+                    provider: AiReviewProviderMetadata::primary(review.model.clone()),
                 };
                 self.update_ai_task_execution_metadata(review, &fallback_metadata)
                     .await;
@@ -1223,6 +1253,7 @@ impl ReviewService {
                         Some(ARCHIVE_DIFF_ONLY_INSTRUCTION),
                     )
                     .await;
+                let provider_metadata = execution.provider.clone();
                 return AiReviewExecutionWithMetadata {
                     execution,
                     metadata: AiReviewExecutionMetadata {
@@ -1230,6 +1261,7 @@ impl ReviewService {
                         fallback_reason: Some(AiReviewFallbackReason::ArchiveLimitExceeded),
                         context_elapsed_ms: Some(context_elapsed_ms),
                         fallback_elapsed_ms: Some(elapsed_ms(fallback_started)),
+                        provider: provider_metadata,
                     },
                 };
             }
@@ -1239,12 +1271,14 @@ impl ReviewService {
                         result: Err(err),
                         coverage: None,
                         incomplete_files: Vec::new(),
+                        provider: AiReviewProviderMetadata::primary(review.model.clone()),
                     },
                     metadata: AiReviewExecutionMetadata {
                         execution_mode: AiReviewExecutionMode::Context,
                         fallback_reason: None,
                         context_elapsed_ms: Some(elapsed_ms(context_started)),
                         fallback_elapsed_ms: None,
+                        provider: AiReviewProviderMetadata::primary(review.model.clone()),
                     },
                 };
             }
@@ -1254,6 +1288,7 @@ impl ReviewService {
             fallback_reason: None,
             context_elapsed_ms: Some(elapsed_ms(context_started)),
             fallback_elapsed_ms: None,
+            provider: AiReviewProviderMetadata::primary(review.model.clone()),
         };
         self.update_ai_task_execution_metadata(review, &context_metadata)
             .await;
@@ -1279,6 +1314,7 @@ impl ReviewService {
         {
             return fallback;
         }
+        let provider_metadata = execution.provider.clone();
         AiReviewExecutionWithMetadata {
             execution,
             metadata: AiReviewExecutionMetadata {
@@ -1286,6 +1322,7 @@ impl ReviewService {
                 fallback_reason: None,
                 context_elapsed_ms: Some(elapsed_ms(context_started)),
                 fallback_elapsed_ms: None,
+                provider: provider_metadata,
             },
         }
     }
@@ -1644,6 +1681,7 @@ mod tests {
                 total_diff_bytes: 0,
                 reviewed_diff_bytes: 0,
             }],
+            provider: AiReviewProviderMetadata::default(),
         }
     }
 
@@ -1690,6 +1728,7 @@ mod tests {
             base_url: "http://unused".into(),
             api_key: "key".into(),
             model: "model".into(),
+            fallback: None,
             timeout_seconds: 37,
             request_timeout_seconds: Some(11),
             max_batch_diff_bytes: 7,
@@ -1768,6 +1807,57 @@ mod tests {
                 Some(TIMEOUT_DIFF_ONLY_INSTRUCTION)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn timeout_diff_only_fallback_keeps_the_backup_provider_selected_by_context() {
+        let mut context_failure = scripted_execution(
+            Err(AppError::ai_review(
+                ReviewErrorCode::AiRequestTimeout,
+                "primary provider timed out",
+            )),
+            1,
+        );
+        context_failure.provider = AiReviewProviderMetadata {
+            primary_model: "primary-model".into(),
+            actual_model: "backup-model".into(),
+            fallback_used: true,
+            fallback_reason: Some("request_timeout".into()),
+        };
+        let mut diff_only_success = scripted_execution(Ok(Vec::new()), 2);
+        diff_only_success.provider = AiReviewProviderMetadata::primary("backup-model");
+        let (service, seam, mut review, event, changes) =
+            scripted_timeout_service(vec![context_failure, diff_only_success], "backup-context")
+                .await;
+        review.model = "primary-model".into();
+        review.fallback = Some(AiReviewProviderConfig {
+            base_url: "https://backup.example/v1".into(),
+            api_key: "backup-token".into(),
+            model: "backup-model".into(),
+        });
+
+        let result = service
+            .run_ai_review_with_timeout_fallback(&review, &changes, &event, None)
+            .await;
+
+        assert!(result.execution.result.is_ok());
+        let calls = seam.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].model, "primary-model");
+        assert_eq!(calls[0].fallback_model.as_deref(), Some("backup-model"));
+        assert_eq!(calls[1].model, "backup-model");
+        assert_eq!(calls[1].fallback_model, None);
+        assert_eq!(
+            calls[1].trusted_runtime_instruction.as_deref(),
+            Some(TIMEOUT_DIFF_ONLY_INSTRUCTION)
+        );
+        assert_eq!(result.metadata.provider.primary_model, "primary-model");
+        assert_eq!(result.metadata.provider.actual_model, "backup-model");
+        assert!(result.metadata.provider.fallback_used);
+        assert_eq!(
+            result.metadata.provider.fallback_reason.as_deref(),
+            Some("request_timeout")
+        );
     }
 
     #[tokio::test]
@@ -1851,6 +1941,7 @@ mod tests {
             base_url: "http://127.0.0.1".into(),
             api_key: "key".into(),
             model: "model".into(),
+            fallback: None,
             timeout_seconds: 1,
             request_timeout_seconds: None,
             max_batch_diff_bytes: 1,
@@ -1993,6 +2084,7 @@ mod tests {
             base_url: format!("http://{ai_addr}"),
             api_key: "key".into(),
             model: "model".into(),
+            fallback: None,
             timeout_seconds: 5,
             request_timeout_seconds: Some(2),
             max_batch_diff_bytes: 30,

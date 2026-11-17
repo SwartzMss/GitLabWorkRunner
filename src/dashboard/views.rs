@@ -245,6 +245,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       archive_limit_exceeded: "Archive 超出安全限制",
       review_run_timeout: "Context Review 整体超时",
       ai_request_timeout: "AI 请求超时",
+      ai_provider_unavailable: "AI 服务暂不可用",
       ai_tool_loop_timeout: "Context tool loop 超时"
     }[reason] || reason || "");
     const renderFailure = (failure) => failure ? `<div class="failure"><div><span class="badge failed">${esc(errorCodeText(failure.code))}</span>${failure.code ? ` <code>${esc(failure.code)}</code>` : ""}</div><pre class="failure-message">${esc(failure.message || "-")}</pre></div>` : "";
@@ -254,6 +255,9 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       if (task.status !== "running" && task.context_elapsed_display != null) rows.push(`<div class="detail-row"><span>Context</span><span>${esc(task.context_elapsed_display)}</span></div>`);
       if (task.status !== "running" && task.fallback_elapsed_display != null) rows.push(`<div class="detail-row"><span>Diff-only</span><span>${esc(task.fallback_elapsed_display)}</span></div>`);
       if (task.status !== "running" && task.ai_total_elapsed_display != null) rows.push(`<div class="detail-row"><span>AI 合计</span><span>${esc(task.ai_total_elapsed_display)}</span></div>`);
+      if (task.primary_model != null) rows.push(`<div class="detail-row"><span>主模型</span><code>${esc(task.primary_model)}</code></div>`);
+      if (task.actual_model != null) rows.push(`<div class="detail-row"><span>实际模型</span><code>${esc(task.actual_model)}</code></div>`);
+      if (task.provider_fallback_reason != null) rows.push(`<div class="detail-row"><span>模型切换原因</span><code>${esc(task.provider_fallback_reason)}</code></div>`);
       if (!rows.length) return "";
       return `<div class="detail-list">${rows.join("")}</div>`;
     }
@@ -607,6 +611,9 @@ mod tests {
         assert!(DASHBOARD_HTML.contains("esc(task.context_elapsed_display)"));
         assert!(DASHBOARD_HTML.contains("esc(task.fallback_elapsed_display)"));
         assert!(DASHBOARD_HTML.contains("esc(task.ai_total_elapsed_display)"));
+        assert!(DASHBOARD_HTML.contains("esc(task.primary_model)"));
+        assert!(DASHBOARD_HTML.contains("esc(task.actual_model)"));
+        assert!(DASHBOARD_HTML.contains("esc(task.provider_fallback_reason)"));
         assert!(DASHBOARD_HTML.contains("task.status !== \"running\""));
         assert!(!DASHBOARD_HTML.contains("const total = (task.context_elapsed_ms"));
         assert!(!DASHBOARD_HTML.contains("fmtMs(task.context_elapsed_ms)"));

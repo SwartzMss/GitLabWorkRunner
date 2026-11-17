@@ -7,6 +7,7 @@ pub enum ReviewErrorCode {
     ArchiveExtractFailed,
     ArchiveLimitExceeded,
     AiRequestTimeout,
+    AiProviderUnavailable,
     AiRequestFailed,
     AiToolLoopTimeout,
     AiResponseParseFailed,
@@ -31,6 +32,7 @@ impl ReviewErrorCode {
             Self::ArchiveExtractFailed => "archive_extract_failed",
             Self::ArchiveLimitExceeded => "archive_limit_exceeded",
             Self::AiRequestTimeout => "ai_request_timeout",
+            Self::AiProviderUnavailable => "ai_provider_unavailable",
             Self::AiRequestFailed => "ai_request_failed",
             Self::AiToolLoopTimeout => "ai_tool_loop_timeout",
             Self::AiResponseParseFailed => "ai_response_parse_failed",
@@ -147,6 +149,10 @@ mod tests {
         assert_eq!(
             ReviewErrorCode::AiToolLoopTimeout.as_str(),
             "ai_tool_loop_timeout"
+        );
+        assert_eq!(
+            ReviewErrorCode::AiProviderUnavailable.as_str(),
+            "ai_provider_unavailable"
         );
         assert_eq!(
             ReviewErrorCode::AiResponseParseFailed.as_str(),
