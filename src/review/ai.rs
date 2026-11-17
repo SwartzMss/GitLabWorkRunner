@@ -659,9 +659,11 @@ async fn run_batched_ai_review(
             "AI review batch started"
         );
         let batch_diff_limit = batch_prompt_payload_limit(&batch_changes);
-        let run_batch = |provider_config: &AiReviewConfig| {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let mut result = match tokio::time::timeout(
+            remaining,
             run_ai_review_single(
-                provider_config,
+                &active_config,
                 &batch_changes,
                 batch_diff_limit,
                 AiReviewSingleOptions {
@@ -672,10 +674,10 @@ async fn run_batched_ai_review(
                     progress: progress.clone(),
                     force_json_output,
                 },
-            )
-        };
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let mut result = match tokio::time::timeout(remaining, run_batch(&active_config)).await {
+            ),
+        )
+        .await
+        {
             Ok(result) => result,
             Err(_) => Err(ai_review_deadline_error(config)),
         };
@@ -706,7 +708,24 @@ async fn run_batched_ai_review(
                     provider.fallback_reason = Some(reason.to_string());
 
                     let remaining = deadline.saturating_duration_since(Instant::now());
-                    result = match tokio::time::timeout(remaining, run_batch(&active_config)).await {
+                    result = match tokio::time::timeout(
+                        remaining,
+                        run_ai_review_single(
+                            &active_config,
+                            &batch_changes,
+                            batch_diff_limit,
+                            AiReviewSingleOptions {
+                                batch: Some((batch_index, batch_count)),
+                                source_dir,
+                                review_request,
+                                trusted_runtime_instruction,
+                                progress: progress.clone(),
+                                force_json_output,
+                            },
+                        ),
+                    )
+                    .await
+                    {
                         Ok(result) => result,
                         Err(_) => Err(ai_review_deadline_error(config)),
                     };
